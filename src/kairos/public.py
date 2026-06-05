@@ -25,7 +25,7 @@ from kairos.helpers import (
     slot_gaps,
     timeslot_payload,
 )
-from kairos.http import form_data
+from kairos.http import form_data, valid_email
 from kairos.notifications import notify_all_responded, notify_new_response
 from kairos.templating import render
 from kairos.web import ics_response
@@ -127,7 +127,12 @@ def _handle_submit(request: Request, poll: dict, action: str, form, invite: dict
         return _render_poll_page(poll, action, request, invite=invite)
 
     name = form.get("name", "").strip()
-    email = form.get("email", "").strip() or (invite["email"] if invite else None)
+    raw_email = form.get("email", "").strip()
+    email = (valid_email(raw_email) if raw_email else None) or (invite["email"] if invite else None)
+    if raw_email and not valid_email(raw_email):
+        return render(env, "message.html", status_code=400, title="Error",
+                      heading="Error", detail="That email address doesn't look valid.",
+                      error=True, noindex=True, back=action, back_label="Go back")
 
     if not name:
         return render(env, "message.html", status_code=400, title="Error",

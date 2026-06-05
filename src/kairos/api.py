@@ -254,6 +254,10 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
     actor = _actor(poll, body.sender_name, body.reply_to)
     base = get_base_url(request)
     results = []
+    from kairos.http import valid_email
+    bad = [e for e in body.emails if not valid_email(e)]
+    if bad:
+        raise HTTPException(400, f"Invalid email address(es): {', '.join(bad)}")
     for email in body.emails:
         invite = create_invite(poll_id, email, required=body.required)
         invite_url = f"{base}{P}/p/i/{invite['token']}"

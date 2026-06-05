@@ -25,6 +25,7 @@ ALLOW = {a.strip().lower() for a in os.environ.get("KAIROS_ALLOW", "").split(","
 BRAND = os.environ.get("KAIROS_BRAND", "Kairos")
 HOME_URL = os.environ.get("KAIROS_HOME_URL", PREFIX + "/")
 LOGIN_URL = os.environ.get("KAIROS_LOGIN_URL", "")  # owner sign-in page; empty -> 401 message
+PUBLIC_URL = os.environ.get("KAIROS_PUBLIC_URL", "")  # SSoT base for share links; empty -> derive from request headers
 API_KEY = os.environ.get("KAIROS_API_KEY") or os.environ.get("SCHEDULER_API_KEY", "")
 
 # Legal pages (/imprint, /privacy) — rendered when KAIROS_OPERATOR is set.

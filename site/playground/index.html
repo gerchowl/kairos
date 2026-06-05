@@ -40,6 +40,7 @@ try {
     py.unpackArchive(buf, "wheel");
   }
   py.globals.set("APP_PREFIX", APP_PREFIX);
+  py.globals.set("PUBLIC_ORIGIN", location.origin);
   log("starting server…");
   await py.runPythonAsync(`
 import base64, json, os
@@ -52,6 +53,7 @@ async def _run_sync_inline(func, *args, **kwargs):
 anyio.to_thread.run_sync = _run_sync_inline
 
 os.environ.update(KAIROS_PREFIX=APP_PREFIX, KAIROS_AUTH="demo",
+                  KAIROS_PUBLIC_URL=PUBLIC_ORIGIN,
                   KAIROS_DB_URL="sqlite:///kairos.db", KAIROS_BRAND="Kairos (playground)",
                   KAIROS_API_KEY="playground")
 from kairos.db import init_schema

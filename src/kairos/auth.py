@@ -56,7 +56,10 @@ def require_auth(request: Request) -> dict:
 
 
 def get_base_url(request: Request) -> str:
-    """Public base URL, honoring reverse-proxy forwarding headers."""
+    """Public base URL for share links: explicit KAIROS_PUBLIC_URL (SSoT,
+    e.g. the WASM playground or odd proxies), else forwarding headers."""
+    if settings.PUBLIC_URL:
+        return settings.PUBLIC_URL.rstrip("/")
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc))
     return f"{proto}://{host}"

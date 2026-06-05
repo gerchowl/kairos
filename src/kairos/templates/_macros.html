@@ -46,7 +46,7 @@
 <fieldset class="fieldset">
   <legend class="fieldset-legend">{{ label }}</legend>
   <input type="{{ type }}" name="{{ name }}" id="field-{{ name }}" value="{{ value }}"
-         class="input w-full {{ input_class }}" {% if required %}required{% endif %}>
+         class="input w-full {{ input_class }}"{% if type == 'email' %} pattern="[^@\s]+@[^@\s]+\.[^@\s]{2,}" title="name@domain.tld"{% endif %} {% if required %}required{% endif %}>
 </fieldset>
 {%- endmacro %}
 

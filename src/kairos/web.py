@@ -37,7 +37,7 @@ from kairos.helpers import (
     slot_gaps,
     timeslot_payload,
 )
-from kairos.http import form_data
+from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
 from kairos.templating import render
 
@@ -539,9 +539,9 @@ def email_decision(poll_id: str, request: Request, form=Depends(form_data)):
 @router.post("/polls/{poll_id}/invite")
 def invite_submit(poll_id: str, request: Request, form=Depends(form_data)):
     user, poll = _owner_action(request, form, poll_id)
-    email = form.get("email", "").strip()
+    email = valid_email(form.get("email", ""))
     if not email:
-        raise HTTPException(400, "Email required")
+        raise HTTPException(400, "Not a valid email address")
     invite = create_invite(poll_id, email, required=form.get("importance", "required") == "required")
     base = get_base_url(request)
     invite_url = f"{base}{P}/p/i/{invite['token']}"

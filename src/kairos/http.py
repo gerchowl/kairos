@@ -22,3 +22,13 @@ async def form_data(request: Request):
         def submit(form=Depends(form_data)): ...
     """
     return await request.form()
+
+
+def valid_email(value: str) -> str | None:
+    """Normalized address or None — real validation (email-validator), not
+    the browser's permissive type=email (which accepts user@host)."""
+    from email_validator import EmailNotValidError, validate_email
+    try:
+        return validate_email(value.strip(), check_deliverability=False).normalized
+    except EmailNotValidError:
+        return None
