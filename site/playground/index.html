@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kairos playground</title>
+<style>
+body{font-family:-apple-system,system-ui,sans-serif;margin:0;background:#1b1b1b;color:#c8c9cc}
+#bar{padding:10px 16px;font-size:14px;display:flex;gap:12px;align-items:center;border-bottom:1px solid #3c3c3c}
+#bar a{color:#7aa2f7}#status{color:#c4c40c}
+iframe{border:0;width:100%;height:calc(100vh - 45px);background:#f4f1eb;display:none}
+#boot{padding:40px;max-width:640px;margin:0 auto;line-height:1.6}
+progress{width:100%}
+</style></head><body>
+<div id="bar"><strong>Kairos playground</strong><span id="status">booting Python…</span>
+<span style="flex:1"></span><a href="../">about</a><a href="https://github.com/gerchowl/kairos">github</a></div>
+<div id="boot"><p>Loading the <em>actual</em> Kairos server into your browser
+(Pyodide/WASM, ~15&nbsp;MB, first visit only). SQLite lives in page memory —
+reload for a fresh instance, nothing leaves your machine. Email features are
+inert here.</p><progress></progress><pre id="log"></pre></div>
+<iframe id="app"></iframe>
+<script type="module">
+const log = (m) => { document.getElementById("status").textContent = m;
+                     document.getElementById("log").textContent += m + "\n"; };
+const APP_PREFIX = new URL("app", location.href).pathname;
+try {
+  await navigator.serviceWorker.register("sw.js");
+  await navigator.serviceWorker.ready;
+  log("service worker ready — fetching Pyodide…");
+  const { loadPyodide } = await import("https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.mjs");
+  const py = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/" });
+  log("installing kairos + deps…");
+  await py.loadPackage("micropip");
+  const micropip = py.pyimport("micropip");
+  await micropip.install(["fastapi", "python-multipart", "itsdangerous", "jinja2",
+                          new URL("kairos_wheel.whl", location.href).href]);
+  log("starting server…");
+  py.globals.set("APP_PREFIX", APP_PREFIX);
+  await py.runPythonAsync(`
+import base64, json, os
+os.environ.update(KAIROS_PREFIX=APP_PREFIX, KAIROS_AUTH="demo",
+                  KAIROS_DB_URL="sqlite:///kairos.db", KAIROS_BRAND="Kairos (playground)",
+                  KAIROS_API_KEY="playground")
+from kairos.db import init_schema
+from kairos.main import create_app
+init_schema()
+app = create_app()
+
+async def handle(method, path, query, headers_json, body_b64):
+    headers = [(k.lower().encode(), v.encode()) for k, v in json.loads(headers_json).items()]
+    body = base64.b64decode(body_b64) if body_b64 else b""
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": method, "scheme": "https", "path": path, "raw_path": path.encode(),
+             "query_string": query.encode(), "headers": headers,
+             "client": ("127.0.0.1", 0), "server": ("playground", 443), "root_path": ""}
+    sent = {"status": 500, "headers": [], "chunks": []}
+    done = False
+    async def receive():
+        nonlocal done
+        if done:
+            return {"type": "http.disconnect"}
+        done = True
+        return {"type": "http.request", "body": body, "more_body": False}
+    async def send(msg):
+        if msg["type"] == "http.response.start":
+            sent["status"] = msg["status"]
+            sent["headers"] = [(k.decode(), v.decode()) for k, v in msg["headers"]]
+        elif msg["type"] == "http.response.body":
+            sent["chunks"].append(bytes(msg.get("body", b"")))
+    await app(scope, receive, send)
+    return json.dumps({"status": sent["status"], "headers": sent["headers"],
+                       "body": base64.b64encode(b"".join(sent["chunks"])).decode()})
+`);
+  const handle = py.globals.get("handle");
+  navigator.serviceWorker.addEventListener("message", async (e) => {
+    const { method, path, query, headers, body } = e.data;
+    const out = await handle(method, path, query || "", JSON.stringify(headers || {}), body);
+    e.ports[0].postMessage(JSON.parse(out));
+  });
+  log("ready");
+  document.getElementById("boot").style.display = "none";
+  const f = document.getElementById("app");
+  f.style.display = "block";
+  f.src = APP_PREFIX + "/";
+} catch (err) {
+  log("boot failed: " + err);
+}
+</script></body></html>

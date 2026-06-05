@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kairos — scheduling polls, agent-first</title>
+<style>
+:root{--bg:#f4f1eb;--fg:#2e3038;--blue:#3060c8;--mut:#70707a}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1b1b;--fg:#c8c9cc;--blue:#7aa2f7;--mut:#888}}
+body{font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:760px;margin:0 auto;padding:48px 24px;line-height:1.6}
+h1{font-size:2.4rem;margin:0}.tag{color:var(--mut)}
+a{color:var(--blue)}.btn{display:inline-block;background:var(--blue);color:#fff;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:600;margin:6px 8px 6px 0}
+.btn.ghost{background:transparent;color:var(--blue);border:1px solid var(--blue)}
+pre{background:rgba(128,128,128,.12);padding:14px;border-radius:6px;overflow-x:auto}
+ul{padding-left:1.2em}.foot{color:var(--mut);font-size:.85rem;margin-top:48px}
+</style></head><body>
+<h1>Kairos</h1>
+<p class="tag">when2meet-style scheduling polls — self-hostable, reverse-proxy-auth friendly, <strong>agent-first</strong>.</p>
+<p>
+<a class="btn" href="playground/">Try it in your browser →</a>
+<a class="btn ghost" href="https://github.com/gerchowl/kairos">GitHub</a>
+</p>
+<p class="tag">The playground runs the <em>actual</em> Python server in your browser (Pyodide/WASM + SQLite). Nothing is uploaded; reload = fresh instance.</p>
+<h2>Run it for real</h2>
+<pre>uvx --from git+https://github.com/gerchowl/kairos kairos
+# → http://127.0.0.1:8003  (SQLite, demo auth)</pre>
+<h2>Why</h2>
+<ul>
+<li>Full-day & time-slot polls, drag grids, heatmaps, public share links</li>
+<li>Required/optional invitees → convergence light (collecting → ready/partial/blocked)</li>
+<li>Idempotent smart reminders + per-participant contact audit trail</li>
+<li>Decide → .ics download + “email everyone” with the file attached</li>
+<li>Bring your own SSO: trusts identity headers from Shibboleth, oauth2-proxy, Authelia, Cloudflare Access…</li>
+<li>Agents: Bearer API, OpenAPI, <code>/llms.txt</code>, MCP server</li>
+</ul>
+<p class="foot">MIT · born inside ETH Zürich's duplet research platform · colorblind-friendly <a href="https://github.com/gerchowl/dalton-colorscheme">Dalton</a> theme</p>
+</body></html>
