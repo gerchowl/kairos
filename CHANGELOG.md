@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/gerchowl/kairos/compare/v0.6.0...v0.6.1) (2026-06-05)
+
+
+### Bug Fixes
+
+* strip decide group right-aligned; select matches the pill background (was near-black on dark) ([a5e81ea](https://github.com/gerchowl/kairos/commit/a5e81ea9e63a4f8c1af55ceac77a2d713c417e72))
+
 ## [0.6.0](https://github.com/gerchowl/kairos/compare/v0.5.1...v0.6.0) (2026-06-05)
 
 
