@@ -8,7 +8,7 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
       - name: Test suite (incl. real SQLite e2e lifecycle)
         run: uv run pytest tests -q
@@ -18,7 +18,7 @@ jobs:
     # boot with SQLite + demo auth, then exercise the live HTTP surface.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
       - run: uv build --wheel
       - name: Boot via uvx and probe
@@ -58,7 +58,7 @@ jobs:
           --health-cmd="healthcheck.sh --connect" --health-interval=5s
           --health-timeout=3s --health-retries=12
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
       - name: Boot against MariaDB and probe
         run: |
@@ -76,7 +76,7 @@ jobs:
     # No copyleft surprises in the dependency tree (we ship MIT)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
       - name: Audit dependency licenses
         run: |
@@ -90,6 +90,6 @@ jobs:
     # Known-CVE scan of the lockfile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
       - run: uv export --all-extras --no-emit-project -o req.txt -q && uvx pip-audit -r req.txt --disable-pip
