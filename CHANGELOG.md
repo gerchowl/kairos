@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/gerchowl/kairos/compare/v0.5.0...v0.5.1) (2026-06-05)
+
+
+### Bug Fixes
+
+* no page jump on add/edit/remove; flat table styling ([264bd71](https://github.com/gerchowl/kairos/commit/264bd71c96b9ff08a3be636c3025baa0d87c3c8f))
+
 ## [0.5.0](https://github.com/gerchowl/kairos/compare/v0.4.1...v0.5.0) (2026-06-05)
 
 
