@@ -40,7 +40,8 @@ try {
 import micropip
 await micropip.install(["fastapi", "starlette", "anyio", "sniffio", "idna",
                         "jinja2", "markupsafe", "itsdangerous",
-                        "python-multipart", "tzdata", WHEEL_URL], deps=False)
+                        "python-multipart", "tzdata"], deps=False)
+await micropip.install(WHEEL_URL, deps=False)
 `);
   log("starting server…");
   await py.runPythonAsync(`
