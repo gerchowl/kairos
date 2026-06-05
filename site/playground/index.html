@@ -30,7 +30,7 @@ try {
   // Native pieces from Pyodide's own index; everything else installed with an
   // explicit closed dependency set (micropip's transitive resolution trips on
   // packages without pure wheels).
-  await py.loadPackage(["pydantic", "sqlite3", "typing-extensions", "jinja2", "markupsafe"]);
+  await py.loadPackage(["pydantic", "sqlite3", "ssl", "typing-extensions", "jinja2", "markupsafe"]);
   // pure-python deps are vendored same-origin and unpacked directly —
   // no micropip, no PyPI, fully deterministic
   const wheels = await (await fetch("wheels.json")).json();
