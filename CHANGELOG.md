@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/gerchowl/kairos/compare/v0.4.1...v0.5.0) (2026-06-05)
+
+
+### Features
+
+* Notion-style add row — the table's last row IS the add form; email column first ([8ae49c3](https://github.com/gerchowl/kairos/commit/8ae49c38775a99137585db95820752ea96131357))
+
 ## [0.4.1](https://github.com/gerchowl/kairos/compare/v0.4.0...v0.4.1) (2026-06-05)
 
 
