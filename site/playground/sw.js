@@ -8,11 +8,11 @@ self.addEventListener("fetch", (event) => {
   event.respondWith(viaClient(event, url));
 });
 async function viaClient(event, url) {
-  let client = await self.clients.get(event.clientId);
-  if (!client) {
-    const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    client = all.find((c) => c.url.includes("/playground/")) || all[0];
-  }
+  // Always target the controller page (it holds Pyodide) — event.clientId
+  // would be the iframe itself, which has no message listener.
+  const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  const client = all.find((c) => c.url.includes("/playground/") && !c.url.includes("/playground/app"))
+    || all[0];
   if (!client) return new Response("Open the playground page first.", { status: 503 });
   let body = null;
   if (!["GET", "HEAD"].includes(event.request.method)) {
