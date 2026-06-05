@@ -57,6 +57,24 @@ class _SqliteConn:
         self._conn.close()
 
 
+class _MySQLConn:
+    """Adapts pymysql to the mysql-connector cursor API the code uses
+    (cursor(dictionary=True))."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self, dictionary=False):
+        import pymysql.cursors
+        return self._conn.cursor(pymysql.cursors.DictCursor if dictionary else None)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+
 def get_connection():
     if IS_SQLITE:
         path = settings.DB_URL.split("///", 1)[-1] or ":memory:"
@@ -64,12 +82,12 @@ def get_connection():
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         return _SqliteConn(conn)
-    import mysql.connector  # optional extra: kairos[mysql]
+    import pymysql  # optional extra: kairos[mysql] — MIT (mysql-connector is GPL)
     u = urlparse(settings.DB_URL)
-    return mysql.connector.connect(
+    return _MySQLConn(pymysql.connect(
         host=u.hostname or "127.0.0.1", port=u.port or 3306,
         user=unquote(u.username or "root"), password=unquote(u.password or ""),
-        database=u.path.lstrip("/"))
+        database=u.path.lstrip("/"), autocommit=False))
 
 
 def db_now() -> datetime:

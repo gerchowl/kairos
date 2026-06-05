@@ -23,7 +23,7 @@ jobs:
       - run: uv build --wheel
       - name: Boot via uvx and probe
         run: |
-          KAIROS_API_KEY=ci uvx --from dist/kairos_scheduler-*.whl kairos --port 8003 &
+          KAIROS_API_KEY=ci uvx --from dist/kairos_scheduler-*.whl kairos --port 8003 > server.log 2>&1 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8003/health && break; sleep 1; done
           set -ex
           curl -sf http://127.0.0.1:8003/health | grep '"ok"'
@@ -63,7 +63,7 @@ jobs:
         run: |
           uv build --wheel
           KAIROS_DB_URL=mysql://root:ci@127.0.0.1:3306/kairos KAIROS_API_KEY=ci \
-            uvx --from "$(ls dist/kairos_scheduler-*.whl)[mysql]" kairos --port 8003 &
+            uvx --from "$(ls dist/kairos_scheduler-*.whl)[mysql]" kairos --port 8003 > server.log 2>&1 &
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8003/health && break; sleep 1; done
           curl -sf http://127.0.0.1:8003/health | grep '"ok"'
           curl -sf -X POST http://127.0.0.1:8003/api/polls \

@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mysql = ["mysql-connector-python>=9.0"]
+mysql = ["pymysql>=1.1"]
 
 [project.scripts]
 kairos = "kairos.cli:main"
