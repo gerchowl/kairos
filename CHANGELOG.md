@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/gerchowl/kairos/compare/v0.5.1...v0.6.0) (2026-06-05)
+
+
+### Features
+
+* lifecycle status strip replaces the Actions card ([#14](https://github.com/gerchowl/kairos/issues/14)) ([1ff3b74](https://github.com/gerchowl/kairos/commit/1ff3b74e73dbb5242e925ce259dd9e62c7a3da0c))
+
+
+### Bug Fixes
+
+* remove table outlines — horizontal separators only; smart-reminders button soft-shaded ([959be36](https://github.com/gerchowl/kairos/commit/959be3601e5259a1a04f5060540dbf709d9da929))
+* round-2 review nits + visual calm ([#14](https://github.com/gerchowl/kairos/issues/14)) ([9052bee](https://github.com/gerchowl/kairos/commit/9052beefc4bb4027ea98d786a981b2b406f9e00e))
+
 ## [0.5.1](https://github.com/gerchowl/kairos/compare/v0.5.0...v0.5.1) (2026-06-05)
 
 
