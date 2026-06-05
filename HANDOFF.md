@@ -1,15 +1,15 @@
-# Kairos — session state
+# Kairos — session state (2026-06-05)
 
-All user-requested batches through 2026-06-05 are DONE and on main:
-extraction (v0.1.0 consumed by duplet), GH Pages landing + WASM playground
-(live), legal pages, flake/direnv/prek, email validation, PUBLIC_URL SSoT,
-participants-table rework (in-table add/Add/optional-checkbox/hover-X
-delete + API DELETE parity), stacked full-day headers, release-please,
-dependabot, license + pip-audit CI.
+Everything requested is DONE, released as v0.2.0 (release-please), and
+deployed: duplet ent runs kairos v0.2.0 (health ok, old polls intact).
 
-Next release: merge the release-please PR when it appears (or tag manually),
-then bump the pin in duplet apps/scheduler/pyproject.toml + uv lock +
-deploy ent.
+Release flow from now on: conventional commits on main -> release-please
+PR -> merge = tag + GH release -> bump pin in duplet
+apps/scheduler/pyproject.toml + uv lock + deploy.sh ent scheduler.
+NOTE: the adapter keeps mysql-connector-python — vendored duplet_common
+needs it (kairos itself uses pymysql since the CI license gate flagged
+the connector as GPL).
 
-Notes: commits via `nix develop -c git commit`; playground wheels are
-CI-vendored (gitignored locally — regenerate via pip download, see pages.yml).
+CI: tests / quickstart / mysql(MariaDB) / licenses(allowlist) /
+audit(pip-audit). Dependabot: uv + npm + actions, weekly, grouped.
+Dev: direnv allow; commit via `nix develop -c git commit`.
