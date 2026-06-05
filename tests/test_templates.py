@@ -224,7 +224,7 @@ if __name__ == "__main__":
      ["waiting on alice, bob"]),
     ({"state": "ready", "slots": 1, "best_slot_id": "s1", "responses": 2,
       "blockers": [], "stale_n": 0},
-     ["works for everyone", "2026-06-08", "Decide", "alert-success"]),
+     ["works for everyone", "Mon 08 Jun 2026", "Decide", "alert-success"]),
     ({"state": "partial", "slots": 1, "best_slot_id": "s3", "excluded": ["Bob"],
       "responses": 2, "blockers": [], "stale_n": 2},
      ["works for all required", "excludes Bob", "2 responses outdated", "alert-warning"]),

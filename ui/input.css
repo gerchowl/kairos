@@ -141,11 +141,9 @@ th.decide-clickable:hover { background: color-mix(in oklab, var(--color-accent) 
 .sched-table { border-collapse: collapse; width: 100%; font-size: 14px; }
 .sched-table td, .sched-table th { padding: 6px 8px; border: 1px solid var(--color-base-300); text-align: center; }
 .sched-table th { background: var(--color-base-200); }
-/* stacked date headers (Mon 08 / Jun / 2026): narrow columns, no h-scroll */
-.sched-th-stack { display: flex; flex-direction: column; line-height: 1.15; min-width: 3.2rem; }
-.sched-th-day { font-weight: 700; white-space: nowrap; }
-.sched-th-mon { font-weight: 500; }
-.sched-th-year { font-weight: 400; opacity: 0.55; font-size: 11px; }
+/* stacked date headers (Mon 08 / Jun / 2026): one size, one weight */
+.sched-th-stack { display: flex; flex-direction: column; line-height: 1.25; min-width: 3.2rem; font-weight: 600; }
+.sched-th-day, .sched-th-mon, .sched-th-year { font-weight: inherit; font-size: inherit; white-space: nowrap; }
 .sched-table .sched-name-cell { text-align: left; }
 .sched-table .sched-summary-cell { padding: 6px 8px; }
 /* visual gap after non-consecutive day columns */
@@ -277,3 +275,18 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
 
 #part-table .part-via-link { font-size: 11px; opacity: 0.5; cursor: help; }
 #part-table .part-new-row input[type="checkbox"]:not(.checkbox) { display: none; }
+
+/* strip CTAs: quiet grey pill by default, color only on hover/focus */
+.strip-cta:hover, .strip-cta:focus-visible {
+  background: var(--color-primary); border-color: var(--color-primary);
+  color: var(--color-primary-content);
+}
+.strip-cta-error:hover, .strip-cta-error:focus-visible {
+  background: var(--color-error); border-color: var(--color-error);
+  color: var(--color-error-content);
+}
+/* Tabulator header tooltips attach to <body> — theme them for dark mode */
+.tabulator-tooltip {
+  background: var(--color-base-200); color: var(--color-base-content);
+  border: 1px solid var(--color-base-300); border-radius: 0.25rem;
+}

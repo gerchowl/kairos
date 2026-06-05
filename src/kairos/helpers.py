@@ -28,11 +28,16 @@ def fmt_time(t) -> str:
 
 
 def format_slot(slot: dict, mode: str) -> str:
-    """Format a slot for display: date only or date + time range."""
-    date = str(slot["date"])
+    """Format a slot for display: 'Mon 06 Jul 2026', plus times in
+    time_slot mode — matches the matrix's stacked headers."""
+    from datetime import date as _date
+    d = slot["date"]
+    if not isinstance(d, _date):
+        d = _date.fromisoformat(str(d)[:10])
+    label = d.strftime("%a %d %b %Y")
     if mode == "time_slot" and slot.get("start_time") and slot.get("end_time"):
-        return f"{date} {fmt_time(slot['start_time'])}–{fmt_time(slot['end_time'])}"
-    return date
+        return f"{label} {fmt_time(slot['start_time'])}–{fmt_time(slot['end_time'])}"
+    return label
 
 
 env.globals["format_slot"] = format_slot

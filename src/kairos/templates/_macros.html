@@ -26,35 +26,35 @@
 {% macro convergence_strip(poll, conv, csrf_token, decided_label=None) -%}
 {% set stale_note = (' · ' ~ conv.stale_n ~ ' response' ~ ('' if conv.stale_n == 1 else 's') ~ ' outdated — a reminder refreshes them') if conv.stale_n else '' %}
 {% if conv.state == 'collecting' %}
-<div class="alert my-4" role="status"><span aria-hidden="true">⏳</span>
+<div class="alert flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">⏳</span>
 <span>{% if conv.responses == 0 and not conv.blockers %}Collecting replies — share the link to gather availability.{% elif conv.blockers %}{{ conv.responses }} replied — waiting on {{ conv.blockers[:3] | join(', ') }}{% if conv.blockers | length > 3 %} +{{ conv.blockers | length - 3 }}{% endif %}.{% else %}Collecting replies — {{ conv.responses }} so far.{% endif %}{{ stale_note }}</span>
 {{ close_ghost(poll, csrf_token) }}</div>
 
 {% elif conv.state == 'ready' %}
-<div class="alert alert-success my-4" role="status"><span aria-hidden="true">✓</span>
+<div class="alert alert-success flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">✓</span>
 <span><strong>{{ slot_label(poll, conv.best_slot_id) }}</strong> works for everyone{% if conv.slots > 1 %} ({{ conv.slots - 1 }} more date{{ '' if conv.slots == 2 else 's' }} also fit{{ 's' if conv.slots == 2 }}){% endif %}.</span>
 {{ decide_form(poll, conv, csrf_token) }}{{ close_ghost(poll, csrf_token) }}</div>
 
 {% elif conv.state == 'partial' %}
-<div class="alert alert-warning my-4" role="status"><span aria-hidden="true">◐</span>
+<div class="alert alert-warning flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">◐</span>
 <span><strong>{{ slot_label(poll, conv.best_slot_id) }}</strong> works for all required — excludes {{ conv.excluded[:3] | join(', ') }}{% if conv.excluded | length > 3 %} +{{ conv.excluded | length - 3 }}{% endif %}.{{ stale_note }}</span>
 {{ decide_form(poll, conv, csrf_token) }}{{ close_ghost(poll, csrf_token) }}</div>
 
 {% elif conv.state == 'blocked' %}
-<div class="alert alert-error my-4" role="status"><span aria-hidden="true">✗</span>
+<div class="alert alert-error flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">✗</span>
 <span>{% if conv.no_dates %}No dates in this poll yet — add some to get started.{% else %}No date fits the required people.{{ stale_note }}{% endif %}</span>
 <a href="{{ P }}/polls/{{ poll.id }}/edit" class="btn btn-sm">{{ 'Add dates' if conv.no_dates else 'Edit dates' }}</a>
 {% if not conv.no_dates %}<form method="post" action="{{ P }}/polls/{{ poll.id }}/close" class="inline">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
-<button type="submit" class="btn btn-error btn-sm" onclick="return confirm('Close this poll without a final date?')">Close poll</button></form>{% endif %}</div>
+<button type="submit" class="btn btn-sm strip-cta-error" onclick="return confirm('Close this poll without a final date?')">Close poll</button></form>{% endif %}</div>
 
 {% elif conv.state == 'closed' %}
-<div class="alert my-4" role="status"><span aria-hidden="true">■</span>
+<div class="alert flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">■</span>
 <span>Closed without a final date — responses are read-only.</span>
 {{ reopen_form(poll, csrf_token) }}</div>
 
 {% elif conv.state == 'decided' and not decided_label %}
-<div class="alert alert-warning my-4" role="status"><span aria-hidden="true">⚠</span>
+<div class="alert alert-warning flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">⚠</span>
 <span>The decided date was removed from this poll — reopen to pick again.</span>
 {{ reopen_form(poll, csrf_token) }}</div>
 {% endif %}
@@ -68,10 +68,10 @@
 <form method="post" action="{{ P }}/polls/{{ poll.id }}/decide" class="inline flex items-center gap-2">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
 <label class="sr-only" for="decide-select">Final date</label>
-<select name="slot_id" id="decide-select" class="select select-sm w-auto">
+<select name="slot_id" id="decide-select" class="select select-sm w-auto bg-base-100 text-base-content border-base-300">
 {% for s in poll.slots %}<option value="{{ s.id }}"{% if s.id == conv.best_slot_id %} selected{% endif %}>{{ format_slot(s, poll.mode) }}</option>{% endfor %}
 </select>
-<button type="submit" class="btn btn-primary btn-sm">Decide</button>
+<button type="submit" class="btn btn-sm strip-cta">Decide</button>
 </form>
 {%- endmacro %}
 
@@ -85,7 +85,7 @@
 {% macro reopen_form(poll, csrf_token) -%}
 <form method="post" action="{{ P }}/polls/{{ poll.id }}/reopen" class="inline ms-auto">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
-<button type="submit" class="btn btn-primary btn-sm">Reopen</button>
+<button type="submit" class="btn btn-sm strip-cta">Reopen</button>
 </form>
 {%- endmacro %}
 

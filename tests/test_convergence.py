@@ -65,3 +65,25 @@ def test_dashboard_rows_without_slots_still_work():
 
 def test_non_open_passthrough():
     assert convergence({**P, "status": "closed"}, [], [])["state"] == "closed"
+
+
+def test_best_slot_most_yes_beats_earliest():
+    rs = [resp("a", {"s1": "yes", "s2": "yes"}),
+          resp("b", {"s1": "no", "s2": "yes"}, required=False)]
+    c = convergence(P, rs, [])
+    assert c["state"] == "ready" and c["best_slot_id"] == "s2"  # 2 yes > 1 yes
+
+
+def test_walkin_required_blocks_but_optional_does_not():
+    rs = [resp("a", {"s1": "yes"}),
+          resp("b", {"s1": "no"}, required=True)]   # required walk-in says no
+    assert convergence(P, rs, [])["state"] == "blocked"
+    rs[1]["required"] = False
+    assert convergence(P, rs, [])["state"] == "partial"
+
+
+def test_required_invitee_no_everywhere_blocks():
+    invites = [inv("i1", "a@x.org"), inv("i2", "b@x.org")]
+    rs = [resp("ra", {"s1": "yes", "s2": "yes"}, email="a@x.org", invite="i1"),
+          resp("rb", {"s1": "no", "s2": "no"}, email="b@x.org", invite="i2")]
+    assert convergence(P, rs, invites)["state"] == "blocked"

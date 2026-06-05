@@ -23,11 +23,16 @@
   function toast(msg, ok) {
     var t = document.createElement("div");
     t.className = "toast toast-end z-50";
-    t.innerHTML = '<div class="alert ' + (ok ? "alert-success" : "alert-error") +
-                  ' shadow-lg"><span></span></div>';
+    // role=status so screen readers announce it; errors stay until dismissed
+    t.innerHTML = '<div role="status" class="alert ' + (ok ? "alert-success" : "alert-error") +
+                  ' shadow-lg"><span></span>' +
+                  (ok ? "" : '<button type="button" class="btn btn-ghost btn-xs">\u2715</button>') +
+                  "</div>";
     t.querySelector("span").textContent = msg;
+    var x = t.querySelector("button");
+    if (x) x.addEventListener("click", function () { t.remove(); });
     document.body.appendChild(t);
-    setTimeout(function () { t.remove(); }, 4000);
+    if (ok) setTimeout(function () { t.remove(); }, 4000);
   }
 
   function freshSentinel() {
@@ -188,14 +193,17 @@
     emails.forEach(function (em) { body.append("emails", em); });
     fetch(cfg.remind_selected_url, { method: "POST", body: body, redirect: "follow" })
       .then(function (r) {
-        // counts ride on the redirect target (?msg=nudged&inv=..&upd=..)
+        // CONTRACT: the route 302s to a path-only URL with the counts as
+        // query params; after redirect:"follow", r.url is the resolved
+        // absolute URL — if that redirect shape changes, update this parse.
         var q = new URL(r.url).searchParams;
         var n = (parseInt(q.get("inv") || 0, 10) || 0) + (parseInt(q.get("upd") || 0, 10) || 0);
         toast(r.ok ? (n ? "Sent " + n + " email" + (n === 1 ? "" : "s") + "."
                         : "Nothing to send.") : "Sending failed.", r.ok);
         table.deselectRow();
         refreshRows();
-      });
+      })
+      .catch(function () { toast("Network error — nothing was sent.", false); });
   });
 
   // smart reminders: same inline treatment — no page jump
@@ -210,7 +218,8 @@
         toast(r.ok ? (n ? "Sent " + n + " reminder" + (n === 1 ? "" : "s") + "."
                         : "Everyone is up to date — nothing sent.") : "Sending failed.", r.ok);
         refreshRows();
-      });
+      })
+      .catch(function () { toast("Network error — nothing was sent.", false); });
   });
 
   // -- name guessing for the add row (first.last@ -> First Last) --------------
