@@ -1,23 +1,35 @@
-# Playground last-mile (only remaining item)
+# Next session — UX batch (user-requested 2026-06-05)
 
-State: extraction DONE (downstream consumer on v0.1.0, verified). Landing page
-live. Playground boots fully (Pyodide + vendored wheels via unpackArchive +
-ssl loaded, server logs "ready") — but the iframe stays empty: SW->page
-message round-trip for app/* requests doesn't complete.
+Repo: ~/Projects/kairos (public gerchowl/kairos). Dev: `direnv allow`, commit
+via `nix develop -c git commit` (prek hooks need ruff). After release: tag,
+bump tag in duplet apps/scheduler/pyproject.toml, uv lock, deploy ent.
 
-Done already: sw.js routes to the controller page (not iframe client) as of
-commit "playground sw: route requests to the controller page". Suspects for
-the remaining gap, in order:
-1. stale SW: browser kept the old worker — verify with a hard
-   unregister (navigator.serviceWorker.getRegistrations -> r.unregister())
-   then reload twice; consider a version query (sw.js?v=N) on register()
-2. handle() proxy: navigator.serviceWorker message listener calls the PyProxy
-   `handle` — confirm it resolves (add console.log of out) and that
-   e.ports[0] exists for iframe-originated fetches
-3. iframe request mode=navigate may not be interceptable before controller
-   claims — first load happens right after register; try reloading the
-   iframe after a tick
+## 1. Participants table rework (templates/poll.html + web.py)
+- invites become part of the table: a trailing "(+)" row with inline inputs
+  (email + optional-checkbox) that POSTs /invite; the row inherits active
+  state filters visually
+- button label "Add" (not "Send Invite") — sending happens via the table's
+  reminder actions
+- importance select -> a simple "optional" CHECKBOX (default unchecked =
+  required)
+- row deletion: hover -> X -> confirm (y/n) -> POST /polls/{id}/invites/{iid}/delete
+  (new db.delete_invite + route + API DELETE endpoint; what about walk-in
+  respondent rows? -> delete_response for those, same UX)
 
-Debug loop: site/ is static — `python3 -m http.server -d site 8990` and edit
-locally (SW scope: serve under /kairos/ path or adjust APP_PREFIX detection),
-no CI roundtrips needed.
+## 2. Full-day responses grid headers render badly (_macros.html fullday_grid)
+- header cell should be stacked, no horizontal scrollbar on cards:
+    <Day> DD     e.g.  Mon 08
+    <Mon> MM           Jun 06
+    YYYY               2026
+  (their sketch: weekday+day / month / year stacked) — add a date_label
+  macro/helper splitting the slot date; constrain column min-widths so the
+  card doesn't overflow (table-fixed or smaller padding; test with 9 columns)
+
+## 3. Playground chrome (DONE in this commit)
+- standalone base.html had leftover portal Profile/Logout dropdown — replaced
+  with plain user name. There is no registration/password flow in Kairos by
+  design: owner identity comes from the operator's SSO proxy (or demo mode);
+  respondents never need accounts.
+
+## State: 62 tests green, CI (tests+quickstart+mariadb) green, Pages green,
+## playground LIVE (WASM, threads patched inline), legal pages shipped.
