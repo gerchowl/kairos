@@ -69,3 +69,25 @@ jobs:
           curl -sf -X POST http://127.0.0.1:8003/api/polls \
             -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
             -d '{"title":"MariaDB poll","mode":"full_day","slots":[{"date":"2026-12-01"}]}' | grep share_url
+
+  licenses:
+    # No copyleft surprises in the dependency tree (we ship MIT)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Audit dependency licenses
+        run: |
+          uv sync --all-extras -q
+          uv run --with pip-licenses pip-licenses \
+            --partial-match \
+            --allow-only="MIT;BSD;Apache;Apache Software License;Apache-2.0;ISC;Python Software Foundation;PSF;MPL;Mozilla Public License 2.0;Unlicense;CC0;Public Domain;Zero-Clause" \
+            --ignore-packages kairos-scheduler pip-licenses prettytable wcwidth
+
+  audit:
+    # Known-CVE scan of the lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv export --all-extras --no-emit-project -o req.txt -q && uvx pip-audit -r req.txt --disable-pip

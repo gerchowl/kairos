@@ -90,3 +90,46 @@ def test_no_legal_routes_without_operator(tmp_path, monkeypatch):
     from kairos.main import create_app
     with TestClient(create_app(), base_url="https://testserver") as c:
         assert c.get("/scheduler/imprint").status_code == 404
+
+
+def test_participant_removal_lifecycle(tmp_path, monkeypatch):
+    """Add-only invite -> appears in table -> delete invite (and its response)."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    from kairos.main import create_app
+    headers = {"X-User": "alice", "X-Email": "alice@example.org", "X-Name": "Alice"}
+    api = {"Authorization": "Bearer dummy-key"}
+    monkeypatch.setattr(settings, "API_KEY", "dummy-key")
+    with TestClient(create_app(), base_url="https://testserver", headers=headers) as c:
+        r = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "Cleanup", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-01"}]})
+        poll = r.json()
+        # web add-only invite: no mail sent, just created
+        page = c.get(f"/scheduler/polls/{poll['id']}")
+        import re
+        m = re.search(r'name="csrf" value="([^"]*)"', page.text)
+        csrf = m.group(1) if m else ""
+        r = c.post(f"/scheduler/polls/{poll['id']}/invite",
+                   data={"email": "bob@example.org", "optional": "on", "csrf": csrf},
+                   follow_redirects=False)
+        assert r.status_code == 302
+        invites = c.get(f"/scheduler/api/polls/{poll['id']}", headers=api).json()["invites"]
+        assert invites[0]["email"] == "bob@example.org" and invites[0]["required"] in (0, False)
+        # duplicate guarded
+        assert c.post(f"/scheduler/polls/{poll['id']}/invite",
+                      data={"email": "bob@example.org", "csrf": csrf}).status_code == 400
+        # web removal of the invite
+        r = c.post(f"/scheduler/polls/{poll['id']}/participants/remove",
+                   data={"kind": "invite", "ref": invites[0]["id"], "csrf": csrf},
+                   follow_redirects=False)
+        assert r.status_code == 302
+        assert c.get(f"/scheduler/api/polls/{poll['id']}", headers=api).json()["invites"] == []
+        # API response deletion
+        slot = poll["slots"][0]["id"]
+        rid = c.post(f"/scheduler/api/polls/{poll['id']}/respond", headers=api,
+                     json={"name": "Carol", "availabilities": {slot: "yes"}}).json()["id"]
+        assert c.delete(f"/scheduler/api/polls/{poll['id']}/responses/{rid}",
+                        headers=api).json() == {"deleted": True}
+        assert c.delete(f"/scheduler/api/polls/{poll['id']}/responses/{rid}",
+                        headers=api).status_code == 404

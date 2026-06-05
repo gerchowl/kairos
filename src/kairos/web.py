@@ -10,6 +10,8 @@ from kairos.db import (
     add_slots,
     create_invite,
     create_poll,
+    delete_invite,
+    delete_response,
     get_contact_log,
     get_invites,
     get_notifications,
@@ -54,7 +56,8 @@ def _login_or_401(next_path: str):
                   detail="This page is for poll owners. Sign in via your organization's portal or identity proxy.")
 
 _MSG_TEXT = {
-    "invited": "Invite created.",
+    "invited": "Invitee added — select them in the table to send the invite mail.",
+    "removed": "Participant removed.",
     "closed": "Poll closed.",
     "decided": "Time decided!",
     "saved": "Poll updated.",
@@ -542,10 +545,26 @@ def invite_submit(poll_id: str, request: Request, form=Depends(form_data)):
     email = valid_email(form.get("email", ""))
     if not email:
         raise HTTPException(400, "Not a valid email address")
-    invite = create_invite(poll_id, email, required=form.get("importance", "required") == "required")
-    base = get_base_url(request)
-    invite_url = f"{base}{P}/p/i/{invite['token']}"
-    if send_invite_email(email, poll["title"], invite_url, user.get("name", "Someone"),
-                         reply_to=user.get("email")):
-        log_contact(poll_id, email, "invite", invite["id"])
+    if any(i["email"].lower() == email.lower() for i in get_invites(poll_id)):
+        raise HTTPException(400, "Already invited")
+    # add-only: the participants table sends the actual mail (Email selected /
+    # smart reminders) — keeps adding cheap and sending deliberate
+    create_invite(poll_id, email, required=not form.get("optional"))
     return RedirectResponse(f"{P}/polls/{poll_id}?msg=invited", status_code=302)
+
+
+@router.post("/polls/{poll_id}/participants/remove")
+def remove_participant(poll_id: str, request: Request, form=Depends(form_data)):
+    _user, _poll = _owner_action(request, form, poll_id)
+    kind, ref = form.get("kind", ""), form.get("ref", "")
+    if kind == "invite" and ref:
+        # an invite's linked response (if any) goes too — the person was uninvited
+        for r in get_responses(poll_id):
+            if r.get("invite_id") == ref:
+                delete_response(r["id"])
+        delete_invite(ref)
+    elif kind == "response" and ref:
+        delete_response(ref)
+    else:
+        raise HTTPException(400, "Bad participant reference")
+    return RedirectResponse(f"{P}/polls/{poll_id}?msg=removed", status_code=302)

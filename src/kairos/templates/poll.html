@@ -86,23 +86,17 @@
 
 {% if is_owner %}
 {% call section_card("Participants") %}
+{# invite form + delete form live OUTSIDE the table (no nested forms);
+   the (+) row's inputs reference them via the form= attribute #}
 {% if poll.status == 'open' %}
-<form method="post" action="{{ P }}/polls/{{ poll.id }}/invite" class="flex items-end gap-2 flex-wrap">
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/invite" id="invite-form">
+<input type="hidden" name="csrf" value="{{ csrf_token }}"></form>
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/participants/remove" id="part-del-form">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
-<div class="grow">{{ text_field('email', 'Email address', type='email', required=True) }}</div>
-<fieldset class="fieldset">
-  <legend class="fieldset-legend">Importance</legend>
-  <select name="importance" class="select w-auto">
-  <option value="required">Required</option>
-  <option value="optional">Optional</option>
-  </select>
-</fieldset>
-<button type="submit" class="btn btn-primary mb-1">Send Invite</button>
-</form>
-<p class="text-sm opacity-60">Required invitees drive the poll's status light: it turns green when a date works for everyone, orange when only the required people fit.</p>
+<input type="hidden" name="kind" id="part-del-kind"><input type="hidden" name="ref" id="part-del-ref"></form>
 {% endif %}
 
-{% if participants %}
+{% if participants or poll.status == 'open' %}
 <div id="part-filters" class="join my-2">
   <button type="button" class="btn btn-xs join-item btn-active" data-pfilter="">All</button>
   <button type="button" class="btn btn-xs join-item" data-pfilter="pending">Pending</button>
@@ -116,7 +110,7 @@
 <table class="table table-sm" id="part-table">
 <thead><tr>
 <th><input type="checkbox" id="part-all" class="checkbox checkbox-xs" title="Select shown"></th>
-<th>Email</th><th>Name</th><th>Importance</th><th>State</th><th>Last contacted</th>
+<th>Email</th><th>Name</th><th>Importance</th><th>State</th><th>Last contacted</th><th></th>
 </tr></thead>
 <tbody>
 {% for p in participants %}
@@ -129,12 +123,32 @@
 <td class="text-xs opacity-70 whitespace-nowrap"{% if p.contacts %} title="{% for c in p.contacts %}{{ c.kind }} {{ (c.sent_at | string)[:16] }}{{ '&#10;' if not loop.last }}{% endfor %}"{% endif %}>
 {% if p.last_contact %}{{ p.last_contact.kind }} &middot; {{ (p.last_contact.sent_at | string)[:16] }}{% if p.contacts | length > 1 %} <span class="opacity-50">(+{{ p.contacts | length - 1 }})</span>{% endif %}{% else %}never{% endif %}
 </td>
+<td class="text-right">
+{% if poll.status == 'open' %}
+<button type="button" class="btn btn-ghost btn-xs part-del" title="Remove {{ p.email }}"
+        data-kind="{{ 'invite' if p.invite_id else 'response' }}" data-ref="{{ p.invite_id or p.response_id }}"
+        data-label="{{ p.email }}">✕</button>
+{% endif %}
+</td>
 </tr>
 {% endfor %}
+{% if poll.status == 'open' %}
+<tr class="part-add-row">
+<td class="opacity-40 text-center">+</td>
+<td><input type="email" name="email" form="invite-form" required placeholder="name@domain.tld"
+           pattern="[^@\s]+@[^@\s]+\.[^@\s]{2,}" class="input input-sm w-full max-w-xs"></td>
+<td colspan="2"><label class="label cursor-pointer justify-start gap-2 py-0">
+  <input type="checkbox" name="optional" form="invite-form" class="checkbox checkbox-xs">
+  <span class="text-sm opacity-70">optional</span></label></td>
+<td colspan="2"><button type="submit" form="invite-form" class="btn btn-primary btn-sm">Add</button></td>
+<td></td>
+</tr>
+{% endif %}
 </tbody>
 </table>
 </div>
 {% if poll.status == 'open' %}
+<p class="text-sm opacity-60">Required invitees drive the poll's status light: green when a date works for everyone, orange when only the required people fit.</p>
 <div class="flex items-center gap-3 mt-2 flex-wrap">
 <button type="submit" id="part-send" class="btn btn-primary btn-sm" disabled>Email selected (0)</button>
 <span class="text-sm opacity-60">Selected people get a state-appropriate mail right now (pending → reminder, stale → new-dates notice, current → plain reminder). Logged in the trail.</span>
@@ -156,7 +170,16 @@
 (function () {
   var form = document.getElementById('part-form');
   if (!form) return;
-  var rows = Array.prototype.slice.call(form.querySelectorAll('tbody tr'));
+  var rows = Array.prototype.slice.call(form.querySelectorAll('tbody tr[data-state]'));
+  var delForm = document.getElementById('part-del-form');
+  form.querySelectorAll('.part-del').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      if (!confirm('Remove ' + this.dataset.label + ' from this poll?')) return;
+      document.getElementById('part-del-kind').value = this.dataset.kind;
+      document.getElementById('part-del-ref').value = this.dataset.ref;
+      delForm.submit();
+    });
+  });
   var send = document.getElementById('part-send');
   var all = document.getElementById('part-all');
   function refresh() {

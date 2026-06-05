@@ -1,0 +1,20 @@
+# Tag-and-changelog automation. Uses the default GITHUB_TOKEN — no GitHub App
+# or PAT needed because nothing downstream must trigger on the release event
+# (CI/Pages run on push; the duplet consumer bumps the tag pin manually).
+# One repo setting is required: Settings -> Actions -> General ->
+# "Allow GitHub Actions to create and approve pull requests".
+name: release-please
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          release-type: python
+          package-name: kairos-scheduler

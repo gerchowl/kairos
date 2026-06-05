@@ -57,10 +57,17 @@
 {# Full-day response grid: respondent rows + stacked-bar summary row.
    Bars are painted by grid.js from the data attributes; gaps lists column
    indices that get a separator stripe (non-consecutive dates). #}
+{% macro date_stack(s) -%}
+{%- set d = s.date if s.date.strftime is defined else None -%}
+{%- if d -%}
+<div class="sched-th-stack"><span class="sched-th-day">{{ d.strftime('%a %d') }}</span><span class="sched-th-mon">{{ d.strftime('%b') }}</span><span class="sched-th-year">{{ d.strftime('%Y') }}</span></div>
+{%- else -%}{{ s.date }}{%- endif -%}
+{%- endmacro %}
+
 {% macro fullday_grid(poll, responses, counts, total, pending_n, gaps=[], decidable=False) -%}
 <div class="overflow-x-auto">
 <table class="sched-table">
-<tr><th></th>{% for s in poll.slots %}<th class="{{ 'sched-gap-after' if loop.index0 in gaps }}"{% if decidable %} data-decide-slot="{{ s.id }}"{% endif %}>{{ format_slot(s, poll.mode) }}</th>{% endfor %}</tr>
+<tr><th></th>{% for s in poll.slots %}<th class="{{ 'sched-gap-after' if loop.index0 in gaps }}"{% if decidable %} data-decide-slot="{{ s.id }}"{% endif %}>{{ date_stack(s) }}</th>{% endfor %}</tr>
 {% for r in responses %}
 <tr><td class="sched-name-cell"><strong>{{ r.respondent_name }}</strong></td>
 {%- for s in poll.slots %}{{ availability_cell(r.slot_availabilities.get(s.id, 'no'), gap=loop.index0 in gaps) }}{% endfor %}</tr>

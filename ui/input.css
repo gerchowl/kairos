@@ -137,8 +137,13 @@ th.decide-clickable:hover { background: color-mix(in oklab, var(--color-accent) 
 
 /* Response grid table */
 .sched-table { border-collapse: collapse; width: 100%; font-size: 14px; }
-.sched-table td, .sched-table th { padding: 6px 10px; border: 1px solid var(--color-base-300); text-align: center; }
+.sched-table td, .sched-table th { padding: 6px 8px; border: 1px solid var(--color-base-300); text-align: center; }
 .sched-table th { background: var(--color-base-200); }
+/* stacked date headers (Mon 08 / Jun / 2026): narrow columns, no h-scroll */
+.sched-th-stack { display: flex; flex-direction: column; line-height: 1.15; min-width: 3.2rem; }
+.sched-th-day { font-weight: 700; white-space: nowrap; }
+.sched-th-mon { font-weight: 500; }
+.sched-th-year { font-weight: 400; opacity: 0.55; font-size: 11px; }
 .sched-table .sched-name-cell { text-align: left; }
 .sched-table .sched-summary-cell { padding: 6px 8px; }
 /* visual gap after non-consecutive day columns */

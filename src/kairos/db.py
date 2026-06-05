@@ -403,6 +403,29 @@ def get_invites(poll_id: str) -> list[dict]:
     return invites
 
 
+def delete_invite(invite_id: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM sched_invites WHERE id = %s", (invite_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return deleted
+
+
+def delete_response(response_id: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM sched_response_slots WHERE response_id = %s", (response_id,))
+    cursor.execute("DELETE FROM sched_responses WHERE id = %s", (response_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return deleted
+
+
 def mark_invite_responded(invite_id: str):
     conn = get_connection()
     cursor = conn.cursor()

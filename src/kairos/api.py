@@ -186,6 +186,29 @@ def update_poll_endpoint(poll_id: str, body: PollUpdate, request: Request,
     return _poll_detail(request, get_poll(poll_id))
 
 
+@router.delete("/polls/{poll_id}/invites/{invite_id}")
+def delete_invite_endpoint(poll_id: str, invite_id: str, user: dict = Depends(require_api_key)):
+    """Remove an invitee (and their linked response, if any)."""
+    _get_or_404(poll_id)
+    from kairos.db import delete_invite, delete_response, get_responses
+    for r in get_responses(poll_id):
+        if r.get("invite_id") == invite_id:
+            delete_response(r["id"])
+    if not delete_invite(invite_id):
+        raise HTTPException(404, "Invite not found")
+    return {"deleted": True}
+
+
+@router.delete("/polls/{poll_id}/responses/{response_id}")
+def delete_response_endpoint(poll_id: str, response_id: str, user: dict = Depends(require_api_key)):
+    """Remove a response (walk-in or invited)."""
+    _get_or_404(poll_id)
+    from kairos.db import delete_response
+    if not delete_response(response_id):
+        raise HTTPException(404, "Response not found")
+    return {"deleted": True}
+
+
 @router.delete("/polls/{poll_id}")
 def delete_poll_endpoint(poll_id: str, user: dict = Depends(require_api_key)):
     _get_or_404(poll_id)

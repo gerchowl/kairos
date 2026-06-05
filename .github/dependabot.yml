@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: uv          # pyproject.toml + uv.lock
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      python-deps: { patterns: ["*"] }
+  - package-ecosystem: npm         # ui/ build chain (tailwind, daisyui)
+    directory: /ui
+    schedule: { interval: weekly }
+    groups:
+      ui-deps: { patterns: ["*"] }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
