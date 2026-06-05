@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/gerchowl/kairos/compare/v0.4.0...v0.4.1) (2026-06-05)
+
+
+### Bug Fixes
+
+* crisp hint texts — one line each, detail lives in tooltips ([0a00259](https://github.com/gerchowl/kairos/commit/0a00259fae4b4f6257bff79a65aca505dac3778c))
+
 ## [0.4.0](https://github.com/gerchowl/kairos/compare/v0.3.1...v0.4.0) (2026-06-05)
 
 
