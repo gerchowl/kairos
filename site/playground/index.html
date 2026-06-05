@@ -27,12 +27,16 @@ try {
   const { loadPyodide } = await import("https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.mjs");
   const py = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/" });
   log("installing kairos + deps…");
-  // pydantic-core + sqlite3 are native: take them from Pyodide's own index
-  await py.loadPackage(["micropip", "pydantic", "sqlite3"]);
+  // Native pieces from Pyodide's own index; everything else installed with an
+  // explicit closed dependency set (micropip's transitive resolution trips on
+  // packages without pure wheels).
+  await py.loadPackage(["micropip", "pydantic", "sqlite3", "typing-extensions"]);
   const micropip = py.pyimport("micropip");
   const wheelName = (await (await fetch("wheel.txt")).text()).trim();
-  await micropip.install(["fastapi", "python-multipart", "itsdangerous", "jinja2", "tzdata",
-                          new URL(wheelName, location.href).href], { keep_going: true });
+  await micropip.install(
+    ["fastapi", "starlette", "anyio", "sniffio", "idna", "jinja2", "markupsafe",
+     "itsdangerous", "python-multipart", "tzdata", new URL(wheelName, location.href).href],
+    { deps: false });
   log("starting server…");
   py.globals.set("APP_PREFIX", APP_PREFIX);
   await py.runPythonAsync(`
