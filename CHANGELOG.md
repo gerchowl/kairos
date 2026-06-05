@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/gerchowl/kairos/compare/v0.3.1...v0.4.0) (2026-06-05)
+
+
+### Features
+
+* optional is per-person, via-link is provenance; plain-language states ([5867db6](https://github.com/gerchowl/kairos/commit/5867db6cbb3613b376c8906837674378bb94c794))
+
 ## [0.3.1](https://github.com/gerchowl/kairos/compare/v0.3.0...v0.3.1) (2026-06-05)
 
 
