@@ -268,7 +268,9 @@ def view_poll(poll_id: str, request: Request):
     decided_slot = decided_slot_of(poll)
     decided_label = format_slot(decided_slot, poll["mode"]) if decided_slot else None
     is_owner = poll["creator_id"] == user["uid"]
-    decidable = is_owner and poll["status"] == "open"
+    conv = convergence(poll, responses, invites)
+    # matrix-click decide is only wired when the strip renders the select
+    decidable = is_owner and poll["status"] == "open" and conv["state"] in ("ready", "partial")
 
     is_ts = bool(poll["mode"] == "time_slot" and slots and slots[0].get("start_time"))
     ctx = {"is_ts": is_ts}
@@ -286,6 +288,8 @@ def view_poll(poll_id: str, request: Request):
             "csrf": make_csrf(user["uid"]),
             "update_url": f"{P}/polls/{poll_id}/participants/update",
             "invite_url": f"{P}/polls/{poll_id}/invite",
+            "remind_url": f"{P}/polls/{poll_id}/remind",
+            "remind_selected_url": f"{P}/polls/{poll_id}/remind-selected",
             "remove_url": f"{P}/polls/{poll_id}/participants/remove",
             "rows": [{
                 "kind": "invite" if r["invite_id"] else "response",
@@ -308,6 +312,7 @@ def view_poll(poll_id: str, request: Request):
     return render(env, "poll.html", user=user, title=poll["title"],
                   poll=poll, responses=responses, invites=invites,
                   part_payload=_part_payload(participants, user),
+                  conv={**conv, "stale_n": sum(1 for pp in participants if pp["state"] == "stale")},
                   participants=participants,
                   total=total, pending_n=pending_n, share_url=share_url,
                   decided_label=decided_label, **_nav_ctx(user),

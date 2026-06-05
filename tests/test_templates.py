@@ -96,6 +96,9 @@ def test_poll_fullday_owner():
         share_url="https://x/scheduler/p/tok123", decided_label=None,
         notif_count=0, notifs=[], is_owner=True, msg_text="Poll closed.",
         csrf_token="tok", is_ts=False, gaps=[1],
+        conv={"state": "partial", "slots": 1, "best_slot_id": "s3",
+              "excluded": ["Bob"], "blockers": [], "responses": 2,
+              "pending_required": 0, "all_optional": False, "stale_n": 1},
         counts=slot_counts(FULLDAY_SLOTS, RESPONSES),
         participants=[
             {"email": "alice@example.com", "invite_id": "i1", "required": True,
@@ -112,14 +115,14 @@ def test_poll_fullday_owner():
                                 "state": "current", "last_contact": "invite · 2026-06-04 18:00",
                                 "contacts_n": 1, "trail": ""}]})
     assert "sched-bar" in html
-    assert "Close Poll" in html
+    assert "Close" in html              # ghost close in the strip
     assert "alice@example.com" in html   # row lands in the part-data payload
     assert 'id="part-data"' in html and "tabulator.min.js" in html
     assert "&lt;script&gt;" in html  # respondent name escaped
     assert "invite \\u00b7 2026-06-04 18:00" in html  # contact trail in JSON payload
-    assert 'id="part-form"' in html      # targeted-send form
+    assert "part-smart" in html  # smart reminders button (fetch-wired)
     assert "Email selected" in html
-    assert "remind-selected" in html
+    assert 'id="part-send"' in html   # email-selected button (fetch-wired)
 
 
 def test_poll_timeslot_decided():
@@ -211,3 +214,41 @@ def test_fullday_weeks_alignment():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+
+@pytest.mark.parametrize("conv,frags", [
+    ({"state": "collecting", "responses": 0, "blockers": [], "stale_n": 0},
+     ["Collecting replies", "share the link"]),
+    ({"state": "collecting", "responses": 2, "blockers": ["alice", "bob"], "stale_n": 0},
+     ["waiting on alice, bob"]),
+    ({"state": "ready", "slots": 1, "best_slot_id": "s1", "responses": 2,
+      "blockers": [], "stale_n": 0},
+     ["works for everyone", "2026-06-08", "Decide", "alert-success"]),
+    ({"state": "partial", "slots": 1, "best_slot_id": "s3", "excluded": ["Bob"],
+      "responses": 2, "blockers": [], "stale_n": 2},
+     ["works for all required", "excludes Bob", "2 responses outdated", "alert-warning"]),
+    ({"state": "blocked", "responses": 2, "blockers": [], "stale_n": 0},
+     ["No date fits", "Close poll", "Edit dates", "alert-error"]),
+    ({"state": "blocked", "no_dates": True, "responses": 0, "blockers": [], "stale_n": 0},
+     ["No dates in this poll yet", "Add dates"]),
+    ({"state": "closed"}, ["Closed without a final date", "Reopen"]),
+    ({"state": "decided"}, ["decided date was removed", "Reopen"]),
+])
+def test_convergence_strip_states(conv, frags):
+    tpl = env.from_string(
+        '{% from "_macros.html" import convergence_strip %}'
+        '{{ convergence_strip(poll, conv, "tok") }}')
+    poll = {"id": "p1", "status": "open", "mode": "full_day", "slots": FULLDAY_SLOTS}
+    html = tpl.render(poll=poll, conv=conv)
+    for frag in frags:
+        assert frag in html, f"{conv['state']}: missing {frag!r}"
+
+
+def test_convergence_strip_decided_with_label_is_empty():
+    tpl = env.from_string(
+        '{% from "_macros.html" import convergence_strip %}'
+        '{{ convergence_strip(poll, conv, "tok", decided_label="Mon 08") }}')
+    html = tpl.render(poll={"id": "p1", "slots": [], "mode": "full_day"},
+                      conv={"state": "decided"})
+    assert html.strip() == ""  # the Final Date card owns this state

@@ -271,15 +271,22 @@ def participant_states(poll: dict, responses: list[dict], invites: list[dict],
 
 # -- Convergence: how close is an open poll to a workable date? --
 
-def convergence(poll: dict, responses: list[dict], invites: list[dict]) -> dict:
-    """Status light for the poll list.
+def convergence(poll: dict, responses: list[dict], invites: list[dict]) -> dict:  # noqa: C901 — one state machine, clearer flat
+    """Single source of truth for poll status — feeds the dashboard dot AND
+    the poll page's status strip, including the presentation payload.
 
     States (open polls; required = required invitees + via-link respondents
     not marked optional):
       collecting — required input still missing (or no responses at all)
-      ready      — some slot works (yes) for ALL participants -> decide!
+      ready      — some slot works (yes) for everyone -> decide!
       partial    — some slot works for all REQUIRED participants only
-      blocked    — no slot works even for the required set
+                   (never reported when there is no required set — a
+                   "partial of nobody" is incoherent; it falls to blocked)
+      blocked    — no slot works even for the required set; no_dates=True
+                   when the poll has no slots at all
+    Extra payload: best_slot_id (most yes, then earliest), excluded (names
+    dropped by deciding the best slot in partial), blockers (who we wait
+    on), all_optional, responses, pending_required.
     Closed/decided polls pass through as their status.
     """
     if poll["status"] != "open":
@@ -293,8 +300,8 @@ def convergence(poll: dict, responses: list[dict], invites: list[dict]) -> dict:
         return by_invite.get(inv["id"]) or by_email.get(inv["email"].lower())
 
     required_inv = [i for i in invites if i.get("required", True)]
-    required_resps = [resp_of(i) for i in required_inv]
-    required_pending = sum(1 for r in required_resps if r is None)
+    pending_req = [i for i in required_inv if resp_of(i) is None]
+    required_resps = [r for r in (resp_of(i) for i in required_inv) if r is not None]
 
     # via-link respondents (no invite) count as required unless the owner
     # marked them optional — being uninvited is provenance, not importance
@@ -304,20 +311,43 @@ def convergence(poll: dict, responses: list[dict], invites: list[dict]) -> dict:
                and (r.get("respondent_email") or "").lower() not in invite_emails]
     required_resps += [r for r in walkins if r.get("required", True)]
 
-    if not responses or required_pending:
-        return {"state": "collecting", "pending_required": required_pending,
-                "responses": len(responses)}
+    base = {"responses": len(responses), "pending_required": len(pending_req),
+            "blockers": [i.get("name") or i["email"] for i in pending_req],
+            "all_optional": not required_inv and not any(
+                r.get("required", True) for r in walkins)}
+
+    slots = poll.get("slots")  # dashboard rows don't carry slots — optional
+    if slots is not None and not slots:
+        return {"state": "blocked", "no_dates": True, **base}
+    if not responses or pending_req:
+        return {"state": "collecting", **base}
 
     def works_for(resps, slot_id):
         return all(r["slot_availabilities"].get(slot_id) == "yes" for r in resps)
 
-    slot_ids = {sid for r in responses for sid in r["slot_availabilities"]}
-    all_ok = [s for s in slot_ids if works_for(responses, s)]
-    req_resps = [r for r in required_resps if r is not None]
-    req_ok = [s for s in slot_ids if works_for(req_resps, s)]
+    def yes_count(slot_id):
+        return sum(1 for r in responses
+                   if r["slot_availabilities"].get(slot_id) == "yes")
 
+    slot_order = {sl["id"]: i for i, sl in enumerate(slots or [])}
+
+    def best(slot_id_list):
+        # most yes votes first, then earliest in the poll's slot order
+        return min(slot_id_list,
+                   key=lambda sid: (-yes_count(sid), slot_order.get(sid, 1 << 30)))
+
+    slot_ids = {sid for r in responses for sid in r["slot_availabilities"]}
+    all_ok = [sid for sid in slot_ids if works_for(responses, sid)]
     if all_ok:
-        return {"state": "ready", "slots": len(all_ok)}
-    if req_ok:
-        return {"state": "partial", "slots": len(req_ok)}
-    return {"state": "blocked"}
+        return {"state": "ready", "slots": len(all_ok),
+                "best_slot_id": best(all_ok), **base}
+    if required_resps:  # a required consensus only means something if it exists
+        req_ok = [sid for sid in slot_ids if works_for(required_resps, sid)]
+        if req_ok:
+            bsid = best(req_ok)
+            excluded = [r.get("respondent_name") or r.get("respondent_email") or "?"
+                        for r in responses
+                        if r["slot_availabilities"].get(bsid) != "yes"]
+            return {"state": "partial", "slots": len(req_ok),
+                    "best_slot_id": bsid, "excluded": excluded, **base}
+    return {"state": "blocked", **base}

@@ -20,6 +20,16 @@
     });
   }
 
+  function toast(msg, ok) {
+    var t = document.createElement("div");
+    t.className = "toast toast-end z-50";
+    t.innerHTML = '<div class="alert ' + (ok ? "alert-success" : "alert-error") +
+                  ' shadow-lg"><span></span></div>';
+    t.querySelector("span").textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(function () { t.remove(); }, 4000);
+  }
+
   function freshSentinel() {
     return { kind: "new", ref: "", email: "", name: "", optional: false,
              state: "", last_contact: "", contacts_n: 0, trail: "", via_link: false };
@@ -173,15 +183,34 @@
     var emails = table.getSelectedData().map(function (d) { return d.email; });
     if (!emails.length) return;
     if (!confirm("Email " + emails.length + " selected participant(s) now? (bypasses the daily cooldown)")) return;
-    var form = document.getElementById("part-form");
-    emails.forEach(function (em) {
-      var inp = document.createElement("input");
-      inp.type = "hidden";
-      inp.name = "emails";
-      inp.value = em;
-      form.appendChild(inp);
-    });
-    form.submit();
+    var body = new URLSearchParams();
+    body.set("csrf", cfg.csrf);
+    emails.forEach(function (em) { body.append("emails", em); });
+    fetch(cfg.remind_selected_url, { method: "POST", body: body, redirect: "follow" })
+      .then(function (r) {
+        // counts ride on the redirect target (?msg=nudged&inv=..&upd=..)
+        var q = new URL(r.url).searchParams;
+        var n = (parseInt(q.get("inv") || 0, 10) || 0) + (parseInt(q.get("upd") || 0, 10) || 0);
+        toast(r.ok ? (n ? "Sent " + n + " email" + (n === 1 ? "" : "s") + "."
+                        : "Nothing to send.") : "Sending failed.", r.ok);
+        table.deselectRow();
+        refreshRows();
+      });
+  });
+
+  // smart reminders: same inline treatment — no page jump
+  var smart = document.getElementById("part-smart");
+  if (smart) smart.addEventListener("click", function () {
+    var body = new URLSearchParams();
+    body.set("csrf", cfg.csrf);
+    fetch(cfg.remind_url, { method: "POST", body: body, redirect: "follow" })
+      .then(function (r) {
+        var q = new URL(r.url).searchParams;
+        var n = (parseInt(q.get("inv") || 0, 10) || 0) + (parseInt(q.get("upd") || 0, 10) || 0);
+        toast(r.ok ? (n ? "Sent " + n + " reminder" + (n === 1 ? "" : "s") + "."
+                        : "Everyone is up to date — nothing sent.") : "Sending failed.", r.ok);
+        refreshRows();
+      });
   });
 
   // -- name guessing for the add row (first.last@ -> First Last) --------------

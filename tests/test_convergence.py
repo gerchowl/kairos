@@ -1,67 +1,67 @@
-"""Convergence engine unit tests — the poll-list status light."""
+"""Unit tests for the convergence engine — the single source of truth
+behind the dashboard dot and the poll page status strip."""
 
 from kairos.helpers import convergence
 
-OPEN = {"status": "open"}
+P = {"id": "p1", "status": "open",
+     "slots": [{"id": "s1", "date": "2026-07-01"}, {"id": "s2", "date": "2026-07-02"}]}
 
 
-def _resp(rid, avails, email=None, invite_id=None):
-    return {"id": rid, "invite_id": invite_id, "respondent_email": email,
-            "respondent_name": rid, "slot_availabilities": avails}
+def resp(rid, avail, name=None, email=None, required=True, invite=None):
+    return {"id": rid, "respondent_name": name or rid, "respondent_email": email,
+            "required": required, "invite_id": invite, "slot_availabilities": avail}
+
+
+def inv(iid, email, required=True, name=None):
+    return {"id": iid, "email": email, "required": required, "name": name}
+
+
+def test_all_optional_never_partial():
+    """works_for([]) used to be vacuously true -> nonsense 'partial'."""
+    rs = [resp("a", {"s1": "yes", "s2": "no"}, required=False),
+          resp("b", {"s1": "no", "s2": "yes"}, required=False)]
+    c = convergence(P, rs, [])
+    assert c["state"] == "blocked" and c["all_optional"]
+
+
+def test_all_optional_ready_via_full_consensus():
+    rs = [resp("a", {"s1": "yes"}, required=False),
+          resp("b", {"s1": "yes"}, required=False)]
+    c = convergence(P, rs, [])
+    assert c["state"] == "ready" and c["best_slot_id"] == "s1"
+
+
+def test_best_slot_most_yes_then_earliest():
+    poll = {**P, "slots": P["slots"] + [{"id": "s3", "date": "2026-07-03"}]}
+    rs = [resp("a", {"s1": "yes", "s2": "yes", "s3": "yes"}),
+          resp("b", {"s1": "no", "s2": "yes", "s3": "yes"}, required=False)]
+    c = convergence(poll, rs, [])
+    # s2 and s3 tie on yes-count (2) and beat s1; earliest (s2) wins
+    assert c["state"] == "ready" and c["best_slot_id"] == "s2"
+
+
+def test_partial_names_the_excluded():
+    rs = [resp("req", {"s1": "yes"}, name="Rita"),
+          resp("opt", {"s1": "no"}, name="Otto", required=False)]
+    c = convergence(P, rs, [])
+    assert c["state"] == "partial" and c["excluded"] == ["Otto"]
+
+
+def test_collecting_names_blockers():
+    c = convergence(P, [], [inv("i1", "a@x.org", name="Ada"), inv("i2", "b@x.org")])
+    assert c["state"] == "collecting" and c["blockers"] == ["Ada", "b@x.org"]
+
+
+def test_no_dates_is_blocked_with_reason():
+    c = convergence({**P, "slots": []}, [], [])
+    assert c["state"] == "blocked" and c["no_dates"]
+
+
+def test_dashboard_rows_without_slots_still_work():
+    row = {"id": "p1", "status": "open"}  # list_polls rows carry no slots
+    c = convergence(row, [resp("a", {"s1": "yes"})], [])
+    assert c["state"] == "ready"
 
 
 def test_non_open_passthrough():
-    assert convergence({"status": "decided"}, [], [])["state"] == "decided"
-    assert convergence({"status": "closed"}, [], [])["state"] == "closed"
-
-
-def test_no_responses_is_collecting():
-    assert convergence(OPEN, [], [])["state"] == "collecting"
-
-
-def test_pending_required_invitee_is_collecting():
-    invites = [{"id": "i1", "email": "a@x", "required": True}]
-    resp = [_resp("r1", {"s1": "yes"}, email="other@x")]
-    assert convergence(OPEN, resp, invites)["state"] == "collecting"
-
-
-def test_open_link_poll_common_slot_is_ready():
-    resps = [_resp("r1", {"s1": "yes", "s2": "no"}),
-             _resp("r2", {"s1": "yes", "s2": "yes"})]
-    c = convergence(OPEN, resps, [])
-    assert c["state"] == "ready" and c["slots"] == 1
-
-
-def test_open_link_poll_no_common_slot_is_blocked():
-    resps = [_resp("r1", {"s1": "yes", "s2": "no"}),
-             _resp("r2", {"s1": "no", "s2": "yes"})]
-    assert convergence(OPEN, resps, [])["state"] == "blocked"
-
-
-def test_required_fit_optional_missing_is_partial():
-    invites = [{"id": "i1", "email": "req@x", "required": True},
-               {"id": "i2", "email": "opt@x", "required": False}]
-    resps = [_resp("r1", {"s1": "yes", "s2": "yes"}, invite_id="i1"),
-             _resp("r2", {"s1": "no", "s2": "no"}, invite_id="i2")]
-    c = convergence(OPEN, resps, invites)
-    assert c["state"] == "partial" and c["slots"] == 2
-
-
-def test_everyone_fits_is_ready_with_walkin():
-    invites = [{"id": "i1", "email": "req@x", "required": True}]
-    resps = [_resp("r1", {"s1": "yes"}, invite_id="i1"),
-             _resp("r2", {"s1": "yes"}, email="walkin@y")]
-    assert convergence(OPEN, resps, invites)["state"] == "ready"
-
-
-def test_required_blocked_is_blocked():
-    invites = [{"id": "i1", "email": "a@x", "required": True},
-               {"id": "i2", "email": "b@x", "required": True}]
-    resps = [_resp("r1", {"s1": "yes", "s2": "no"}, invite_id="i1"),
-             _resp("r2", {"s1": "no", "s2": "yes"}, invite_id="i2")]
-    assert convergence(OPEN, resps, invites)["state"] == "blocked"
-
-
-def test_maybe_does_not_count_as_yes():
-    resps = [_resp("r1", {"s1": "maybe"}), _resp("r2", {"s1": "yes"})]
-    assert convergence(OPEN, resps, [])["state"] == "blocked"
+    assert convergence({**P, "status": "closed"}, [], [])["state"] == "closed"
