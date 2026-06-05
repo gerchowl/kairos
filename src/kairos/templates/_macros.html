@@ -28,7 +28,7 @@
 {% if conv.state == 'collecting' %}
 <div class="alert flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">⏳</span>
 <span>{% if conv.responses == 0 and not conv.blockers %}Collecting replies — share the link to gather availability.{% elif conv.blockers %}{{ conv.responses }} replied — waiting on {{ conv.blockers[:3] | join(', ') }}{% if conv.blockers | length > 3 %} +{{ conv.blockers | length - 3 }}{% endif %}.{% else %}Collecting replies — {{ conv.responses }} so far.{% endif %}{{ stale_note }}</span>
-{{ close_ghost(poll, csrf_token) }}</div>
+{{ close_ghost(poll, csrf_token, push=True) }}</div>
 
 {% elif conv.state == 'ready' %}
 <div class="alert alert-success flex flex-wrap items-center gap-2 my-4" role="status"><span aria-hidden="true">✓</span>
@@ -65,18 +65,18 @@
 {%- endmacro %}
 
 {% macro decide_form(poll, conv, csrf_token) -%}
-<form method="post" action="{{ P }}/polls/{{ poll.id }}/decide" class="inline flex items-center gap-2">
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/decide" class="inline flex items-center gap-2 ms-auto">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
 <label class="sr-only" for="decide-select">Final date</label>
-<select name="slot_id" id="decide-select" class="select select-sm w-auto bg-base-100 text-base-content border-base-300">
+<select name="slot_id" id="decide-select" class="select select-sm w-auto bg-base-200 text-base-content border-base-300">
 {% for s in poll.slots %}<option value="{{ s.id }}"{% if s.id == conv.best_slot_id %} selected{% endif %}>{{ format_slot(s, poll.mode) }}</option>{% endfor %}
 </select>
 <button type="submit" class="btn btn-sm strip-cta">Decide</button>
 </form>
 {%- endmacro %}
 
-{% macro close_ghost(poll, csrf_token) -%}
-<form method="post" action="{{ P }}/polls/{{ poll.id }}/close" class="inline ms-auto">
+{% macro close_ghost(poll, csrf_token, push=False) -%}
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/close" class="inline{{ ' ms-auto' if push }}">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
 <button type="submit" class="btn btn-ghost btn-sm opacity-60" onclick="return confirm('Close this poll?')">Close</button>
 </form>
