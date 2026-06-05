@@ -1,0 +1,17 @@
+{# Infinite-scroll date-select calendar — driven by cal-select.js.
+   Selected dates land as hidden inputs name="dates" in #hidden-dates. #}
+<div id="cal-wrap">
+<div id="cal-nav">
+<select id="cal-year" class="select select-sm w-auto"></select>
+<div id="cal-month-btns">
+{% for m in MONTH_NAMES[1:] %}<button type="button">{{ m }}</button>{% endfor %}
+</div>
+</div>
+<div id="cal-scroll">
+<table id="cal-grid"><thead><tr>
+<th class="cal-wk"></th><th>Mo</th><th>Tu</th><th>We</th><th>Th</th><th>Fr</th><th class="cal-we">Sa</th><th class="cal-we">Su</th>
+</tr></thead><tbody id="cal-body"></tbody></table>
+</div>
+</div>
+<div id="selected-summary" class="text-sm opacity-60 my-2"></div>
+<div id="hidden-dates"></div>

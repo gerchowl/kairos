@@ -1,0 +1,11 @@
+{% extends "scheduler_base.html" %}
+{% block head %}{% if noindex %}<meta name="robots" content="noindex,nofollow">{% endif %}{% endblock %}
+{% block content %}
+<div class="card bg-base-100 shadow-sm">
+  <div class="card-body">
+    <h1 class="card-title text-2xl{% if error %} text-error{% endif %}">{{ heading }}</h1>
+    {% if detail %}<p>{{ detail }}</p>{% endif %}
+    {% if back %}<div class="card-actions"><a href="{{ back }}" class="btn btn-ghost btn-sm">{{ back_label | default('Back') }}</a></div>{% endif %}
+  </div>
+</div>
+{% endblock %}

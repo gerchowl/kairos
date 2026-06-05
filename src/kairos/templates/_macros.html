@@ -1,0 +1,94 @@
+{# Status light for the poll list: convergence-aware for open polls. #}
+{% macro status_dot(poll) -%}
+{% set state = poll.conv.state if poll.conv else poll.status %}
+{% set map = {
+  'collecting': ('●', 'text-info', 'Open — collecting responses'),
+  'ready': ('●', 'text-success', 'A date works for everyone — ready to decide'),
+  'partial': ('●', 'text-warning', 'A date works for all required participants'),
+  'blocked': ('●', 'text-error', 'No date works for all required participants'),
+  'open': ('●', 'text-info', 'Open'),
+  'decided': ('✓', 'text-primary', 'Decided'),
+  'closed': ('■', 'opacity-40', 'Closed'),
+} %}
+{% set d = map.get(state, ('●', 'opacity-40', state)) %}
+<span class="{{ d[1] }} shrink-0 text-lg leading-none" title="{{ d[2] }}">{{ d[0] }}</span>
+{%- endmacro %}
+
+{% macro status_badge(status) -%}
+<span class="badge {{ {'open': 'badge-success', 'closed': 'badge-error', 'decided': 'badge-info'}.get(status, 'badge-ghost') }}">{{ status }}</span>
+{%- endmacro %}
+
+{# Full-width page hero. Optional badge (poll status) and subtitle; wrap in
+   {% call %} to append CTA buttons / extra lines below the subtitle. #}
+{% macro page_hero(title, subtitle=None, badge=None) -%}
+<div class="hero bg-base-100 shadow-sm">
+  <div class="hero-content text-center py-10">
+    <div class="max-w-2xl">
+      <h1 class="text-4xl font-bold">{{ title }}{% if badge %} {{ status_badge(badge) }}{% endif %}</h1>
+      {% if subtitle %}<p class="pt-3 opacity-70">{{ subtitle }}</p>{% endif %}
+      {% if caller %}<div class="pt-4">{{ caller() }}</div>{% endif %}
+    </div>
+  </div>
+</div>
+{%- endmacro %}
+
+{# Main-area section as a card. Wrap content in {% call section_card("Heading") %}. #}
+{% macro section_card(heading=None) -%}
+<div class="card bg-base-100 shadow-sm my-4">
+  <div class="card-body">
+    {% if heading %}<h2 class="card-title">{{ heading }}</h2>{% endif %}
+    {{ caller() }}
+  </div>
+</div>
+{%- endmacro %}
+
+{% macro text_field(name, label, type='text', value='', required=False, input_class='') -%}
+<fieldset class="fieldset">
+  <legend class="fieldset-legend">{{ label }}</legend>
+  <input type="{{ type }}" name="{{ name }}" id="field-{{ name }}" value="{{ value }}"
+         class="input w-full {{ input_class }}" {% if required %}required{% endif %}>
+</fieldset>
+{%- endmacro %}
+
+{% macro availability_cell(av, gap=False) -%}
+<td class="av-{{ av }}{{ ' sched-gap-after' if gap }}">{{ {'yes': '✓', 'maybe': '?', 'no': '✗'}.get(av, '✗') }}</td>
+{%- endmacro %}
+
+{# Full-day response grid: respondent rows + stacked-bar summary row.
+   Bars are painted by grid.js from the data attributes; gaps lists column
+   indices that get a separator stripe (non-consecutive dates). #}
+{% macro fullday_grid(poll, responses, counts, total, pending_n, gaps=[], decidable=False) -%}
+<div class="overflow-x-auto">
+<table class="sched-table">
+<tr><th></th>{% for s in poll.slots %}<th class="{{ 'sched-gap-after' if loop.index0 in gaps }}"{% if decidable %} data-decide-slot="{{ s.id }}"{% endif %}>{{ format_slot(s, poll.mode) }}</th>{% endfor %}</tr>
+{% for r in responses %}
+<tr><td class="sched-name-cell"><strong>{{ r.respondent_name }}</strong></td>
+{%- for s in poll.slots %}{{ availability_cell(r.slot_availabilities.get(s.id, 'no'), gap=loop.index0 in gaps) }}{% endfor %}</tr>
+{% endfor %}
+<tr><td class="sched-name-cell"><strong>Summary</strong></td>
+{%- for c in counts %}
+<td class="sched-summary-cell{{ ' sched-gap-after' if loop.index0 in gaps }}">
+  <div class="sched-bar" data-yes="{{ c.yes }}" data-maybe="{{ c.maybe }}" data-no="{{ c.no }}" data-total="{{ total }}"></div>
+  <div class="sched-counts">
+    {%- if c.yes %}<span class="sched-n-yes">✓{{ c.yes }}</span> {% endif -%}
+    {%- if c.maybe %}<span class="sched-n-maybe">?{{ c.maybe }}</span> {% endif -%}
+    {%- if c.no %}<span class="sched-n-no">✗{{ c.no }}</span> {% endif -%}
+    {%- if pending_n %}<span class="sched-n-pending">·{{ pending_n }}</span> {% endif -%}
+    <span class="sched-n-total">/{{ total if total else 1 }}</span>
+  </div>
+</td>
+{%- endfor %}</tr>
+</table>
+</div>
+{%- endmacro %}
+
+{# Time-slot heatmap grid: skeleton table + JSON payload, built by grid.js.
+   The tz note is filled by grid.js when the viewer's browser timezone
+   differs from the poll's. #}
+{% macro ts_grid(payload) -%}
+<script type="application/json" id="ts-grid-data">{{ payload | tojson }}</script>
+<div class="overflow-x-auto my-3">
+<table id="ts-grid"><thead><tr><th></th></tr></thead><tbody></tbody></table>
+</div>
+<div id="ts-tz-note" class="text-xs text-info"></div>
+{%- endmacro %}

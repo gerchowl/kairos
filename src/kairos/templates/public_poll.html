@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% from "_macros.html" import page_hero, section_card, fullday_grid, ts_grid, text_field %}
+{% block head %}
+<meta name="robots" content="noindex,nofollow">
+<script src="{{ P }}/static/grid.js?v={{ static_v }}" defer></script>
+{% endblock %}
+{% block hero %}
+{% call page_hero(poll.title, poll.description, badge=(poll.status if poll.status != 'open' else None)) %}
+<p class="text-sm opacity-60">{{ poll.mode | replace('_', ' ') }} &middot; {{ poll.timezone }}</p>
+{% endcall %}
+{% endblock %}
+{% block content %}
+
+{% if msg %}<div class="alert alert-success my-4"><span>{{ msg }}</span></div>{% endif %}
+
+{% if decided_label %}
+<div class="alert alert-info my-4 justify-center text-center">
+  <div>
+    <h2 class="text-lg font-bold">Final date</h2>
+    <p class="text-lg">{{ decided_label }}</p>
+    <a href="{{ P }}/p/{{ poll.public_token }}/event.ics" class="btn btn-sm mt-2">Add to calendar (.ics)</a>
+  </div>
+</div>
+{% endif %}
+
+{% if is_ts %}
+  {# Combined heatmap + picker: the grid doubles as the response input when open #}
+  {% if is_open %}
+  {% call section_card("Your Response — " ~ (responses | length) ~ " so far") %}
+  <form method="post" action="{{ action }}" id="response-form">
+    {{ text_field('name', 'Your Name', value=prefill_name, required=True) }}
+    {{ text_field('email', 'Email (optional)', type='email', value=prefill_email) }}
+    <p class="text-sm opacity-60 mt-2">Click/drag to mark your availability.
+      <span class="ts-legend-item"><span class="ts-legend-badge ts-legend-yes">✓</span> yes</span>
+      <span class="ts-legend-item"><span class="ts-legend-badge ts-legend-maybe">?</span> maybe</span>
+      <span class="ts-legend-item"><span class="ts-legend-badge ts-legend-no">✗</span> no</span></p>
+    {{ ts_grid(ts_payload) }}
+    <div id="sched-hidden-avails"></div>
+    <div class="card-actions mt-2">
+    <button type="submit" id="save-btn" class="btn btn-primary">Save Response</button>
+    </div>
+  </form>
+  {% endcall %}
+  {% else %}
+  {% call section_card("Responses (" ~ (responses | length) ~ ")") %}
+  {{ ts_grid(ts_payload) }}
+  <div class="text-xs opacity-60">Hover cells to see who's available</div>
+  {% endcall %}
+  {% endif %}
+{% else %}
+  {% if responses %}
+  {% call section_card("Responses (" ~ (responses | length) ~ ")") %}
+  {{ fullday_grid(poll, responses, counts, total, pending_n, gaps) }}
+  {% endcall %}
+  {% endif %}
+  {% if is_open %}
+  {% call section_card("Your Response") %}
+  <form method="post" action="{{ action }}" id="response-form">
+    {{ text_field('name', 'Your Name', value=prefill_name, required=True) }}
+    {{ text_field('email', 'Email (optional)', type='email', value=prefill_email) }}
+    <p class="text-sm opacity-60 mt-2">Click a highlighted date to cycle: available → maybe → unavailable. Drag for rectangular selection.</p>
+    <script type="application/json" id="fullday-cal-data">{{ fullday_payload | tojson }}</script>
+    <div class="overflow-x-auto overflow-y-auto max-h-96 border border-base-300 rounded my-3">
+    <table id="resp-cal"><thead><tr>
+    <th class="cal-wk"></th><th>Mo</th><th>Tu</th><th>We</th><th>Th</th><th>Fr</th><th class="cal-we">Sa</th><th class="cal-we">Su</th>
+    </tr></thead><tbody>
+    {% for week in weeks %}
+    {% set ri = loop.index0 %}
+    <tr><td class="cal-wk-cell">W{{ week.num }}</td>
+    {%- for day in week.days %}
+    <td class="{{ 'cal-we-col' if loop.index0 >= 5 }}{{ ' month-alt' if day.month % 2 == 1 }}">
+      {%- if day.is_slot -%}
+      <div class="cal-cell slot-cell" data-row="{{ ri }}" data-col="{{ loop.index0 }}" data-slot="{{ day.slot_id }}" data-day="{{ day.day }}">{{ day.day }}{% if day.day == 1 %}<span class="month-band">{{ MONTH_NAMES[day.month] }}</span>{% endif %}</div>
+      {%- else -%}
+      <div class="cal-cell past">{{ day.day }}{% if day.day == 1 %}<span class="month-band">{{ MONTH_NAMES[day.month] }}</span>{% endif %}</div>
+      {%- endif -%}
+    </td>
+    {%- endfor %}</tr>
+    {% endfor %}
+    </tbody></table>
+    </div>
+    <div id="sched-hidden-avails"></div>
+    <div class="card-actions mt-2">
+    <button type="submit" id="save-btn" class="btn btn-primary">Save Response</button>
+    </div>
+  </form>
+  {% endcall %}
+  {% endif %}
+{% endif %}
+{% endblock %}

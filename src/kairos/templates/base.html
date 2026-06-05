@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ title | default(BRAND) }}{% endblock %} — {{ BRAND }}</title>
+<script>
+// Apply the saved theme before first paint (no flash); default follows the OS.
+(function () {
+  var t = localStorage.getItem("kairos-theme");
+  if (t) document.documentElement.setAttribute("data-theme", t);
+})();
+</script>
+<link rel="stylesheet" href="{{ P }}/static/kairos.css?v={{ static_v }}">
+<script src="{{ P }}/static/htmx.min.js?v={{ static_v }}" defer></script>
+{% block head %}{% endblock %}
+</head>
+<body class="min-h-screen bg-base-200 flex flex-col">
+{% block nav %}
+<header class="navbar bg-base-100 border-b border-base-300 px-3 sm:px-6 min-h-14">
+  <div class="navbar-start gap-1">
+    <a href="{{ HOME_URL }}" class="text-lg font-bold tracking-tight px-2">{{ BRAND }}</a>
+    {% block nav_links %}{% endblock %}
+  </div>
+  <div class="navbar-end gap-1">
+    <button type="button" id="theme-toggle" class="btn btn-ghost btn-circle" aria-label="Toggle dark mode">
+      <svg class="theme-icon-light h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v1.5M12 19.5V21M4.72 4.72l1.06 1.06M18.22 18.22l1.06 1.06M3 12h1.5M19.5 12H21M4.72 19.28l1.06-1.06M18.22 5.78l1.06-1.06M15.75 12a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0Z"/></svg>
+      <svg class="theme-icon-dark h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M21.752 15.002A9.718 9.718 0 0 1 18 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 0 0 3 11.25C3 16.635 7.365 21 12.75 21a9.753 9.753 0 0 0 9.002-5.998Z"/></svg>
+    </button>
+    {% if user %}
+    <span class="text-sm opacity-70 px-2">{{ user.name | default(user.display_name) }}</span>
+      <ul tabindex="0" class="dropdown-content menu menu-sm bg-base-100 border border-base-300 rounded-box shadow-sm z-20 w-44 p-2 mt-2">
+        <li><a href="/profile">Profile</a></li>
+        <li><a href="/logout">Logout</a></li>
+      </ul>
+    </div>
+    {% else %}
+    
+    {% endif %}
+  </div>
+</header>
+{% endblock %}
+{% block hero %}{% endblock %}
+<main class="container mx-auto max-w-4xl p-4 w-full grow">
+{% block content %}{% endblock %}
+</main>
+{% block footer %}
+<footer class="footer footer-center bg-base-100 text-base-content/60 p-6 mt-10">
+  <aside>
+    <p><span class="font-semibold text-base-content/80">{{ BRAND }}</span> &mdash; scheduling polls &middot; <a class="link" href="https://github.com/gerchowl/kairos">github.com/gerchowl/kairos</a></p>
+  </aside>
+</footer>
+{% endblock %}
+<script>
+// Light/dark toggle: explicit choice wins over the OS preference and persists.
+(function () {
+  var btn = document.getElementById("theme-toggle");
+  if (!btn) return;
+  var root = document.documentElement;
+  function current() {
+    return root.getAttribute("data-theme") ||
+      (matchMedia("(prefers-color-scheme: dark)").matches ? "dalton-dark" : "dalton-bright");
+  }
+  btn.addEventListener("click", function () {
+    var next = current() === "dalton-dark" ? "dalton-bright" : "dalton-dark";
+    root.setAttribute("data-theme", next);
+    localStorage.setItem("kairos-theme", next);
+  });
+})();
+</script>
+</body>
+</html>

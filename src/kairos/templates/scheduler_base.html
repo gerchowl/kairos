@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block nav_links %}
+<a href="{{ P }}/" class="btn btn-ghost btn-sm">Kairos</a>
+{% if user %}
+<div class="dropdown">
+  <div tabindex="0" role="button" class="btn btn-ghost btn-sm btn-circle" aria-label="Notifications">
+    <span class="relative inline-flex">
+      <svg class="h-5 w-5 text-info" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.76c0 1.6 1.123 2.994 2.707 3.227 1.087.16 2.185.283 3.293.369V21l4.076-4.076a1.526 1.526 0 0 1 1.037-.443 48.282 48.282 0 0 0 5.68-.494c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0 0 12 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018Z"/></svg>
+      {% if notif_count %}<span class="badge badge-info badge-xs absolute -top-2 -right-3">{{ notif_count }}</span>{% endif %}
+    </span>
+  </div>
+  <ul tabindex="0" class="dropdown-content menu menu-sm bg-base-100 border border-base-300 rounded-box shadow-sm z-20 w-80 p-2 mt-2">
+    {% for n in notifs %}
+    <li><a href="{{ P }}/polls/{{ n.poll_id }}">{{ n.message }}</a></li>
+    {% else %}
+    <li class="menu-disabled"><span class="opacity-60">No new notifications</span></li>
+    {% endfor %}
+    {% if notif_count %}
+    <li class="border-t border-base-300 mt-1 pt-1">
+      <form method="post" action="{{ P }}/notifications/read-all" class="p-0">
+        <input type="hidden" name="csrf" value="{{ csrf_token }}">
+        <button type="submit" class="w-full text-left px-3 py-1">Mark all read</button>
+      </form>
+    </li>
+    {% endif %}
+  </ul>
+</div>
+{% endif %}
+{% endblock %}

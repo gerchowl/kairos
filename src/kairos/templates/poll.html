@@ -1,0 +1,192 @@
+{% extends "scheduler_base.html" %}
+{% from "_macros.html" import page_hero, section_card, fullday_grid, ts_grid, text_field %}
+{% block head %}<script src="{{ P }}/static/grid.js?v={{ static_v }}" defer></script>{% endblock %}
+{% block hero %}
+{% call page_hero(poll.title, poll.description, badge=poll.status) %}
+<p class="text-sm opacity-60">{{ poll.mode | replace('_', ' ') }} &middot; {{ poll.timezone }}</p>
+{% if is_owner %}<a href="{{ P }}/polls/{{ poll.id }}/edit" class="btn btn-ghost btn-sm mt-2">Edit Poll</a>{% endif %}
+{% endcall %}
+{% endblock %}
+{% block content %}
+
+{% if msg_text %}<div class="alert alert-success my-4"><span>{{ msg_text }}</span></div>{% endif %}
+
+{% if decided_label %}
+{% call section_card("Final Date") %}
+<div class="flex items-center gap-3 flex-wrap">
+  <span class="badge badge-info badge-lg">{{ decided_label }}</span>
+  <a href="{{ P }}/polls/{{ poll.id }}/event.ics" class="btn btn-ghost btn-sm">Download .ics</a>
+</div>
+{% if is_owner %}
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/email-decision" class="mt-2">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<fieldset class="fieldset">
+  <legend class="fieldset-legend">Message (optional — included in the email)</legend>
+  <textarea name="note" class="textarea w-full"></textarea>
+</fieldset>
+<button type="submit" class="btn btn-primary mt-2" {% if not recipients_n %}disabled{% endif %}
+        onclick="return confirm('Email the final date (with .ics attached) to {{ recipients_n }} recipient{{ '' if recipients_n == 1 else 's' }}?')">
+  Email everyone ({{ recipients_n }})
+</button>
+{% if not recipients_n %}<p class="text-sm opacity-60 mt-1">No respondent or invitee has an email address.</p>{% endif %}
+</form>
+{% endif %}
+{% endcall %}
+{% endif %}
+
+{% call section_card("Share Link") %}
+<div class="flex items-center gap-2">
+  <div class="bg-base-200 rounded p-3 font-mono text-sm break-all grow" id="share-url">{{ share_url }}</div>
+  <button type="button" class="btn btn-ghost btn-sm"
+          onclick="navigator.clipboard.writeText(document.getElementById('share-url').textContent.trim()); this.textContent='Copied!'">Copy</button>
+</div>
+<p class="text-sm opacity-60">Anyone with this link can respond — no account needed.</p>
+{% endcall %}
+
+{% call section_card("Responses (" ~ (responses | length) ~ ")") %}
+{% if is_ts %}
+{{ ts_grid(ts_payload) }}
+<div class="text-xs opacity-60">Hover cells to see who's available{% if decidable %} &middot; click a slot to pick it as the final date{% endif %}</div>
+{% else %}
+{{ fullday_grid(poll, responses, counts, total, pending_n, gaps, decidable=decidable) }}
+{% if decidable %}<div class="text-xs opacity-60">Click a date header to pick it as the final date</div>{% endif %}
+{% endif %}
+{% if not responses %}
+<p class="text-sm opacity-60">No responses yet. Share the link to start collecting availability.</p>
+{% endif %}
+{% endcall %}
+
+{% if is_owner and poll.status == 'open' %}
+{% call section_card("Actions") %}
+<div class="flex items-center gap-3 flex-wrap">
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/close" class="inline">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<button type="submit" class="btn btn-error" onclick="return confirm('Close this poll?')">Close Poll</button>
+</form>
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/decide" class="inline flex items-center gap-2">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<select name="slot_id" id="decide-select" class="select w-auto">
+{% for s in poll.slots %}<option value="{{ s.id }}">{{ format_slot(s, poll.mode) }}</option>{% endfor %}
+</select>
+<button type="submit" class="btn btn-primary">Decide</button>
+</form>
+</div>
+<p class="text-sm opacity-60 mt-2">Pick the final date by clicking a slot in the responses matrix above, or via the dropdown.</p>
+{% endcall %}
+
+{% elif is_owner %}
+{% call section_card("Actions") %}
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/reopen" class="inline">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<button type="submit" class="btn btn-primary">Reopen Poll</button>
+</form>
+<p class="text-sm opacity-60">Reopening accepts responses again{% if poll.status == 'decided' %} and clears the decided date{% endif %}.</p>
+{% endcall %}
+{% endif %}
+
+{% if is_owner %}
+{% call section_card("Participants") %}
+{% if poll.status == 'open' %}
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/invite" class="flex items-end gap-2 flex-wrap">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<div class="grow">{{ text_field('email', 'Email address', type='email', required=True) }}</div>
+<fieldset class="fieldset">
+  <legend class="fieldset-legend">Importance</legend>
+  <select name="importance" class="select w-auto">
+  <option value="required">Required</option>
+  <option value="optional">Optional</option>
+  </select>
+</fieldset>
+<button type="submit" class="btn btn-primary mb-1">Send Invite</button>
+</form>
+<p class="text-sm opacity-60">Required invitees drive the poll's status light: it turns green when a date works for everyone, orange when only the required people fit.</p>
+{% endif %}
+
+{% if participants %}
+<div id="part-filters" class="join my-2">
+  <button type="button" class="btn btn-xs join-item btn-active" data-pfilter="">All</button>
+  <button type="button" class="btn btn-xs join-item" data-pfilter="pending">Pending</button>
+  <button type="button" class="btn btn-xs join-item" data-pfilter="stale">Stale</button>
+  <button type="button" class="btn btn-xs join-item" data-pfilter="current">Current</button>
+</div>
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/remind-selected" id="part-form"
+      onsubmit="return confirm('Email the selected participants now? (bypasses the daily cooldown)')">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<div class="overflow-x-auto">
+<table class="table table-sm" id="part-table">
+<thead><tr>
+<th><input type="checkbox" id="part-all" class="checkbox checkbox-xs" title="Select shown"></th>
+<th>Email</th><th>Name</th><th>Importance</th><th>State</th><th>Last contacted</th>
+</tr></thead>
+<tbody>
+{% for p in participants %}
+<tr data-state="{{ p.state }}">
+<td><input type="checkbox" name="emails" value="{{ p.email }}" class="checkbox checkbox-xs part-check"></td>
+<td>{{ p.email }}</td>
+<td>{{ p.name or '—' }}</td>
+<td>{{ 'Required' if p.required else ('Optional' if p.invited else 'Walk-in') }}</td>
+<td><span class="badge badge-sm {{ {'pending': 'badge-warning', 'stale': 'badge-info', 'current': 'badge-success'}[p.state] }}">{{ p.state }}</span></td>
+<td class="text-xs opacity-70 whitespace-nowrap"{% if p.contacts %} title="{% for c in p.contacts %}{{ c.kind }} {{ (c.sent_at | string)[:16] }}{{ '&#10;' if not loop.last }}{% endfor %}"{% endif %}>
+{% if p.last_contact %}{{ p.last_contact.kind }} &middot; {{ (p.last_contact.sent_at | string)[:16] }}{% if p.contacts | length > 1 %} <span class="opacity-50">(+{{ p.contacts | length - 1 }})</span>{% endif %}{% else %}never{% endif %}
+</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% if poll.status == 'open' %}
+<div class="flex items-center gap-3 mt-2 flex-wrap">
+<button type="submit" id="part-send" class="btn btn-primary btn-sm" disabled>Email selected (0)</button>
+<span class="text-sm opacity-60">Selected people get a state-appropriate mail right now (pending → reminder, stale → new-dates notice, current → plain reminder). Logged in the trail.</span>
+</div>
+{% endif %}
+</form>
+{% endif %}
+
+{% if poll.status == 'open' and (invites or responses) %}
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/remind" class="mt-3">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<button type="submit" class="btn btn-ghost btn-sm">Send smart reminders</button>
+<p class="text-sm opacity-60 mt-1">Idempotent &amp; safe to repeat: only pending invitees (max. once a day) and people who haven't seen newly added dates get an email.</p>
+</form>
+{% endif %}
+{% endcall %}
+
+<script>
+(function () {
+  var form = document.getElementById('part-form');
+  if (!form) return;
+  var rows = Array.prototype.slice.call(form.querySelectorAll('tbody tr'));
+  var send = document.getElementById('part-send');
+  var all = document.getElementById('part-all');
+  function refresh() {
+    if (!send) return;
+    var n = form.querySelectorAll('.part-check:checked').length;
+    send.disabled = !n;
+    send.textContent = 'Email selected (' + n + ')';
+  }
+  form.addEventListener('change', refresh);
+  if (all) all.addEventListener('change', function () {
+    rows.forEach(function (tr) {
+      if (!tr.classList.contains('hidden')) tr.querySelector('.part-check').checked = all.checked;
+    });
+    refresh();
+  });
+  document.querySelectorAll('#part-filters [data-pfilter]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var f = this.dataset.pfilter;
+      document.querySelectorAll('#part-filters .btn-active').forEach(function (b) { b.classList.remove('btn-active'); });
+      this.classList.add('btn-active');
+      rows.forEach(function (tr) {
+        var show = !f || tr.dataset.state === f;
+        tr.classList.toggle('hidden', !show);
+        if (!show) tr.querySelector('.part-check').checked = false;
+      });
+      refresh();
+    });
+  });
+  refresh();
+})();
+</script>
+{% endif %}
+{% endblock %}

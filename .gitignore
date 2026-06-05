@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+kairos.db
+node_modules/
+dist/
+.pytest_cache/

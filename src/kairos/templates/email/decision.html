@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+{# HTML email — inline CSS is required by mail clients (style-guard exempts templates/email/). #}
+<html>
+<body style="font-family: -apple-system, system-ui, sans-serif; color: #2e3038;">
+<p><strong>{{ sender_name }}</strong> has decided on a final date for:</p>
+<h2 style="color: #3060c8;">{{ poll_title }}</h2>
+<p style="font-size: 18px;"><strong>{{ slot_label }}</strong></p>
+{% if note %}<p style="background: #f4f1eb; border-left: 3px solid #3060c8; padding: 10px 14px;">{{ note }}</p>{% endif %}
+<p><a href="{{ poll_url }}" style="background: #3060c8; color: #f4f1eb; padding: 12px 24px; border-radius: 4px; text-decoration: none; display: inline-block;">View Poll</a></p>
+<p style="color: #70707a; font-size: 13px;">The attached calendar file adds the event to your calendar.</p>
+<p style="color: #70707a; font-size: 12px; margin-top: 24px;">Sent via <strong>{{ BRAND }}</strong> scheduling</p>
+</body>
+</html>

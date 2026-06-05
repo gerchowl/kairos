@@ -1,0 +1,84 @@
+{% extends "scheduler_base.html" %}
+{% from "_macros.html" import status_dot %}
+{% block content %}
+<div class="flex items-end justify-between gap-4 flex-wrap mt-4 mb-3">
+  <div>
+    <h1 class="text-xl font-bold">{{ BRAND }}</h1>
+    <p class="text-sm opacity-60">Find a time that works — create a poll and share the link.</p>
+  </div>
+  <div class="flex items-center gap-2">
+    <div id="poll-filters" class="join">
+      <button type="button" class="btn btn-xs join-item btn-active" data-filter="">All</button>
+      <button type="button" class="btn btn-xs join-item" data-filter="open">Open</button>
+      <button type="button" class="btn btn-xs join-item" data-filter="decided">Decided</button>
+      <button type="button" class="btn btn-xs join-item" data-filter="closed">Closed</button>
+    </div>
+    <label class="input input-sm w-52 flex items-center gap-2">
+      <svg class="h-4 w-4 opacity-50" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="m21 21-4.34-4.34M17 10.5a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0Z"/></svg>
+      <input type="search" id="poll-search" class="grow" placeholder="Search polls…">
+    </label>
+  </div>
+</div>
+
+<a href="{{ P }}/new" class="flex items-center gap-3 border border-dashed border-base-content/25 rounded-box px-4 py-3 mb-2 opacity-50 hover:opacity-100 transition-opacity">
+  <span class="text-xl leading-none font-semibold">+</span>
+  <span class="font-semibold">New poll</span>
+</a>
+
+<ul id="poll-list" class="space-y-2">
+{% for poll in polls %}
+<li data-title="{{ poll.title | lower }}" data-status="{{ poll.status }}">
+<a href="{{ P }}/polls/{{ poll.id }}" class="flex items-center gap-3 bg-base-100 rounded-box px-4 py-3 shadow-sm hover:shadow-md transition-shadow">
+  {{ status_dot(poll) }}
+  <span class="font-semibold truncate">{{ poll.title }}</span>
+  <span class="text-sm opacity-60 whitespace-nowrap">{{ poll.response_count }} resp.{% if poll.invite_count %} &middot; {{ poll.invite_count }} inv.{% endif %}</span>
+  <span class="text-sm opacity-40 whitespace-nowrap ms-auto hidden sm:inline">{{ (poll.created_at | string)[:10] }}</span>
+  <button type="button" class="btn btn-ghost btn-xs btn-circle shrink-0" title="Copy share link"
+          data-link="{{ P }}/p/{{ poll.public_token }}"
+          onclick="event.preventDefault(); event.stopPropagation(); navigator.clipboard.writeText(location.origin + this.dataset.link); this.classList.add('text-success'); this.title = 'Copied!';">
+    <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.8" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M13.19 8.688a4.5 4.5 0 0 1 1.242 7.244l-4.5 4.5a4.5 4.5 0 0 1-6.364-6.364l1.757-1.757m13.35-.622 1.757-1.757a4.5 4.5 0 0 0-6.364-6.364l-4.5 4.5a4.5 4.5 0 0 0 1.242 7.244"/></svg>
+  </button>
+</a>
+</li>
+{% else %}
+<li id="poll-empty"><p class="opacity-60 px-4 py-6">No polls yet — create your first one above.</p></li>
+{% endfor %}
+</ul>
+<p id="poll-no-match" class="opacity-60 px-4 py-6 hidden">No polls match.</p>
+
+<div class="flex gap-4 flex-wrap text-xs opacity-60 mt-6 px-1">
+  <span><span class="text-info">●</span> collecting</span>
+  <span><span class="text-success">●</span> works for everyone — decide!</span>
+  <span><span class="text-warning">●</span> works for all required</span>
+  <span><span class="text-error">●</span> no date for required</span>
+  <span><span class="text-primary">✓</span> decided</span>
+</div>
+
+<script>
+(function () {
+  var search = document.getElementById('poll-search');
+  var items = Array.prototype.slice.call(document.querySelectorAll('#poll-list [data-title]'));
+  var noMatch = document.getElementById('poll-no-match');
+  var filter = '';
+  function apply() {
+    var q = (search.value || '').toLowerCase();
+    var visible = 0;
+    items.forEach(function (li) {
+      var ok = (!q || li.dataset.title.indexOf(q) !== -1) && (!filter || li.dataset.status === filter);
+      li.classList.toggle('hidden', !ok);
+      if (ok) visible++;
+    });
+    noMatch.classList.toggle('hidden', visible > 0 || !items.length);
+  }
+  search.addEventListener('input', apply);
+  document.querySelectorAll('#poll-filters [data-filter]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      filter = this.dataset.filter;
+      document.querySelectorAll('#poll-filters .btn-active').forEach(function (b) { b.classList.remove('btn-active'); });
+      this.classList.add('btn-active');
+      apply();
+    });
+  });
+})();
+</script>
+{% endblock %}
