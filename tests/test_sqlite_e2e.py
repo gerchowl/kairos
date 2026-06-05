@@ -185,3 +185,35 @@ def test_named_invites_and_inline_edit(tmp_path, monkeypatch):
         # payload feeds the table
         page = c.get(f"/scheduler/polls/{pid}")
         assert 'id="part-data"' in page.text and "Robert" in page.text
+
+
+def test_via_link_respondent_optional_toggle(tmp_path, monkeypatch):
+    """Via-link people count as required for convergence until marked optional."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    from kairos.main import create_app
+    api = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver",
+                    headers={"X-User": "alice", "X-Email": "a@e.org", "X-Name": "Alice"}) as c:
+        poll = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "Conv", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-01"}, {"date": "2026-07-02"}]}).json()
+        pid, s1, s2 = poll["id"], poll["slots"][0]["id"], poll["slots"][1]["id"]
+        # two via-link respondents with disjoint availability -> blocked
+        c.post(f"/scheduler/api/polls/{pid}/respond", headers=api,
+               json={"name": "A", "email": "x@example.org",
+                     "availabilities": {s1: "yes", s2: "no"}})
+        rid = c.post(f"/scheduler/api/polls/{pid}/respond", headers=api,
+                     json={"name": "B", "email": "y@example.org",
+                           "availabilities": {s1: "no", s2: "yes"}}).json()["id"]
+        from kairos.db import get_responses
+        from kairos.helpers import convergence
+        conv = convergence(poll, get_responses(pid), [])
+        assert conv["state"] == "blocked"
+        # mark B optional via the API -> a slot now works for the required set
+        r = c.patch(f"/scheduler/api/polls/{pid}/responses/{rid}", headers=api,
+                    json={"required": False})
+        assert r.json() == {"updated": True}
+        conv = convergence(poll, get_responses(pid), [])
+        assert conv["state"] == "partial"

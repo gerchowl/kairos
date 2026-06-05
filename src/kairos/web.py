@@ -292,7 +292,8 @@ def view_poll(poll_id: str, request: Request):
                 "ref": r["invite_id"] or r["response_id"],
                 "name": r["name"] or "",
                 "email": r["email"],
-                "optional": not r["required"] if r["invited"] else False,
+                "optional": not r["required"],
+                "via_link": not r["invited"],
                 "state": r["state"],
                 "last_contact": (f"{r['last_contact']['kind']} · {str(r['last_contact']['sent_at'])[:16]}"
                                  if r["last_contact"] else ""),
@@ -593,7 +594,8 @@ def update_participant(poll_id: str, request: Request, form=Depends(form_data)):
         update_invite(ref, name=name, email=email,
                       required=not form.get("optional"))
     elif kind == "response" and ref:
-        update_response_contact(ref, name=name or None, email=email)
+        update_response_contact(ref, name=name or None, email=email,
+                                required=not form.get("optional"))
     else:
         raise HTTPException(400, "Bad participant reference")
     return RedirectResponse(f"{P}/polls/{poll_id}?msg=updated", status_code=302)

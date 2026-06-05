@@ -25,6 +25,10 @@
   }
 
   var stateBadge = { pending: "badge-warning", stale: "badge-info", current: "badge-success" };
+  var stateLabel = { pending: "no reply", stale: "outdated", current: "up to date" };
+  var stateTip = { pending: "Has not responded yet",
+                   stale: "Responded before the newest dates were added",
+                   current: "Response covers all current dates" };
 
   var columns = [
     { formatter: "rowSelection", titleFormatter: "rowSelection", hozAlign: "center",
@@ -32,24 +36,29 @@
     { title: "Name", field: "name", editor: cfg.open ? "input" : false, widthGrow: 2,
       formatter: function (cell) { return cell.getValue() || '<span class="opacity-40">—</span>'; } },
     { title: "Email", field: "email", editor: cfg.open ? "input" : false, widthGrow: 3,
-      validator: ["required", "regex:^[^@\\s]+@[^@\\s]+\\.[^@\\s]{2,}$"] },
-    { title: "Optional", field: "optional", hozAlign: "center", width: 100,
-      headerTooltip: "Invitees are required by default — tick to make optional. \"via link\" rows responded on the share link without an invite.",
+      validator: ["required", "regex:^[^@\\s]+@[^@\\s]+\\.[^@\\s]{2,}$"],
       formatter: function (cell) {
         var d = cell.getRow().getData();
-        if (d.kind !== "invite") return '<span class="badge badge-ghost badge-sm" title="Responded via the share link — not invited">via link</span>';
+        var link = d.via_link
+          ? ' <span class="part-via-link" title="Joined via the share link (not invited)">🔗</span>' : "";
+        return (cell.getValue() || "") + link;
+      } },
+    { title: "Optional", field: "optional", hozAlign: "center", width: 100,
+      headerTooltip: "Everyone counts as required for finding a date — tick to make someone optional.",
+      formatter: function (cell) {
         return '<input type="checkbox" class="checkbox checkbox-xs align-middle"' +
                (cell.getValue() ? " checked" : "") + (cfg.open ? "" : " disabled") + ">";
       },
       cellClick: function (e, cell) {
-        var d = cell.getRow().getData();
-        if (!cfg.open || d.kind !== "invite") return;
+        if (!cfg.open) return;
         cell.setValue(!cell.getValue());
       } },
-    { title: "State", field: "state", hozAlign: "center", width: 100,
+    { title: "State", field: "state", hozAlign: "center", width: 110,
+      headerTooltip: "no reply = hasn't responded · outdated = responded before the newest dates · up to date = covers all current dates",
       formatter: function (cell) {
         var v = cell.getValue();
-        return '<span class="badge badge-sm ' + (stateBadge[v] || "badge-ghost") + '">' + v + "</span>";
+        return '<span class="badge badge-sm ' + (stateBadge[v] || "badge-ghost") + '" title="' +
+               (stateTip[v] || "") + '">' + (stateLabel[v] || v) + "</span>";
       } },
     { title: "Last contacted", field: "last_contact", headerSort: true, widthGrow: 2,
       formatter: function (cell) {

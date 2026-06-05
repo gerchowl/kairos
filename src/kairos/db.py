@@ -124,6 +124,7 @@ def init_schema():
     _ensure_column(cursor, "sched_invites", "required", "required BOOLEAN DEFAULT TRUE")
     _ensure_column(cursor, "sched_invites", "name", "name VARCHAR(255) NULL")
     _ensure_column(cursor, "sched_responses", "notified_at", "notified_at TIMESTAMP NULL")
+    _ensure_column(cursor, "sched_responses", "required", "required BOOLEAN DEFAULT TRUE")
     conn.commit()
     cursor.close()
     conn.close()
@@ -411,7 +412,8 @@ def update_invite(invite_id: str, name: str | None = None, email: str | None = N
 
 
 def update_response_contact(response_id: str, name: str | None = None,
-                            email: str | None = None) -> bool:
+                            email: str | None = None,
+                            required: bool | None = None) -> bool:
     sets, params = [], []
     if name is not None:
         sets.append("respondent_name = %s")
@@ -419,6 +421,9 @@ def update_response_contact(response_id: str, name: str | None = None,
     if email is not None:
         sets.append("respondent_email = %s")
         params.append(email)
+    if required is not None:
+        sets.append("required = %s")
+        params.append(required)
     if not sets:
         return False
     conn = get_connection()

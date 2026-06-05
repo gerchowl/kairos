@@ -220,6 +220,29 @@ def delete_invite_endpoint(poll_id: str, invite_id: str, user: dict = Depends(re
     return {"deleted": True}
 
 
+class ResponsePatch(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    required: bool | None = None
+
+
+@router.patch("/polls/{poll_id}/responses/{response_id}")
+def patch_response_endpoint(poll_id: str, response_id: str, body: ResponsePatch,
+                            user: dict = Depends(require_api_key)):
+    """Edit a respondent's name/email or toggle required (via-link people
+    count as required for convergence unless marked optional)."""
+    _get_or_404(poll_id)
+    from kairos.db import update_response_contact
+    if body.email is not None:
+        from kairos.http import valid_email
+        if not valid_email(body.email):
+            raise HTTPException(400, "Invalid email address")
+    if not update_response_contact(response_id, name=body.name, email=body.email,
+                                   required=body.required):
+        raise HTTPException(404, "Response not found or no fields given")
+    return {"updated": True}
+
+
 @router.delete("/polls/{poll_id}/responses/{response_id}")
 def delete_response_endpoint(poll_id: str, response_id: str, user: dict = Depends(require_api_key)):
     """Remove a response (walk-in or invited)."""

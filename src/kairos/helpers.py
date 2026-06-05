@@ -245,7 +245,8 @@ def participant_states(poll: dict, responses: list[dict], invites: list[dict],
             "email": email,
             "invite_id": invite["id"] if invite else None,
             "response_id": (resp or {}).get("id"),
-            "required": invite.get("required", True) if invite else False,
+            "required": (invite.get("required", True) if invite
+                         else bool((resp or {}).get("required", True))),
             "invited": invite is not None,
             "name": (invite or {}).get("name") or (resp or {}).get("respondent_name"),
             "state": state_of(resp),
@@ -273,8 +274,8 @@ def participant_states(poll: dict, responses: list[dict], invites: list[dict],
 def convergence(poll: dict, responses: list[dict], invites: list[dict]) -> dict:
     """Status light for the poll list.
 
-    States (open polls; required = invites with required=True, or everyone
-    when the poll has no invites):
+    States (open polls; required = required invitees + via-link respondents
+    not marked optional):
       collecting — required input still missing (or no responses at all)
       ready      — some slot works (yes) for ALL participants -> decide!
       partial    — some slot works for all REQUIRED participants only
@@ -295,9 +296,13 @@ def convergence(poll: dict, responses: list[dict], invites: list[dict]) -> dict:
     required_resps = [resp_of(i) for i in required_inv]
     required_pending = sum(1 for r in required_resps if r is None)
 
-    if not invites:
-        # Open-link poll: everyone who responded counts as required
-        required_resps = list(responses)
+    # via-link respondents (no invite) count as required unless the owner
+    # marked them optional — being uninvited is provenance, not importance
+    invite_emails = {i["email"].lower() for i in invites}
+    walkins = [r for r in responses
+               if not r.get("invite_id")
+               and (r.get("respondent_email") or "").lower() not in invite_emails]
+    required_resps += [r for r in walkins if r.get("required", True)]
 
     if not responses or required_pending:
         return {"state": "collecting", "pending_required": required_pending,
