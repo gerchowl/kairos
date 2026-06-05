@@ -29,13 +29,6 @@
     </button>
     {% if user %}
     <span class="text-sm opacity-70 px-2">{{ user.name | default(user.display_name) }}</span>
-      <ul tabindex="0" class="dropdown-content menu menu-sm bg-base-100 border border-base-300 rounded-box shadow-sm z-20 w-44 p-2 mt-2">
-        <li><a href="/profile">Profile</a></li>
-        <li><a href="/logout">Logout</a></li>
-      </ul>
-    </div>
-    {% else %}
-    
     {% endif %}
   </div>
 </header>
