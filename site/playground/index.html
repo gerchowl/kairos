@@ -29,8 +29,9 @@ try {
   log("installing kairos + deps…");
   await py.loadPackage("micropip");
   const micropip = py.pyimport("micropip");
+  const wheelName = (await (await fetch("wheel.txt")).text()).trim();
   await micropip.install(["fastapi", "python-multipart", "itsdangerous", "jinja2",
-                          new URL("kairos_wheel.whl", location.href).href]);
+                          new URL(wheelName, location.href).href]);
   log("starting server…");
   py.globals.set("APP_PREFIX", APP_PREFIX);
   await py.runPythonAsync(`

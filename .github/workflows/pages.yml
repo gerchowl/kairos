@@ -16,7 +16,9 @@ jobs:
       - name: Build wheel for the WASM playground
         run: |
           uv build --wheel
-          cp dist/kairos_scheduler-*.whl site/playground/kairos_wheel.whl
+          WHEEL=$(basename dist/kairos_scheduler-*.whl)
+          cp "dist/$WHEEL" site/playground/
+          echo "$WHEEL" > site/playground/wheel.txt
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
