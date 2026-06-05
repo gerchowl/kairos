@@ -1,0 +1,9 @@
+line-length = 110
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "C4", "C90"]
+ignore = ["E501", "B008"]  # B008: FastAPI Depends() in defaults is the framework idiom
+
+[lint.mccabe]
+max-complexity = 16

@@ -93,6 +93,21 @@ def create_app() -> FastAPI:
             f"# Agent/API discovery: {P}/llms.txt and {P}/api/openapi.json\n"
             f"User-agent: *\nDisallow: {P}/p/\nDisallow: {P}/api/\n")
 
+    if settings.OPERATOR:
+        from kairos.templating import create_env, render
+        legal_env = create_env()
+        legal_ctx = {"operator": settings.OPERATOR,
+                     "address": [a.strip() for a in settings.OPERATOR_ADDRESS.split(",") if a.strip()],
+                     "email": settings.OPERATOR_EMAIL, "extra": settings.LEGAL_EXTRA}
+
+        @app.get(f"{P}/imprint", include_in_schema=False)
+        def imprint():
+            return render(legal_env, "legal_imprint.html", title="Imprint", **legal_ctx)
+
+        @app.get(f"{P}/privacy", include_in_schema=False)
+        def privacy():
+            return render(legal_env, "legal_privacy.html", title="Privacy", **legal_ctx)
+
     @app.get(f"{P}/health", include_in_schema=False)
     def health():
         try:

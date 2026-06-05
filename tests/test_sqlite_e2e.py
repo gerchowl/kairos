@@ -64,3 +64,29 @@ def test_full_lifecycle_on_sqlite(client):
     # init_schema is idempotent (migrations re-run safely)
     from kairos.db import init_schema
     init_schema()
+
+
+def test_legal_pages_render_when_operator_set(tmp_path, monkeypatch):
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "OPERATOR", "Example Lab, ETH Zurich")
+    monkeypatch.setattr(settings, "OPERATOR_ADDRESS", "Musterstrasse 1, 8092 Zurich, Switzerland")
+    monkeypatch.setattr(settings, "OPERATOR_EMAIL", "lab@example.org")
+    from kairos.main import create_app
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        imp = c.get("/scheduler/imprint")
+        assert imp.status_code == 200 and "Example Lab" in imp.text and "Musterstrasse" in imp.text
+        prv = c.get("/scheduler/privacy")
+        assert prv.status_code == 200 and "strictly-necessary cookies" in prv.text
+        # footer links appear on regular pages
+        pub = c.get("/scheduler/llms.txt")
+        assert pub.status_code == 200
+
+
+def test_no_legal_routes_without_operator(tmp_path, monkeypatch):
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "OPERATOR", "")
+    from kairos.main import create_app
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        assert c.get("/scheduler/imprint").status_code == 404

@@ -1,3 +1,6 @@
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from kairos import settings
 from kairos.auth import RESPONSE_REF_MAX_AGE, get_user, load_response_ref, sign_response_ref
 from kairos.db import (
     add_response,
@@ -12,10 +15,6 @@ from kairos.db import (
     mark_invite_responded,
     update_response,
 )
-from kairos import settings
-from kairos.http import form_data
-from kairos.templating import render
-from fastapi import APIRouter, Depends, HTTPException, Request
 from kairos.helpers import (
     env,
     expected_counts,
@@ -26,7 +25,9 @@ from kairos.helpers import (
     slot_gaps,
     timeslot_payload,
 )
+from kairos.http import form_data
 from kairos.notifications import notify_all_responded, notify_new_response
+from kairos.templating import render
 from kairos.web import ics_response
 
 P = settings.PREFIX

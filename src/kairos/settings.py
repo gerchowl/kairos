@@ -27,6 +27,15 @@ HOME_URL = os.environ.get("KAIROS_HOME_URL", PREFIX + "/")
 LOGIN_URL = os.environ.get("KAIROS_LOGIN_URL", "")  # owner sign-in page; empty -> 401 message
 API_KEY = os.environ.get("KAIROS_API_KEY") or os.environ.get("SCHEDULER_API_KEY", "")
 
+# Legal pages (/imprint, /privacy) — rendered when KAIROS_OPERATOR is set.
+# Structured input, no HTML needed; the operator carries the legal duty
+# (CH nDSG / GDPR). Kairos itself sets only strictly-necessary cookies,
+# so no consent banner is required — the privacy page discloses them.
+OPERATOR = os.environ.get("KAIROS_OPERATOR", "")            # name / org
+OPERATOR_ADDRESS = os.environ.get("KAIROS_OPERATOR_ADDRESS", "")  # postal address, comma-separated
+OPERATOR_EMAIL = os.environ.get("KAIROS_OPERATOR_EMAIL", "")
+LEGAL_EXTRA = os.environ.get("KAIROS_LEGAL_EXTRA", "")      # free-form extra paragraph
+
 
 def session_secret() -> str:
     secret = os.environ.get("SESSION_SECRET", "")

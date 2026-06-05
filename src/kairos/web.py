@@ -1,8 +1,11 @@
 from datetime import datetime, timedelta
 
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import RedirectResponse, Response
+
 from kairos import settings
 from kairos.auth import get_base_url, get_user
-from kairos.dbconn import db_now
+from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
     add_slots,
     create_invite,
@@ -20,12 +23,8 @@ from kairos.db import (
     mark_response_notified,
     update_poll,
 )
-from kairos.csrf import make_csrf, require_csrf
-from kairos.http import form_data
-from kairos.templating import render
+from kairos.dbconn import db_now
 from kairos.email_service import send_decision_email, send_invite_email, send_update_emails
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse, Response
 from kairos.helpers import (
     TIMEZONES,
     convergence,
@@ -38,7 +37,9 @@ from kairos.helpers import (
     slot_gaps,
     timeslot_payload,
 )
+from kairos.http import form_data
 from kairos.ics import build_ics
+from kairos.templating import render
 
 P = settings.PREFIX
 router = APIRouter(prefix=P) if P else APIRouter()
@@ -377,7 +378,7 @@ def edit_poll_submit(poll_id: str, request: Request, form=Depends(form_data)):
 NUDGE_COOLDOWN = timedelta(hours=24)
 
 
-def nudge_participants(request: Request, poll: dict, user: dict,
+def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 — a state machine: per-participant timestamp gating is clearer flat than split
                        only_emails: set[str] | None = None, force: bool = False) -> dict:
     """State-driven, idempotent reminders — safe to trigger repeatedly.
 

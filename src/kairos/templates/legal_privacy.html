@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card bg-base-100 shadow-sm my-6"><div class="card-body">
+<h1 class="card-title text-2xl">Privacy</h1>
+<p><strong>Controller:</strong> {{ operator }}{% if email %} (<a class="link" href="mailto:{{ email }}">{{ email }}</a>){% endif %}</p>
+<h2 class="text-lg font-bold mt-4">What this instance stores</h2>
+<ul class="list-disc ps-5">
+<li><strong>Poll responses</strong>: the name you enter, an optional email address, and your availability per date — visible to the poll owner and other respondents, kept until the poll is deleted.</li>
+<li><strong>Invitations</strong>: invitee email addresses and a log of outbound mails (invite/reminder/decision), visible to the poll owner.</li>
+<li><strong>Account data</strong> (poll owners): identity provided by the operator's sign-in system.</li>
+</ul>
+<h2 class="text-lg font-bold mt-4">Cookies</h2>
+<p>Only strictly-necessary cookies are used — sign-in session, CSRF protection, and an optional signed token so you can edit your own response later (180 days). No tracking, no analytics, no third-party cookies; therefore no consent banner is required.</p>
+<h2 class="text-lg font-bold mt-4">Your rights</h2>
+<p>To access, correct, or delete your data, contact the controller above. Respondents can edit their response at any time via their poll link while the poll is open.</p>
+{% if extra %}<p>{{ extra }}</p>{% endif %}
+</div></div>
+{% endblock %}

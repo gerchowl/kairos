@@ -1,0 +1,13 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff — lint + import order (fixes applied)
+        entry: ruff check --fix
+        language: system
+        types: [python]
+      - id: pytest
+        name: pytest — full suite (sqlite, fast)
+        entry: sh -c 'uv run pytest tests -q'
+        language: system
+        pass_filenames: false

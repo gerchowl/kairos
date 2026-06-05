@@ -47,7 +47,7 @@
 {% block footer %}
 <footer class="footer footer-center bg-base-100 text-base-content/60 p-6 mt-10">
   <aside>
-    <p><span class="font-semibold text-base-content/80">{{ BRAND }}</span> &mdash; scheduling polls &middot; <a class="link" href="https://github.com/gerchowl/kairos">github.com/gerchowl/kairos</a></p>
+    <p><span class="font-semibold text-base-content/80">{{ BRAND }}</span> &mdash; scheduling polls &middot; <a class="link" href="https://github.com/gerchowl/kairos">github.com/gerchowl/kairos</a>{% if LEGAL %} &middot; <a class="link" href="{{ P }}/imprint">Imprint</a> &middot; <a class="link" href="{{ P }}/privacy">Privacy</a>{% endif %}</p>
   </aside>
 </footer>
 {% endblock %}

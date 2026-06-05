@@ -2,10 +2,10 @@
 
 from datetime import date, time
 
-from kairos import api
-from kairos import main
 import pytest
 from fastapi.testclient import TestClient
+
+from kairos import api, main
 
 KEY = "test-api-key"
 

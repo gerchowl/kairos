@@ -22,7 +22,8 @@ def create_env(extra_dir: Path | str | None = None) -> Environment:
     env = Environment(loader=ChoiceLoader(loaders) if len(loaders) > 1 else loaders[0],
                       autoescape=select_autoescape(("html", "htm", "xml")))
     env.globals.update(static_v=STATIC_VERSION, P=settings.PREFIX,
-                       BRAND=settings.BRAND, HOME_URL=settings.HOME_URL)
+                       BRAND=settings.BRAND, HOME_URL=settings.HOME_URL,
+                       LEGAL=bool(settings.OPERATOR))
     return env
 
 

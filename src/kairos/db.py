@@ -1,7 +1,6 @@
+import re
 import secrets
 import uuid
-
-import re
 
 from kairos.dbconn import IS_SQLITE, get_connection  # noqa: F401  (re-exported)
 

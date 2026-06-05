@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card bg-base-100 shadow-sm my-6"><div class="card-body">
+<h1 class="card-title text-2xl">Imprint / Impressum</h1>
+<p>This {{ BRAND }} instance is operated by:</p>
+<p><strong>{{ operator }}</strong><br>
+{% for line in address %}{{ line }}<br>{% endfor %}
+{% if email %}Contact: <a class="link" href="mailto:{{ email }}">{{ email }}</a>{% endif %}</p>
+{% if extra %}<p>{{ extra }}</p>{% endif %}
+<p class="text-sm opacity-60">Software: <a class="link" href="https://github.com/gerchowl/kairos">Kairos</a> (MIT) — the operator above is responsible for this deployment and its data.</p>
+</div></div>
+{% endblock %}

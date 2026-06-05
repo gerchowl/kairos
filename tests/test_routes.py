@@ -2,11 +2,10 @@
 
 from datetime import date, time
 
-from kairos import main
-from kairos import public
 import pytest
-from kairos import web
 from fastapi.testclient import TestClient
+
+from kairos import main, public, web
 
 POLL = {
     "id": "p1", "creator_id": "testuser", "title": "Retreat",

@@ -7,6 +7,7 @@ Run from repo root:
 from datetime import date, time
 
 import pytest
+
 from kairos.helpers import (
     env,
     expected_counts,

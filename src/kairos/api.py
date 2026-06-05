@@ -12,6 +12,9 @@ poll creator's name/Reply-To by default; override per call with
 
 from datetime import datetime
 
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+
 from kairos import settings
 from kairos.auth import get_base_url, require_api_key
 from kairos.db import (
@@ -31,11 +34,9 @@ from kairos.db import (
     update_response,
 )
 from kairos.email_service import send_decision_email, send_invite_email
-from fastapi import APIRouter, Depends, HTTPException, Request
 from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics
 from kairos.notifications import notify_new_response
-from pydantic import BaseModel
 from kairos.web import (
     _valid_timezone,
     decided_slot_of,
