@@ -233,15 +233,15 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
 /* -- Tabulator (participants table): restyle onto DaisyUI tokens ---------- */
 
 #part-table.tabulator {
-  background: transparent; border: 1px solid var(--color-base-300);
-  border-radius: 0.25rem; font-size: 14px;
+  background: transparent; border: none; border-radius: 0; font-size: 14px;
 }
 #part-table .tabulator-header,
 #part-table .tabulator-header .tabulator-col,
 #part-table .tabulator-header .tabulator-col .tabulator-col-content {
   background: var(--color-base-200); color: var(--color-base-content);
-  border-color: var(--color-base-300);
+  border: none;
 }
+#part-table .tabulator-header { border-bottom: 1px solid var(--color-base-300); }
 #part-table .tabulator-tableholder,
 #part-table .tabulator-tableholder .tabulator-table {
   background: transparent; color: var(--color-base-content);
@@ -252,7 +252,7 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
 }
 #part-table .tabulator-row.tabulator-selected { background: color-mix(in oklab, var(--color-primary) 14%, transparent); }
 #part-table .tabulator-row:hover { background: color-mix(in oklab, var(--color-base-200) 45%, transparent); }
-#part-table .tabulator-cell { border-color: var(--color-base-300); }
+#part-table .tabulator-cell { border: none; }
 #part-table .tabulator-cell.tabulator-editing {
   border: 1px solid var(--color-primary); background: var(--color-base-100);
 }

@@ -118,7 +118,7 @@
 {% if poll.status == 'open' and (invites or responses) %}
 <form method="post" action="{{ P }}/polls/{{ poll.id }}/remind" class="mt-3">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
-<button type="submit" class="btn btn-outline btn-sm">Send smart reminders</button>
+<button type="submit" class="btn btn-soft btn-sm">Send smart reminders</button>
 <p class="text-sm opacity-60 mt-1">Safe to repeat — mails only no-replies (once/day) and people missing new dates.</p>
 </form>
 {% endif %}
