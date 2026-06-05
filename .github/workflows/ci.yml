@@ -1,0 +1,71 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Test suite (incl. real SQLite e2e lifecycle)
+        run: uv run pytest tests -q
+
+  quickstart:
+    # Executes the README quickstart verbatim against the built wheel:
+    # boot with SQLite + demo auth, then exercise the live HTTP surface.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build --wheel
+      - name: Boot via uvx and probe
+        run: |
+          KAIROS_API_KEY=ci uvx --from dist/kairos_scheduler-*.whl kairos --port 8003 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8003/health && break; sleep 1; done
+          set -ex
+          curl -sf http://127.0.0.1:8003/health | grep '"ok"'
+          curl -sf http://127.0.0.1:8003/ | grep -i kairos            # dashboard (demo auth)
+          curl -sf http://127.0.0.1:8003/llms.txt | grep openapi      # agent discovery
+          curl -sf http://127.0.0.1:8003/api/openapi.json | grep bearerAuth
+          # API lifecycle: create -> respond -> decide -> ics
+          POLL=$(curl -sf -X POST http://127.0.0.1:8003/api/polls \
+            -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
+            -d '{"title":"CI poll","mode":"full_day","slots":[{"date":"2026-12-01"}]}')
+          ID=$(echo "$POLL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          SLOT=$(echo "$POLL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["slots"][0]["id"])')
+          curl -sf -X POST "http://127.0.0.1:8003/api/polls/$ID/respond" \
+            -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
+            -d "{\"name\":\"CI\",\"availabilities\":{\"$SLOT\":\"yes\"}}" | grep CI
+          curl -sf -X POST "http://127.0.0.1:8003/api/polls/$ID/decide" \
+            -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
+            -d "{\"slot_id\":\"$SLOT\"}" | grep decided
+          curl -sf "http://127.0.0.1:8003/api/polls/$ID/event.ics" \
+            -H 'Authorization: Bearer ci' | grep "BEGIN:VCALENDAR"
+
+  mysql:
+    # The "or MySQL/MariaDB" claim: same lifecycle against a real MariaDB
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11
+        env: { MARIADB_ROOT_PASSWORD: ci, MARIADB_DATABASE: kairos }
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="healthcheck.sh --connect" --health-interval=5s
+          --health-timeout=3s --health-retries=12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Boot against MariaDB and probe
+        run: |
+          uv build --wheel
+          KAIROS_DB_URL=mysql://root:ci@127.0.0.1:3306/kairos KAIROS_API_KEY=ci \
+            uvx --from "$(ls dist/kairos_scheduler-*.whl)[mysql]" kairos --port 8003 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8003/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:8003/health | grep '"ok"'
+          curl -sf -X POST http://127.0.0.1:8003/api/polls \
+            -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
+            -d '{"title":"MariaDB poll","mode":"full_day","slots":[{"date":"2026-12-01"}]}' | grep share_url

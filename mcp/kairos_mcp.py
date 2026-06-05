@@ -9,8 +9,8 @@ Runs locally (stdio) and talks to the Kairos REST API over HTTPS:
     KAIROS_API_KEY=... uv run mcp/kairos_mcp.py
 
 Env:
-    KAIROS_URL      base URL (default https://dupletent.ethz.ch)
-    KAIROS_API_KEY  bearer key (sops: secrets/duplet.<env>.env -> SCHEDULER_API_KEY)
+    KAIROS_URL      base URL of your Kairos instance (default http://127.0.0.1:8003)
+    KAIROS_API_KEY  bearer key of the instance
 
 Registered in .claude/mcp.json so Claude Code sessions in this repo get
 kairos_* tools automatically.
@@ -21,7 +21,7 @@ import os
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-BASE = os.environ.get("KAIROS_URL", "https://dupletent.ethz.ch").rstrip("/")
+BASE = os.environ.get("KAIROS_URL", "http://127.0.0.1:8003").rstrip("/")
 KEY = os.environ.get("KAIROS_API_KEY", "")
 
 mcp = FastMCP("kairos")

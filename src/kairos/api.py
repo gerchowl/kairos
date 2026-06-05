@@ -62,7 +62,7 @@ class PollCreate(BaseModel):
     mode: str  # full_day or time_slot
     timezone: str = "Europe/Zurich"
     slots: list[SlotIn]
-    creator: str | None = None  # nethz uid — attributes the poll to a real account
+    creator: str | None = None  # account uid — attributes the poll to a real user
 
 class PollUpdate(BaseModel):
     title: str | None = None
@@ -115,7 +115,7 @@ def _actor(poll: dict, sender_name: str | None = None, reply_to: str | None = No
     """Mail sender identity: explicit override, else generic brand.
 
     Deployments with a user directory can monkeypatch this to resolve the
-    poll creator's account (the ETH/duplet adapter does)."""
+    poll creator's account (a deployment adapter can)."""
     return {"name": sender_name or settings.BRAND, "email": reply_to}
 
 

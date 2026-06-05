@@ -1,6 +1,6 @@
 # Playground last-mile (only remaining item)
 
-State: extraction DONE (duplet consumes v0.1.0 on ent, verified). Landing page
+State: extraction DONE (downstream consumer on v0.1.0, verified). Landing page
 live. Playground boots fully (Pyodide + vendored wheels via unpackArchive +
 ssl loaded, server logs "ready") — but the iframe stays empty: SW->page
 message round-trip for app/* requests doesn't complete.

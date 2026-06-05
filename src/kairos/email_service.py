@@ -25,9 +25,9 @@ SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@example.org")
 
 
 def is_configured() -> bool:
-    # SMTP_USER/PASSWORD are optional: the ETH-internal relay (smtp0.ethz.ch:25)
-    # accepts unauthenticated mail from ETH IPs — auth is only for submission
-    # via mail.ethz.ch:587 with a real service mailbox.
+    # SMTP_USER/PASSWORD are optional — many institutional relays accept
+    # unauthenticated mail from internal IPs; auth is only needed for
+    # authenticated submission with a real service mailbox.
     return bool(SMTP_HOST)
 
 

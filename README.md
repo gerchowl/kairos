@@ -1,5 +1,7 @@
 # Kairos
 
+[![CI](https://github.com/gerchowl/kairos/actions/workflows/ci.yml/badge.svg)](https://github.com/gerchowl/kairos/actions/workflows/ci.yml)
+
 when2meet-style scheduling polls — self-hostable, reverse-proxy-auth friendly,
 **agent-first API** (OpenAPI + llms.txt + MCP).
 
@@ -33,6 +35,3 @@ Kairos trusts identity headers from whatever reverse proxy you already run
 (`KAIROS_AUTH=header`): Shibboleth/Apache, oauth2-proxy, Authelia, Cloudflare
 Access, Tailscale… Respondents never need accounts — share links and invite
 tokens are self-contained. See `kairos/settings.py` for all env knobs.
-
-Born inside ETH Zürich's [duplet](https://github.com/gerchowl/duplet-webserver)
-research platform; extracted to run anywhere.
