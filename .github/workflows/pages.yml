@@ -16,9 +16,17 @@ jobs:
       - name: Build wheel for the WASM playground
         run: |
           uv build --wheel
-          WHEEL=$(basename dist/kairos_scheduler-*.whl)
-          cp "dist/$WHEEL" site/playground/
-          echo "$WHEEL" > site/playground/wheel.txt
+          mkdir -p site/playground/wheels
+          cp dist/kairos_scheduler-*.whl site/playground/wheels/
+          # vendor every pure-python dep: the playground installs same-origin
+          # wheels only (micropip's PyPI download path is unreliable)
+          pip download --no-deps --only-binary :all: -d site/playground/wheels \
+            fastapi==0.115.6 starlette==0.41.3 itsdangerous==2.2.0 jinja2==3.1.4 \
+            markupsafe==2.1.5 python-multipart==0.0.17 anyio==4.6.2.post1 \
+            sniffio==1.3.1 idna==3.10 tzdata==2024.2
+          ls site/playground/wheels/*.whl | xargs -n1 basename | python3 -c \
+            "import json,sys; print(json.dumps(sys.stdin.read().split()))" \
+            > site/playground/wheels.json
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site

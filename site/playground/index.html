@@ -31,17 +31,14 @@ try {
   // explicit closed dependency set (micropip's transitive resolution trips on
   // packages without pure wheels).
   await py.loadPackage(["micropip", "pydantic", "sqlite3", "typing-extensions"]);
-  const wheelName = (await (await fetch("wheel.txt")).text()).trim();
-  py.globals.set("WHEEL_URL", new URL(wheelName, location.href).href);
+  // all pure-python deps are vendored same-origin (CI: pip download) — no PyPI
+  const wheels = await (await fetch("wheels.json")).json();
+  py.globals.set("WHEEL_URLS", wheels.map((w) => new URL("wheels/" + w, location.href).href).join(" "));
   py.globals.set("APP_PREFIX", APP_PREFIX);
-  // install inside Python: JS objects don't map to kwargs, so deps=False
-  // only works here (micropip's transitive resolution trips on PyPI)
   await py.runPythonAsync(`
 import micropip
-await micropip.install(["fastapi", "starlette", "anyio", "sniffio", "idna",
-                        "jinja2", "markupsafe", "itsdangerous",
-                        "python-multipart", "tzdata"], deps=False)
-await micropip.install(WHEEL_URL, deps=False)
+for url in WHEEL_URLS.split():
+    await micropip.install(url, deps=False)
 `);
   log("starting server…");
   await py.runPythonAsync(`
