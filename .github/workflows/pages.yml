@@ -27,7 +27,7 @@ jobs:
           ls site/playground/wheels/*.whl | xargs -n1 basename | python3 -c \
             "import json,sys; print(json.dumps(sys.stdin.read().split()))" \
             > site/playground/wheels.json
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
       - id: deploy
