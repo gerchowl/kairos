@@ -44,6 +44,7 @@ jobs:
             -d "{\"slot_id\":\"$SLOT\"}" | grep decided
           curl -sf "http://127.0.0.1:8003/api/polls/$ID/event.ics" \
             -H 'Authorization: Bearer ci' | grep "BEGIN:VCALENDAR"
+          kill %1 && wait || true   # free uv for the cache post-step
 
   mysql:
     # The "or MySQL/MariaDB" claim: same lifecycle against a real MariaDB
@@ -69,6 +70,7 @@ jobs:
           curl -sf -X POST http://127.0.0.1:8003/api/polls \
             -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
             -d '{"title":"MariaDB poll","mode":"full_day","slots":[{"date":"2026-12-01"}]}' | grep share_url
+          kill %1 && wait || true   # free uv for the cache post-step
 
   licenses:
     # No copyleft surprises in the dependency tree (we ship MIT)
