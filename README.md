@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/gerchowl/kairos/actions/workflows/ci.yml/badge.svg)](https://github.com/gerchowl/kairos/actions/workflows/ci.yml)
 
+**[Website](https://gerchowl.github.io/kairos/)** · **[▶ Try it in your browser](https://gerchowl.github.io/kairos/playground/)** — the actual Python server on Pyodide/WASM, nothing leaves your machine.
+
 when2meet-style scheduling polls — self-hostable, reverse-proxy-auth friendly,
 **agent-first API** (OpenAPI + llms.txt + MCP).
 

@@ -43,6 +43,14 @@ try {
   log("starting server…");
   await py.runPythonAsync(`
 import base64, json, os
+
+# WASM has no threads: run sync endpoints/dependencies inline instead of
+# anyio's worker threads (single user, SQLite — blocking is fine here)
+import anyio.to_thread
+async def _run_sync_inline(func, *args, **kwargs):
+    return func(*args)
+anyio.to_thread.run_sync = _run_sync_inline
+
 os.environ.update(KAIROS_PREFIX=APP_PREFIX, KAIROS_AUTH="demo",
                   KAIROS_DB_URL="sqlite:///kairos.db", KAIROS_BRAND="Kairos (playground)",
                   KAIROS_API_KEY="playground")
@@ -79,8 +87,14 @@ async def handle(method, path, query, headers_json, body_b64):
   const handle = py.globals.get("handle");
   navigator.serviceWorker.addEventListener("message", async (e) => {
     const { method, path, query, headers, body } = e.data;
-    const out = await handle(method, path, query || "", JSON.stringify(headers || {}), body);
-    e.ports[0].postMessage(JSON.parse(out));
+    try {
+      const out = await handle(method, path, query || "", JSON.stringify(headers || {}), body);
+      e.ports[0].postMessage(JSON.parse(out));
+    } catch (err) {
+      // never leave the SW hanging — surface the Python traceback
+      e.ports[0].postMessage({ status: 500, headers: [["content-type", "text/plain"]],
+                               body: btoa(unescape(encodeURIComponent(String(err)))) });
+    }
   });
   log("ready");
   document.getElementById("boot").style.display = "none";

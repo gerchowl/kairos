@@ -5,3 +5,5 @@ kairos.db
 node_modules/
 dist/
 .pytest_cache/
+site/playground/wheels/
+site/playground/wheels.json
