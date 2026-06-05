@@ -28,7 +28,7 @@
 
   var columns = [
     { formatter: "rowSelection", titleFormatter: "rowSelection", hozAlign: "center",
-      headerSort: false, width: 36, cssClass: "part-col-select" },
+      headerHozAlign: "center", headerSort: false, width: 40, cssClass: "part-col-select" },
     { title: "Name", field: "name", editor: cfg.open ? "input" : false, widthGrow: 2,
       formatter: function (cell) { return cell.getValue() || '<span class="opacity-40">—</span>'; } },
     { title: "Email", field: "email", editor: cfg.open ? "input" : false, widthGrow: 3,
