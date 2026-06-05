@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/gerchowl/kairos/compare/v0.3.0...v0.3.1) (2026-06-05)
+
+
+### Bug Fixes
+
+* align the select-all checkbox with row checkboxes (headerHozAlign + uniform sizing, theme accent-color) ([133cb0e](https://github.com/gerchowl/kairos/commit/133cb0ec32929c1e500a4e462d3d602e1ca39f66))
+* participants table — dark-mode colors, in-table add row, real optional checkbox ([6a890ca](https://github.com/gerchowl/kairos/commit/6a890caa733f2c12db2f5c1467a887de5615f634))
+
 ## [0.3.0](https://github.com/gerchowl/kairos/compare/v0.2.0...v0.3.0) (2026-06-05)
 
 
