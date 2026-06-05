@@ -8,20 +8,38 @@
   if (!el || !dataEl || typeof Tabulator === "undefined") return;
   var cfg = JSON.parse(dataEl.textContent);
 
-  function post(url, fields) {
-    var form = document.createElement("form");
-    form.method = "post";
-    form.action = url;
-    fields.csrf = cfg.csrf;
-    Object.keys(fields).forEach(function (k) {
-      var inp = document.createElement("input");
-      inp.type = "hidden";
-      inp.name = k;
-      inp.value = fields[k];
-      form.appendChild(inp);
+  // fetch-based posts: no page navigation, so scroll and focus survive
+  function post(url, fields, then) {
+    var body = new URLSearchParams(fields);
+    body.set("csrf", cfg.csrf);
+    fetch(url, { method: "POST", body: body, redirect: "follow" }).then(function (r) {
+      if (!r.ok) return r.json().then(function (j) {
+        alert(j.detail || "Action failed");
+      }).catch(function () { alert("Action failed"); });
+      if (then) then();
     });
-    document.body.appendChild(form);
-    form.submit();
+  }
+
+  function freshSentinel() {
+    return { kind: "new", ref: "", email: "", name: "", optional: false,
+             state: "", last_contact: "", contacts_n: 0, trail: "", via_link: false };
+  }
+
+  // re-read the server-rendered payload and swap the table data in place
+  function refreshRows(focusAdd) {
+    fetch(location.pathname).then(function (r) { return r.text(); }).then(function (html) {
+      var doc = new DOMParser().parseFromString(html, "text/html");
+      var data = JSON.parse(doc.getElementById("part-data").textContent);
+      var rows = data.rows;
+      if (cfg.open) rows.push(freshSentinel());
+      table.replaceData(rows).then(function () {
+        if (!focusAdd) return;
+        setTimeout(function () {  // let Tabulator finish rendering first
+          var sentinel = table.getRows().find(function (r2) { return r2.getData().kind === "new"; });
+          if (sentinel) sentinel.getCell("email").edit();
+        }, 50);
+      });
+    });
   }
 
   var stateBadge = { pending: "badge-warning", stale: "badge-info", current: "badge-success" };
@@ -85,13 +103,11 @@
         var d = cell.getRow().getData();
         if (d.kind === "new") return;
         if (confirm("Remove " + d.email + " from this poll?"))
-          post(cfg.remove_url, { kind: d.kind, ref: d.ref });
+          post(cfg.remove_url, { kind: d.kind, ref: d.ref }, refreshRows);
       } },
   ];
 
-  var NEW_ROW = { kind: "new", ref: "", email: "", name: "", optional: false,
-                  state: "", last_contact: "", contacts_n: 0, trail: "", via_link: false };
-  if (cfg.open) cfg.rows.push(NEW_ROW);
+  if (cfg.open) cfg.rows.push(freshSentinel());
 
   var table = new Tabulator(el, {
     data: cfg.rows,
@@ -121,7 +137,8 @@
       if (cell.getField() === "email" && EMAIL_RE.test((d.email || "").trim()))
         post(cfg.invite_url, { email: d.email.trim(),
                                name: (d.name || guessName(d.email)).trim(),
-                               optional: d.optional ? "on" : "" });
+                               optional: d.optional ? "on" : "" },
+             function () { refreshRows(true); });  // stay put, reopen the add row
       return;  // name/optional edits just wait for the email
     }
     post(cfg.update_url, { kind: d.kind, ref: d.ref, name: d.name || "",

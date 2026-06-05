@@ -234,7 +234,7 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
 
 #part-table.tabulator {
   background: transparent; border: 1px solid var(--color-base-300);
-  border-radius: var(--radius-box, 0.5rem); font-size: 14px;
+  border-radius: 0.25rem; font-size: 14px;
 }
 #part-table .tabulator-header,
 #part-table .tabulator-header .tabulator-col,
@@ -250,9 +250,8 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
   background: transparent; color: var(--color-base-content);
   border-bottom: 1px solid var(--color-base-300);
 }
-#part-table .tabulator-row.tabulator-row-even { background: color-mix(in oklab, var(--color-base-200) 40%, transparent); }
 #part-table .tabulator-row.tabulator-selected { background: color-mix(in oklab, var(--color-primary) 14%, transparent); }
-#part-table .tabulator-row:hover { background: color-mix(in oklab, var(--color-base-200) 80%, transparent); }
+#part-table .tabulator-row:hover { background: color-mix(in oklab, var(--color-base-200) 45%, transparent); }
 #part-table .tabulator-cell { border-color: var(--color-base-300); }
 #part-table .tabulator-cell.tabulator-editing {
   border: 1px solid var(--color-primary); background: var(--color-base-100);
