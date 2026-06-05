@@ -266,16 +266,9 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
 #part-table .part-del-x { cursor: pointer; opacity: 0.35; }
 #part-table .tabulator-row:hover .part-del-x { opacity: 1; color: var(--color-error); }
 
-#part-add-row {
-  display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.5rem;
-  background: color-mix(in oklab, var(--color-base-200) 50%, transparent);
-  border-top: 1px solid var(--color-base-300);
-}
-#part-add-row .part-add-plus { opacity: 0.4; font-weight: 700; padding: 0 0.4rem; }
-#part-table .tabulator-footer {
-  background: transparent; border-top: none; padding: 0;
-}
-#part-table .tabulator-footer .tabulator-footer-contents { padding: 0; }
+/* the add row is a real table row (Notion-style): dimmed until it has content */
+#part-table .part-new-row { background: color-mix(in oklab, var(--color-base-200) 35%, transparent) !important; }
+#part-table .part-new-row .tabulator-cell { border-right-color: transparent; }
 
 /* selection checkboxes: same size/position in header and rows */
 #part-table input[type="checkbox"]:not(.checkbox) {
@@ -285,3 +278,4 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
 #part-table .part-col-select .tabulator-col-content { padding: 4px 0; }
 
 #part-table .part-via-link { font-size: 11px; opacity: 0.5; cursor: help; }
+#part-table .part-new-row input[type="checkbox"]:not(.checkbox) { display: none; }

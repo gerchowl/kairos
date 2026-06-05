@@ -33,15 +33,21 @@
   var columns = [
     { formatter: "rowSelection", titleFormatter: "rowSelection", hozAlign: "center",
       headerHozAlign: "center", headerSort: false, width: 40, cssClass: "part-col-select" },
-    { title: "Name", field: "name", editor: cfg.open ? "input" : false, widthGrow: 2,
-      formatter: function (cell) { return cell.getValue() || '<span class="opacity-40">—</span>'; } },
     { title: "Email", field: "email", editor: cfg.open ? "input" : false, widthGrow: 3,
-      validator: ["required", "regex:^[^@\\s]+@[^@\\s]+\\.[^@\\s]{2,}$"],
       formatter: function (cell) {
         var d = cell.getRow().getData();
+        if (d.kind === "new" && !cell.getValue())
+          return '<span class="opacity-40">+ add by email\u2026</span>';
         var link = d.via_link
-          ? ' <span class="part-via-link" title="Joined via the share link (not invited)">🔗</span>' : "";
+          ? ' <span class="part-via-link" title="Joined via the share link (not invited)">\ud83d\udd17</span>' : "";
         return (cell.getValue() || "") + link;
+      } },
+    { title: "Name", field: "name", editor: cfg.open ? "input" : false, widthGrow: 2,
+      formatter: function (cell) {
+        var d = cell.getRow().getData();
+        if (d.kind === "new")
+          return cell.getValue() || '<span class="opacity-30">auto-filled from email</span>';
+        return cell.getValue() || '<span class="opacity-40">\u2014</span>';
       } },
     { title: "Optional", field: "optional", hozAlign: "center", width: 100,
       headerTooltip: "Everyone counts as required for finding a date — tick to make someone optional.",
@@ -57,49 +63,67 @@
       headerTooltip: "no reply = hasn't responded · outdated = responded before the newest dates · up to date = covers all current dates",
       formatter: function (cell) {
         var v = cell.getValue();
+        if (!v) return "";
         return '<span class="badge badge-sm ' + (stateBadge[v] || "badge-ghost") + '" title="' +
                (stateTip[v] || "") + '">' + (stateLabel[v] || v) + "</span>";
       } },
     { title: "Last contacted", field: "last_contact", headerSort: true, widthGrow: 2,
       formatter: function (cell) {
         var d = cell.getRow().getData();
+        if (d.kind === "new") return "";
         var label = cell.getValue() || "never";
         var extra = d.contacts_n > 1 ? ' <span class="opacity-50">(+' + (d.contacts_n - 1) + ")</span>" : "";
         return '<span class="text-xs opacity-70" title="' + (d.trail || "") + '">' + label + extra + "</span>";
       } },
-    { formatter: function () { return '<span class="part-del-x" title="Remove">✕</span>'; },
+    { formatter: function (cell) {
+        return cell.getRow().getData().kind === "new"
+          ? "" : '<span class="part-del-x" title="Remove">\u2715</span>';
+      },
       hozAlign: "center", width: 44, headerSort: false,
       cellClick: function (e, cell) {
         if (!cfg.open) return;
         var d = cell.getRow().getData();
+        if (d.kind === "new") return;
         if (confirm("Remove " + d.email + " from this poll?"))
           post(cfg.remove_url, { kind: d.kind, ref: d.ref });
       } },
   ];
 
-  var footer = null;
-  if (cfg.open) {
-    footer = document.createElement("div");
-    footer.id = "part-add-row";
-    footer.innerHTML =
-      '<span class="part-add-plus">+</span>' +
-      '<input type="text" id="part-add-name" placeholder="name — auto-filled from email" class="input input-sm input-ghost grow">' +
-      '<input type="email" id="part-add-email" placeholder="name@domain.tld" class="input input-sm input-ghost grow">' +
-      '<label class="flex items-center gap-1 text-sm opacity-70"><input type="checkbox" id="part-add-optional" class="checkbox checkbox-xs"> optional</label>' +
-      '<button type="button" id="part-add-btn" class="btn btn-primary btn-xs" disabled>Add</button>';
-  }
+  var NEW_ROW = { kind: "new", ref: "", email: "", name: "", optional: false,
+                  state: "", last_contact: "", contacts_n: 0, trail: "", via_link: false };
+  if (cfg.open) cfg.rows.push(NEW_ROW);
 
   var table = new Tabulator(el, {
     data: cfg.rows,
     columns: columns,
     layout: "fitColumns",
     selectableRows: cfg.open ? true : false,
-    placeholder: "No participants yet — add someone in the row below or share the link.",
-    footerElement: footer,
+    selectableRowsCheck: function (row) { return row.getData().kind !== "new"; },
+    placeholder: "No participants yet — share the link.",
+    rowFormatter: function (row) {
+      row.getElement().classList.toggle("part-new-row", row.getData().kind === "new");
+    },
   });
+
+  function newRowLast() {
+    var rows = table.getRows("active");
+    if (!rows.length) return;
+    var sentinel = rows.find(function (r) { return r.getData().kind === "new"; });
+    if (sentinel && rows[rows.length - 1] !== sentinel)
+      table.moveRow(sentinel, rows[rows.length - 1], false);
+  }
+  table.on("dataSorted", function () { setTimeout(newRowLast, 0); });
 
   table.on("cellEdited", function (cell) {
     var d = cell.getRow().getData();
+    if (d.kind === "new") {
+      // Notion-style: the bottom row IS the add form — a valid email commits
+      if (cell.getField() === "email" && EMAIL_RE.test((d.email || "").trim()))
+        post(cfg.invite_url, { email: d.email.trim(),
+                               name: (d.name || guessName(d.email)).trim(),
+                               optional: d.optional ? "on" : "" });
+      return;  // name/optional edits just wait for the email
+    }
     post(cfg.update_url, { kind: d.kind, ref: d.ref, name: d.name || "",
                            email: d.email, optional: d.optional ? "on" : "" });
   });
@@ -112,7 +136,8 @@
       });
       this.classList.add("btn-active");
       var f = this.dataset.pfilter;
-      if (f) table.setFilter("state", "=", f); else table.clearFilter();
+      if (f) table.setFilter(function (data) { return data.kind === "new" || data.state === f; });
+      else table.clearFilter();
       table.deselectRow();
       refreshSend();
     });
@@ -142,7 +167,7 @@
     form.submit();
   });
 
-  // -- footer add-row: autofill name from email patterns ---------------------
+  // -- name guessing for the add row (first.last@ -> First Last) --------------
   var EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/;
   var GENERIC = ["info", "admin", "office", "mail", "contact", "noreply", "no-reply", "hello", "support", "team"];
   function guessName(email) {
@@ -152,28 +177,4 @@
     if (!parts.length) return "";
     return parts.map(function (p) { return p[0].toUpperCase() + p.slice(1); }).join(" ");
   }
-  table.on("tableBuilt", function () {
-    var addEmail = document.getElementById("part-add-email");
-    var addName = document.getElementById("part-add-name");
-    var addBtn = document.getElementById("part-add-btn");
-    if (!addEmail || !addBtn) return;
-    var touched = false;
-    function refresh() { addBtn.disabled = !EMAIL_RE.test(addEmail.value.trim()); }
-    addName.addEventListener("input", function () { touched = this.value !== ""; });
-    addEmail.addEventListener("input", function () {
-      if (!touched) addName.value = guessName(this.value);
-      refresh();
-    });
-    function submit() {
-      if (addBtn.disabled) return;
-      post(cfg.invite_url, {
-        email: addEmail.value.trim(), name: addName.value.trim(),
-        optional: document.getElementById("part-add-optional").checked ? "on" : "",
-      });
-    }
-    addBtn.addEventListener("click", submit);
-    [addEmail, addName].forEach(function (inp) {
-      inp.addEventListener("keydown", function (e) { if (e.key === "Enter") submit(); });
-    });
-  });
 })();
