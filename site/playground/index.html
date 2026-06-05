@@ -30,7 +30,7 @@ try {
   // Native pieces from Pyodide's own index; everything else installed with an
   // explicit closed dependency set (micropip's transitive resolution trips on
   // packages without pure wheels).
-  await py.loadPackage(["micropip", "pydantic", "sqlite3", "typing-extensions"]);
+  await py.loadPackage(["micropip", "pydantic", "sqlite3", "typing-extensions", "jinja2", "markupsafe"]);
   // all pure-python deps are vendored same-origin (CI: pip download) — no PyPI
   const wheels = await (await fetch("wheels.json")).json();
   py.globals.set("WHEEL_URLS", wheels.map((w) => new URL("wheels/" + w, location.href).href).join(" "));
