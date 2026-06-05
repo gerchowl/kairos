@@ -116,9 +116,10 @@ def test_participant_removal_lifecycle(tmp_path, monkeypatch):
         assert r.status_code == 302
         invites = c.get(f"/scheduler/api/polls/{poll['id']}", headers=api).json()["invites"]
         assert invites[0]["email"] == "bob@example.org" and invites[0]["required"] in (0, False)
-        # duplicate guarded
-        assert c.post(f"/scheduler/polls/{poll['id']}/invite",
-                      data={"email": "bob@example.org", "csrf": csrf}).status_code == 400
+        # duplicate guarded (friendly redirect)
+        r = c.post(f"/scheduler/polls/{poll['id']}/invite",
+                   data={"email": "bob@example.org", "csrf": csrf}, follow_redirects=False)
+        assert r.status_code == 302 and "msg=duplicate" in r.headers["location"]
         # web removal of the invite
         r = c.post(f"/scheduler/polls/{poll['id']}/participants/remove",
                    data={"kind": "invite", "ref": invites[0]["id"], "csrf": csrf},
@@ -133,3 +134,54 @@ def test_participant_removal_lifecycle(tmp_path, monkeypatch):
                         headers=api).json() == {"deleted": True}
         assert c.delete(f"/scheduler/api/polls/{poll['id']}/responses/{rid}",
                         headers=api).status_code == 404
+
+
+def test_named_invites_and_inline_edit(tmp_path, monkeypatch):
+    """Names on invites: web add, API 'Name <addr>' form, PATCH, web update."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    from kairos.main import create_app
+    api = {"Authorization": "Bearer k"}
+    headers = {"X-User": "alice", "X-Email": "a@e.org", "X-Name": "Alice"}
+    with TestClient(create_app(), base_url="https://testserver", headers=headers) as c:
+        poll = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "Named", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-01"}]}).json()
+        pid = poll["id"]
+        # API: RFC-5322 named entry
+        c.post(f"/scheduler/api/polls/{pid}/invite", headers=api,
+               json={"emails": ["Ada Lovelace <ada@example.org>"]})
+        inv = c.get(f"/scheduler/api/polls/{pid}/invites", headers=api).json()[0]
+        assert inv["name"] == "Ada Lovelace"
+        # PATCH name + required
+        r = c.patch(f"/scheduler/api/polls/{pid}/invites/{inv['id']}", headers=api,
+                    json={"name": "Ada L.", "required": False})
+        assert r.json() == {"updated": True}
+        inv = c.get(f"/scheduler/api/polls/{pid}/invites", headers=api).json()[0]
+        assert inv["name"] == "Ada L." and not inv["required"]
+        # web: add with name + duplicate redirects friendly
+        import re
+        page = c.get(f"/scheduler/polls/{pid}")
+        csrf = re.search(r'name="csrf" value="([^"]*)"', page.text).group(1)
+        r = c.post(f"/scheduler/polls/{pid}/invite",
+                   data={"email": "bob@example.org", "name": "Bob", "csrf": csrf},
+                   follow_redirects=False)
+        assert r.status_code == 302
+        r = c.post(f"/scheduler/polls/{pid}/invite",
+                   data={"email": "bob@example.org", "csrf": csrf}, follow_redirects=False)
+        assert r.status_code == 302 and "msg=duplicate" in r.headers["location"]
+        # web inline update route
+        bob = [i for i in c.get(f"/scheduler/api/polls/{pid}/invites", headers=api).json()
+               if i["email"] == "bob@example.org"][0]
+        r = c.post(f"/scheduler/polls/{pid}/participants/update",
+                   data={"kind": "invite", "ref": bob["id"], "name": "Robert",
+                         "email": "robert@example.org", "optional": "on", "csrf": csrf},
+                   follow_redirects=False)
+        assert r.status_code == 302
+        bob = [i for i in c.get(f"/scheduler/api/polls/{pid}/invites", headers=api).json()
+               if i["id"] == bob["id"]][0]
+        assert (bob["name"], bob["email"], bool(bob["required"])) == ("Robert", "robert@example.org", False)
+        # payload feeds the table
+        page = c.get(f"/scheduler/polls/{pid}")
+        assert 'id="part-data"' in page.text and "Robert" in page.text

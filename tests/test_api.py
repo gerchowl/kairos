@@ -121,7 +121,7 @@ def test_add_slots_with_notify_nudges(client, monkeypatch):
 def test_invite_with_required_flag(client, monkeypatch):
     created = []
     monkeypatch.setattr(api, "create_invite",
-                        lambda pid, email, required=True:
+                        lambda pid, email, required=True, name=None:
                         created.append((email, required)) or
                         {"id": "i1", "token": "tk", "email": email})
     monkeypatch.setattr(api, "send_invite_email", lambda *a, **k: True)

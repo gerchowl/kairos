@@ -80,7 +80,9 @@ def _render_poll_page(poll: dict, action: str, request: Request,
     else:
         existing, user = _existing_response(request, poll, invite["email"] if invite else None)
     saved = existing["slot_availabilities"] if existing else None
-    prefill_name = (existing or {}).get("respondent_name") or (user or {}).get("name") or ""
+    prefill_name = ((existing or {}).get("respondent_name")
+                    or (invite.get("name") if invite else None)
+                    or (user or {}).get("name") or "")
     prefill_email = ((existing or {}).get("respondent_email")
                      or (invite["email"] if invite else None)
                      or (user or {}).get("email") or "")

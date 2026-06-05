@@ -23,7 +23,9 @@ from kairos.db import (
     mark_invite_notified,
     mark_notification_read,
     mark_response_notified,
+    update_invite,
     update_poll,
+    update_response_contact,
 )
 from kairos.dbconn import db_now
 from kairos.email_service import send_decision_email, send_invite_email, send_update_emails
@@ -58,6 +60,8 @@ def _login_or_401(next_path: str):
 _MSG_TEXT = {
     "invited": "Invitee added — select them in the table to send the invite mail.",
     "removed": "Participant removed.",
+    "updated": "Participant updated.",
+    "duplicate": "That address is already on the list.",
     "closed": "Poll closed.",
     "decided": "Time decided!",
     "saved": "Poll updated.",
@@ -276,11 +280,32 @@ def view_poll(poll_id: str, request: Request):
         ctx["counts"] = slot_counts(slots, responses)
         ctx["gaps"] = slot_gaps(slots)
 
+    def _part_payload(rows, user):
+        return {
+            "open": poll["status"] == "open",
+            "csrf": make_csrf(user["uid"]),
+            "update_url": f"{P}/polls/{poll_id}/participants/update",
+            "remove_url": f"{P}/polls/{poll_id}/participants/remove",
+            "rows": [{
+                "kind": "invite" if r["invite_id"] else "response",
+                "ref": r["invite_id"] or r["response_id"],
+                "name": r["name"] or "",
+                "email": r["email"],
+                "optional": not r["required"] if r["invited"] else False,
+                "state": r["state"],
+                "last_contact": (f"{r['last_contact']['kind']} · {str(r['last_contact']['sent_at'])[:16]}"
+                                 if r["last_contact"] else ""),
+                "contacts_n": len(r["contacts"]),
+                "trail": "\n".join(f"{c['kind']} {str(c['sent_at'])[:16]}" for c in r["contacts"]),
+            } for r in rows],
+        }
+
     participants = (participant_states(poll, responses, invites, get_contact_log(poll_id))
                     if is_owner else [])
 
     return render(env, "poll.html", user=user, title=poll["title"],
                   poll=poll, responses=responses, invites=invites,
+                  part_payload=_part_payload(participants, user),
                   participants=participants,
                   total=total, pending_n=pending_n, share_url=share_url,
                   decided_label=decided_label, **_nav_ctx(user),
@@ -546,11 +571,31 @@ def invite_submit(poll_id: str, request: Request, form=Depends(form_data)):
     if not email:
         raise HTTPException(400, "Not a valid email address")
     if any(i["email"].lower() == email.lower() for i in get_invites(poll_id)):
-        raise HTTPException(400, "Already invited")
+        return RedirectResponse(f"{P}/polls/{poll_id}?msg=duplicate", status_code=302)
     # add-only: the participants table sends the actual mail (Email selected /
     # smart reminders) — keeps adding cheap and sending deliberate
-    create_invite(poll_id, email, required=not form.get("optional"))
+    create_invite(poll_id, email, required=not form.get("optional"),
+                  name=form.get("name", "").strip() or None)
     return RedirectResponse(f"{P}/polls/{poll_id}?msg=invited", status_code=302)
+
+
+@router.post("/polls/{poll_id}/participants/update")
+def update_participant(poll_id: str, request: Request, form=Depends(form_data)):
+    """Inline row edit: name/email for both kinds, required only for invites."""
+    _user, _poll = _owner_action(request, form, poll_id)
+    kind, ref = form.get("kind", ""), form.get("ref", "")
+    name = form.get("name", "").strip()
+    email = valid_email(form.get("email", "")) if form.get("email") else None
+    if form.get("email") and not email:
+        raise HTTPException(400, "Not a valid email address")
+    if kind == "invite" and ref:
+        update_invite(ref, name=name, email=email,
+                      required=not form.get("optional"))
+    elif kind == "response" and ref:
+        update_response_contact(ref, name=name or None, email=email)
+    else:
+        raise HTTPException(400, "Bad participant reference")
+    return RedirectResponse(f"{P}/polls/{poll_id}?msg=updated", status_code=302)
 
 
 @router.post("/polls/{poll_id}/participants/remove")

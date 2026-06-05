@@ -1,6 +1,12 @@
 {% extends "scheduler_base.html" %}
 {% from "_macros.html" import page_hero, section_card, fullday_grid, ts_grid, text_field %}
-{% block head %}<script src="{{ P }}/static/grid.js?v={{ static_v }}" defer></script>{% endblock %}
+{% block head %}
+<script src="{{ P }}/static/grid.js?v={{ static_v }}" defer></script>
+{% if is_owner %}
+<script src="{{ P }}/static/tabulator.min.js?v={{ static_v }}"></script>
+<script src="{{ P }}/static/participants.js?v={{ static_v }}" defer></script>
+{% endif %}
+{% endblock %}
 {% block hero %}
 {% call page_hero(poll.title, poll.description, badge=poll.status) %}
 <p class="text-sm opacity-60">{{ poll.mode | replace('_', ' ') }} &middot; {{ poll.timezone }}</p>
@@ -86,74 +92,37 @@
 
 {% if is_owner %}
 {% call section_card("Participants") %}
-{# invite form + delete form live OUTSIDE the table (no nested forms);
-   the (+) row's inputs reference them via the form= attribute #}
-{% if poll.status == 'open' %}
-<form method="post" action="{{ P }}/polls/{{ poll.id }}/invite" id="invite-form">
-<input type="hidden" name="csrf" value="{{ csrf_token }}"></form>
-<form method="post" action="{{ P }}/polls/{{ poll.id }}/participants/remove" id="part-del-form">
-<input type="hidden" name="csrf" value="{{ csrf_token }}">
-<input type="hidden" name="kind" id="part-del-kind"><input type="hidden" name="ref" id="part-del-ref"></form>
-{% endif %}
+<script type="application/json" id="part-data">{{ part_payload | default({}, true) | tojson }}</script>
 
-{% if participants or poll.status == 'open' %}
-<div id="part-filters" class="join my-2">
+<div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+<div id="part-filters" class="join">
   <button type="button" class="btn btn-xs join-item btn-active" data-pfilter="">All</button>
   <button type="button" class="btn btn-xs join-item" data-pfilter="pending">Pending</button>
   <button type="button" class="btn btn-xs join-item" data-pfilter="stale">Stale</button>
   <button type="button" class="btn btn-xs join-item" data-pfilter="current">Current</button>
 </div>
-<form method="post" action="{{ P }}/polls/{{ poll.id }}/remind-selected" id="part-form"
-      onsubmit="return confirm('Email the selected participants now? (bypasses the daily cooldown)')">
+{% if poll.status == 'open' %}
+<button type="button" id="part-send" class="btn btn-primary btn-sm" disabled>Email selected (0)</button>
+{% endif %}
+</div>
+
+<div id="part-table"></div>
+
+{% if poll.status == 'open' %}
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/invite" class="flex items-end gap-2 flex-wrap mt-3">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
-<div class="overflow-x-auto">
-<table class="table table-sm" id="part-table">
-<thead><tr>
-<th><input type="checkbox" id="part-all" class="checkbox checkbox-xs" title="Select shown"></th>
-<th>Email</th><th>Name</th><th>Importance</th><th>State</th><th>Last contacted</th><th></th>
-</tr></thead>
-<tbody>
-{% for p in participants %}
-<tr data-state="{{ p.state }}">
-<td><input type="checkbox" name="emails" value="{{ p.email }}" class="checkbox checkbox-xs part-check"></td>
-<td>{{ p.email }}</td>
-<td>{{ p.name or '—' }}</td>
-<td>{{ 'Required' if p.required else ('Optional' if p.invited else 'Walk-in') }}</td>
-<td><span class="badge badge-sm {{ {'pending': 'badge-warning', 'stale': 'badge-info', 'current': 'badge-success'}[p.state] }}">{{ p.state }}</span></td>
-<td class="text-xs opacity-70 whitespace-nowrap"{% if p.contacts %} title="{% for c in p.contacts %}{{ c.kind }} {{ (c.sent_at | string)[:16] }}{{ '&#10;' if not loop.last }}{% endfor %}"{% endif %}>
-{% if p.last_contact %}{{ p.last_contact.kind }} &middot; {{ (p.last_contact.sent_at | string)[:16] }}{% if p.contacts | length > 1 %} <span class="opacity-50">(+{{ p.contacts | length - 1 }})</span>{% endif %}{% else %}never{% endif %}
-</td>
-<td class="text-right">
-{% if poll.status == 'open' %}
-<button type="button" class="btn btn-ghost btn-xs part-del" title="Remove {{ p.email }}"
-        data-kind="{{ 'invite' if p.invite_id else 'response' }}" data-ref="{{ p.invite_id or p.response_id }}"
-        data-label="{{ p.email }}">✕</button>
-{% endif %}
-</td>
-</tr>
-{% endfor %}
-{% if poll.status == 'open' %}
-<tr class="part-add-row">
-<td class="opacity-40 text-center">+</td>
-<td><input type="email" name="email" form="invite-form" required placeholder="name@domain.tld"
-           pattern="[^@\s]+@[^@\s]+\.[^@\s]{2,}" class="input input-sm w-full max-w-xs"></td>
-<td colspan="2"><label class="label cursor-pointer justify-start gap-2 py-0">
-  <input type="checkbox" name="optional" form="invite-form" class="checkbox checkbox-xs">
-  <span class="text-sm opacity-70">optional</span></label></td>
-<td colspan="2"><button type="submit" form="invite-form" class="btn btn-primary btn-sm">Add</button></td>
-<td></td>
-</tr>
-{% endif %}
-</tbody>
-</table>
-</div>
-{% if poll.status == 'open' %}
-<p class="text-sm opacity-60">Required invitees drive the poll's status light: green when a date works for everyone, orange when only the required people fit.</p>
-<div class="flex items-center gap-3 mt-2 flex-wrap">
-<button type="submit" id="part-send" class="btn btn-primary btn-sm" disabled>Email selected (0)</button>
-<span class="text-sm opacity-60">Selected people get a state-appropriate mail right now (pending → reminder, stale → new-dates notice, current → plain reminder). Logged in the trail.</span>
-</div>
-{% endif %}
+<label class="floating-label grow max-w-xs"><span>Email</span>
+  <input type="email" name="email" id="part-add-email" required placeholder="name@domain.tld"
+         pattern="[^@\s]+@[^@\s]+\.[^@\s]{2,}" class="input input-sm w-full"></label>
+<label class="floating-label grow max-w-xs"><span>Name</span>
+  <input type="text" name="name" id="part-add-name" placeholder="auto-filled from email" class="input input-sm w-full"></label>
+<label class="label cursor-pointer gap-2 pb-1">
+  <input type="checkbox" name="optional" class="checkbox checkbox-xs"><span class="text-sm opacity-70">optional</span></label>
+<button type="submit" class="btn btn-primary btn-sm">Add</button>
+</form>
+<p class="text-sm opacity-60 mt-2">Click a name, email or the optional mark to edit it in place. Required invitees drive the status light: green when a date works for everyone, orange when only the required people fit. Adding does not send mail — select rows and use "Email selected", or the smart reminders below.</p>
+<form method="post" action="{{ P }}/polls/{{ poll.id }}/remind-selected" id="part-form" class="hidden">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
 </form>
 {% endif %}
 
@@ -166,50 +135,5 @@
 {% endif %}
 {% endcall %}
 
-<script>
-(function () {
-  var form = document.getElementById('part-form');
-  if (!form) return;
-  var rows = Array.prototype.slice.call(form.querySelectorAll('tbody tr[data-state]'));
-  var delForm = document.getElementById('part-del-form');
-  form.querySelectorAll('.part-del').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      if (!confirm('Remove ' + this.dataset.label + ' from this poll?')) return;
-      document.getElementById('part-del-kind').value = this.dataset.kind;
-      document.getElementById('part-del-ref').value = this.dataset.ref;
-      delForm.submit();
-    });
-  });
-  var send = document.getElementById('part-send');
-  var all = document.getElementById('part-all');
-  function refresh() {
-    if (!send) return;
-    var n = form.querySelectorAll('.part-check:checked').length;
-    send.disabled = !n;
-    send.textContent = 'Email selected (' + n + ')';
-  }
-  form.addEventListener('change', refresh);
-  if (all) all.addEventListener('change', function () {
-    rows.forEach(function (tr) {
-      if (!tr.classList.contains('hidden')) tr.querySelector('.part-check').checked = all.checked;
-    });
-    refresh();
-  });
-  document.querySelectorAll('#part-filters [data-pfilter]').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      var f = this.dataset.pfilter;
-      document.querySelectorAll('#part-filters .btn-active').forEach(function (b) { b.classList.remove('btn-active'); });
-      this.classList.add('btn-active');
-      rows.forEach(function (tr) {
-        var show = !f || tr.dataset.state === f;
-        tr.classList.toggle('hidden', !show);
-        if (!show) tr.querySelector('.part-check').checked = false;
-      });
-      refresh();
-    });
-  });
-  refresh();
-})();
-</script>
 {% endif %}
 {% endblock %}

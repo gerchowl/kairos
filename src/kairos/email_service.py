@@ -58,7 +58,8 @@ def _ics_part(ics_content: str) -> MIMEText:
 
 def build_invite_message(to_email: str, poll_title: str, invite_url: str,
                          sender_name: str, reply_to: str | None = None,
-                         reminder: bool = False) -> MIMEMultipart:
+                         reminder: bool = False,
+                         recipient_name: str | None = None) -> MIMEMultipart:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = (f"Reminder — please respond: {poll_title}" if reminder
                       else f"You're invited: {poll_title}")
@@ -67,7 +68,8 @@ def build_invite_message(to_email: str, poll_title: str, invite_url: str,
 
     lead = ("a friendly reminder: please respond to the scheduling poll"
             if reminder else "invited you to respond to a scheduling poll")
-    text = f"""{sender_name} — {lead}: {poll_title}
+    hi = f"Hi {recipient_name},\n\n" if recipient_name else ""
+    text = f"""{hi}{sender_name} — {lead}: {poll_title}
 
 Click here to respond: {invite_url}
 
@@ -75,7 +77,7 @@ No account needed — just click the link and pick your available times."""
 
     html = env.get_template("email/invite.html").render(
         sender_name=sender_name, poll_title=poll_title, invite_url=invite_url,
-        reminder=reminder)
+        reminder=reminder, recipient_name=recipient_name)
 
     msg.attach(MIMEText(text, "plain"))
     msg.attach(MIMEText(html, "html"))
@@ -111,12 +113,12 @@ The attached calendar file ({ICS_FILENAME}) adds the event to your calendar."""
 
 def send_invite_email(to_email: str, poll_title: str, invite_url: str,
                       sender_name: str, reply_to: str | None = None,
-                      reminder: bool = False) -> bool:
+                      reminder: bool = False, recipient_name: str | None = None) -> bool:
     """Send an invite (or reminder) email. False if not configured / send fails."""
     if not is_configured():
         return False
     msg = build_invite_message(to_email, poll_title, invite_url, sender_name,
-                               reply_to, reminder=reminder)
+                               reply_to, reminder=reminder, recipient_name=recipient_name)
     try:
         with _smtp_session() as server:
             server.send_message(msg)

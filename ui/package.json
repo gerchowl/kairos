@@ -8,5 +8,8 @@
     "@tailwindcss/cli": "^4.1.0",
     "daisyui": "^5.0.0",
     "tailwindcss": "^4.1.0"
+  },
+  "dependencies": {
+    "tabulator-tables": "^6.4.0"
   }
 }

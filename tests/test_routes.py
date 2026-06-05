@@ -435,7 +435,7 @@ def test_invite_rejects_fake_email(client, owner, monkeypatch):
     monkeypatch.setattr(web, "get_invites", lambda pid: [])
     r = client.post("/scheduler/polls/p1/invite", data={"email": "test@test"})
     assert r.status_code == 400 and "valid email" in r.text
-    monkeypatch.setattr(web, "create_invite", lambda pid, email, required=True:
+    monkeypatch.setattr(web, "create_invite", lambda pid, email, required=True, name=None:
                         {"id": "i9", "token": "t9", "email": email})
     r = client.post("/scheduler/polls/p1/invite",
                     data={"email": "Real.Person@example.org"}, follow_redirects=False)

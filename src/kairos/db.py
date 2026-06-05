@@ -122,6 +122,7 @@ def init_schema():
                    "(SELECT created_at FROM sched_polls WHERE id = poll_id)")
     _ensure_column(cursor, "sched_invites", "notified_at", "notified_at TIMESTAMP NULL")
     _ensure_column(cursor, "sched_invites", "required", "required BOOLEAN DEFAULT TRUE")
+    _ensure_column(cursor, "sched_invites", "name", "name VARCHAR(255) NULL")
     _ensure_column(cursor, "sched_responses", "notified_at", "notified_at TIMESTAMP NULL")
     conn.commit()
     cursor.close()
@@ -367,20 +368,68 @@ def get_responses(poll_id: str) -> list[dict]:
 
 # -- Invites --
 
-def create_invite(poll_id: str, email: str, required: bool = True) -> dict:
+def create_invite(poll_id: str, email: str, required: bool = True, name: str | None = None) -> dict:
     invite_id = new_id()
     token = new_token()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO sched_invites (id, poll_id, email, token, required) VALUES (%s, %s, %s, %s, %s)",
-        (invite_id, poll_id, email, token, required),
+        "INSERT INTO sched_invites (id, poll_id, email, token, required, name)"
+        " VALUES (%s, %s, %s, %s, %s, %s)",
+        (invite_id, poll_id, email, token, required, name),
     )
     conn.commit()
     cursor.close()
     conn.close()
     return {"id": invite_id, "poll_id": poll_id, "email": email, "token": token,
-            "responded": False, "required": required}
+            "responded": False, "required": required, "name": name}
+
+
+def update_invite(invite_id: str, name: str | None = None, email: str | None = None,
+                  required: bool | None = None) -> bool:
+    sets, params = [], []
+    if name is not None:
+        sets.append("name = %s")
+        params.append(name or None)
+    if email is not None:
+        sets.append("email = %s")
+        params.append(email)
+    if required is not None:
+        sets.append("required = %s")
+        params.append(required)
+    if not sets:
+        return False
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE sched_invites SET {', '.join(sets)} WHERE id = %s",
+                   (*params, invite_id))
+    updated = cursor.rowcount > 0
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return updated
+
+
+def update_response_contact(response_id: str, name: str | None = None,
+                            email: str | None = None) -> bool:
+    sets, params = [], []
+    if name is not None:
+        sets.append("respondent_name = %s")
+        params.append(name)
+    if email is not None:
+        sets.append("respondent_email = %s")
+        params.append(email)
+    if not sets:
+        return False
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE sched_responses SET {', '.join(sets)} WHERE id = %s",
+                   (*params, response_id))
+    updated = cursor.rowcount > 0
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return updated
 
 
 def get_invite_by_token(token: str) -> dict | None:

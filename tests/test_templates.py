@@ -105,13 +105,18 @@ def test_poll_fullday_owner():
             {"email": "bob@example.com", "invite_id": "i2", "required": False,
              "invited": True, "name": None, "state": "pending",
              "responded_at": None, "last_contact": None, "contacts": []},
-        ])
+        ],
+        part_payload={"open": True, "csrf": "tok", "update_url": "/u", "remove_url": "/r",
+                      "rows": [{"kind": "invite", "ref": "i1", "name": "Alice",
+                                "email": "alice@example.com", "optional": False,
+                                "state": "current", "last_contact": "invite · 2026-06-04 18:00",
+                                "contacts_n": 1, "trail": ""}]})
     assert "sched-bar" in html
     assert "Close Poll" in html
-    assert "alice@example.com" in html
+    assert "alice@example.com" in html   # row lands in the part-data payload
+    assert 'id="part-data"' in html and "tabulator.min.js" in html
     assert "&lt;script&gt;" in html  # respondent name escaped
-    assert "badge-warning" in html       # pending state badge
-    assert "invite · 2026-06-04 18:00" in html or "invite &middot; 2026-06-04 18:00" in html
+    assert "invite \\u00b7 2026-06-04 18:00" in html  # contact trail in JSON payload
     assert 'id="part-form"' in html      # targeted-send form
     assert "Email selected" in html
     assert "remind-selected" in html

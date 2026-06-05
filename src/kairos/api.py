@@ -186,6 +186,27 @@ def update_poll_endpoint(poll_id: str, body: PollUpdate, request: Request,
     return _poll_detail(request, get_poll(poll_id))
 
 
+class InvitePatch(BaseModel):
+    name: str | None = None
+    email: str | None = None
+    required: bool | None = None
+
+
+@router.patch("/polls/{poll_id}/invites/{invite_id}")
+def patch_invite_endpoint(poll_id: str, invite_id: str, body: InvitePatch,
+                          user: dict = Depends(require_api_key)):
+    """Edit an invitee's name/email/required flag."""
+    _get_or_404(poll_id)
+    from kairos.db import update_invite
+    if body.email is not None:
+        from kairos.http import valid_email
+        if not valid_email(body.email):
+            raise HTTPException(400, "Invalid email address")
+    if not update_invite(invite_id, name=body.name, email=body.email, required=body.required):
+        raise HTTPException(404, "Invite not found or no fields given")
+    return {"updated": True}
+
+
 @router.delete("/polls/{poll_id}/invites/{invite_id}")
 def delete_invite_endpoint(poll_id: str, invite_id: str, user: dict = Depends(require_api_key)):
     """Remove an invitee (and their linked response, if any)."""
@@ -277,12 +298,19 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
     actor = _actor(poll, body.sender_name, body.reply_to)
     base = get_base_url(request)
     results = []
+    from email.utils import parseaddr
+
     from kairos.http import valid_email
-    bad = [e for e in body.emails if not valid_email(e)]
+    # entries may be bare addresses or RFC 5322 "Name <addr>" pairs
+    parsed = [(parseaddr(e)[0] or None, parseaddr(e)[1]) for e in body.emails]
+    bad = [e for (_, e) in parsed if not valid_email(e)]
     if bad:
         raise HTTPException(400, f"Invalid email address(es): {', '.join(bad)}")
+    names = {e: n for (n, e) in parsed}
+    body.emails = [e for (_, e) in parsed]
     for email in body.emails:
-        invite = create_invite(poll_id, email, required=body.required)
+        invite = create_invite(poll_id, email, required=body.required,
+                                name=names.get(email))
         invite_url = f"{base}{P}/p/i/{invite['token']}"
         sent = send_invite_email(email, poll["title"], invite_url,
                                  actor["name"], reply_to=actor["email"])
