@@ -33,11 +33,13 @@
       formatter: function (cell) { return cell.getValue() || '<span class="opacity-40">—</span>'; } },
     { title: "Email", field: "email", editor: cfg.open ? "input" : false, widthGrow: 3,
       validator: ["required", "regex:^[^@\\s]+@[^@\\s]+\\.[^@\\s]{2,}$"] },
-    { title: "Optional", field: "optional", hozAlign: "center", width: 110,
+    { title: "Optional", field: "optional", hozAlign: "center", width: 100,
+      headerTooltip: "Invitees are required by default — tick to make optional. \"via link\" rows responded on the share link without an invite.",
       formatter: function (cell) {
         var d = cell.getRow().getData();
-        if (d.kind !== "invite") return '<span class="badge badge-ghost badge-sm">walk-in</span>';
-        return cell.getValue() ? "✓" : '<span class="opacity-30">–</span>';
+        if (d.kind !== "invite") return '<span class="badge badge-ghost badge-sm" title="Responded via the share link — not invited">via link</span>';
+        return '<input type="checkbox" class="checkbox checkbox-xs align-middle"' +
+               (cell.getValue() ? " checked" : "") + (cfg.open ? "" : " disabled") + ">";
       },
       cellClick: function (e, cell) {
         var d = cell.getRow().getData();
@@ -66,12 +68,25 @@
       } },
   ];
 
+  var footer = null;
+  if (cfg.open) {
+    footer = document.createElement("div");
+    footer.id = "part-add-row";
+    footer.innerHTML =
+      '<span class="part-add-plus">+</span>' +
+      '<input type="text" id="part-add-name" placeholder="name — auto-filled from email" class="input input-sm input-ghost grow">' +
+      '<input type="email" id="part-add-email" placeholder="name@domain.tld" class="input input-sm input-ghost grow">' +
+      '<label class="flex items-center gap-1 text-sm opacity-70"><input type="checkbox" id="part-add-optional" class="checkbox checkbox-xs"> optional</label>' +
+      '<button type="button" id="part-add-btn" class="btn btn-primary btn-xs" disabled>Add</button>';
+  }
+
   var table = new Tabulator(el, {
     data: cfg.rows,
     columns: columns,
     layout: "fitColumns",
     selectableRows: cfg.open ? true : false,
-    placeholder: "No participants yet — add someone below or share the link.",
+    placeholder: "No participants yet — add someone in the row below or share the link.",
+    footerElement: footer,
   });
 
   table.on("cellEdited", function (cell) {
@@ -118,9 +133,8 @@
     form.submit();
   });
 
-  // -- add form: autofill name from email patterns ---------------------------
-  var addEmail = document.getElementById("part-add-email");
-  var addName = document.getElementById("part-add-name");
+  // -- footer add-row: autofill name from email patterns ---------------------
+  var EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/;
   var GENERIC = ["info", "admin", "office", "mail", "contact", "noreply", "no-reply", "hello", "support", "team"];
   function guessName(email) {
     var local = (email.split("@")[0] || "").toLowerCase();
@@ -129,11 +143,28 @@
     if (!parts.length) return "";
     return parts.map(function (p) { return p[0].toUpperCase() + p.slice(1); }).join(" ");
   }
-  if (addEmail && addName) {
+  table.on("tableBuilt", function () {
+    var addEmail = document.getElementById("part-add-email");
+    var addName = document.getElementById("part-add-name");
+    var addBtn = document.getElementById("part-add-btn");
+    if (!addEmail || !addBtn) return;
     var touched = false;
+    function refresh() { addBtn.disabled = !EMAIL_RE.test(addEmail.value.trim()); }
     addName.addEventListener("input", function () { touched = this.value !== ""; });
     addEmail.addEventListener("input", function () {
       if (!touched) addName.value = guessName(this.value);
+      refresh();
     });
-  }
+    function submit() {
+      if (addBtn.disabled) return;
+      post(cfg.invite_url, {
+        email: addEmail.value.trim(), name: addName.value.trim(),
+        optional: document.getElementById("part-add-optional").checked ? "on" : "",
+      });
+    }
+    addBtn.addEventListener("click", submit);
+    [addEmail, addName].forEach(function (inp) {
+      inp.addEventListener("keydown", function (e) { if (e.key === "Enter") submit(); });
+    });
+  });
 })();

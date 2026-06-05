@@ -285,6 +285,7 @@ def view_poll(poll_id: str, request: Request):
             "open": poll["status"] == "open",
             "csrf": make_csrf(user["uid"]),
             "update_url": f"{P}/polls/{poll_id}/participants/update",
+            "invite_url": f"{P}/polls/{poll_id}/invite",
             "remove_url": f"{P}/polls/{poll_id}/participants/remove",
             "rows": [{
                 "kind": "invite" if r["invite_id"] else "response",

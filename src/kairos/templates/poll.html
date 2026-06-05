@@ -109,18 +109,7 @@
 <div id="part-table"></div>
 
 {% if poll.status == 'open' %}
-<form method="post" action="{{ P }}/polls/{{ poll.id }}/invite" class="flex items-end gap-2 flex-wrap mt-3">
-<input type="hidden" name="csrf" value="{{ csrf_token }}">
-<label class="floating-label grow max-w-xs"><span>Email</span>
-  <input type="email" name="email" id="part-add-email" required placeholder="name@domain.tld"
-         pattern="[^@\s]+@[^@\s]+\.[^@\s]{2,}" class="input input-sm w-full"></label>
-<label class="floating-label grow max-w-xs"><span>Name</span>
-  <input type="text" name="name" id="part-add-name" placeholder="auto-filled from email" class="input input-sm w-full"></label>
-<label class="label cursor-pointer gap-2 pb-1">
-  <input type="checkbox" name="optional" class="checkbox checkbox-xs"><span class="text-sm opacity-70">optional</span></label>
-<button type="submit" class="btn btn-primary btn-sm">Add</button>
-</form>
-<p class="text-sm opacity-60 mt-2">Click a name, email or the optional mark to edit it in place. Required invitees drive the status light: green when a date works for everyone, orange when only the required people fit. Adding does not send mail — select rows and use "Email selected", or the smart reminders below.</p>
+<p class="text-sm opacity-60 mt-2">Click a name, email or the optional box to edit in place; the bottom row adds people (no mail is sent — select rows and use "Email selected", or the smart reminders below). Required invitees drive the status light: green when a date works for everyone, orange when only the required people fit. "via link" rows responded on the share link without an invite.</p>
 <form method="post" action="{{ P }}/polls/{{ poll.id }}/remind-selected" id="part-form" class="hidden">
 <input type="hidden" name="csrf" value="{{ csrf_token }}">
 </form>
