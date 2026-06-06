@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/gerchowl/kairos/compare/v0.6.1...v0.6.2) (2026-06-06)
+
+
+### Bug Fixes
+
+* notification bubble moves to the navbar's right side; hook line back next to the brand ([6d82f76](https://github.com/gerchowl/kairos/commit/6d82f7604e86de4153fcff1859aa82c619316d50))
+
 ## [0.6.1](https://github.com/gerchowl/kairos/compare/v0.6.0...v0.6.1) (2026-06-05)
 
 
