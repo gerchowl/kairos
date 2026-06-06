@@ -249,6 +249,7 @@ def participant_states(poll: dict, responses: list[dict], invites: list[dict],
         return {
             "email": email,
             "invite_id": invite["id"] if invite else None,
+            "joined_at": (invite or {}).get("sent_at") or (resp or {}).get("created_at"),
             "response_id": (resp or {}).get("id"),
             "required": (invite.get("required", True) if invite
                          else bool((resp or {}).get("required", True))),

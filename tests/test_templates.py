@@ -112,7 +112,8 @@ def test_poll_fullday_owner():
         part_payload={"open": True, "csrf": "tok", "update_url": "/u", "remove_url": "/r",
                       "rows": [{"kind": "invite", "ref": "i1", "name": "Alice",
                                 "email": "alice@example.com", "optional": False,
-                                "state": "current", "last_contact": "invite · 2026-06-04 18:00",
+                                "state": "current", "joined": "✉ 04 Jun 2026", "via_link": False,
+                                "last_contact": "invite · 2026-06-04 18:00",
                                 "contacts_n": 1, "trail": ""}]})
     assert "sched-bar" in html
     assert "Close" in html              # ghost close in the strip

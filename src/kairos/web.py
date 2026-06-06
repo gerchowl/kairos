@@ -282,6 +282,13 @@ def view_poll(poll_id: str, request: Request):
         ctx["counts"] = slot_counts(slots, responses)
         ctx["gaps"] = slot_gaps(slots)
 
+    def _fmt_day(ts) -> str:
+        from datetime import date as _date
+        try:
+            return _date.fromisoformat(str(ts)[:10]).strftime("%d %b %Y")
+        except ValueError:
+            return str(ts)[:10]
+
     def _part_payload(rows, user):
         return {
             "open": poll["status"] == "open",
@@ -298,6 +305,8 @@ def view_poll(poll_id: str, request: Request):
                 "email": r["email"],
                 "optional": not r["required"],
                 "via_link": not r["invited"],
+                "joined": (("\u2709" if r["invited"] else "\U0001f517") + " "
+                           + _fmt_day(r["joined_at"])) if r["joined_at"] else "",
                 "state": r["state"],
                 "last_contact": (f"{r['last_contact']['kind']} · {str(r['last_contact']['sent_at'])[:16]}"
                                  if r["last_contact"] else ""),

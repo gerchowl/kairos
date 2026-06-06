@@ -71,9 +71,7 @@
         var d = cell.getRow().getData();
         if (d.kind === "new" && !cell.getValue())
           return '<span class="opacity-40">+ add by email\u2026</span>';
-        var link = d.via_link
-          ? ' <span class="part-via-link" title="Joined via the share link (not invited)">\ud83d\udd17</span>' : "";
-        return (cell.getValue() || "") + link;
+        return cell.getValue() || "";
       } },
     { title: "Name", field: "name", editor: cfg.open ? "input" : false, widthGrow: 2,
       formatter: function (cell) {
@@ -91,6 +89,15 @@
       cellClick: function (e, cell) {
         if (!cfg.open) return;
         cell.setValue(!cell.getValue());
+      } },
+    { title: "Invited", field: "joined", width: 130,
+      headerTooltip: "\u2709 invited by mail on this date \u00b7 \ud83d\udd17 self-joined via the share link (date of their first response)",
+      formatter: function (cell) {
+        var d = cell.getRow().getData();
+        if (d.kind === "new" || !cell.getValue()) return "";
+        return '<span class="text-xs opacity-70" title="' +
+               (d.via_link ? "Self-joined via the share link" : "Invited by mail") +
+               '">' + cell.getValue() + "</span>";
       } },
     { title: "State", field: "state", hozAlign: "center", width: 110,
       headerTooltip: "no reply = hasn't responded · outdated = responded before the newest dates · up to date = covers all current dates",
