@@ -37,3 +37,5 @@ Kairos trusts identity headers from whatever reverse proxy you already run
 (`KAIROS_AUTH=header`): Shibboleth/Apache, oauth2-proxy, Authelia, Cloudflare
 Access, Tailscale… Respondents never need accounts — share links and invite
 tokens are self-contained. See `kairos/settings.py` for all env knobs.
+
+> **Cookie note for operators:** Kairos sets only strictly-necessary cookies (session, signed response-edit token, theme preference) — disclosed on `/privacy`, no consent banner required (ePrivacy Art. 5(3) / Swiss TCA 45c exemptions). If you add analytics or any third-party embeds to your deployment, that changes — you'll need consent management.
