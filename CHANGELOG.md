@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/gerchowl/kairos/compare/v0.6.2...v0.7.0) (2026-06-06)
+
+
+### Features
+
+* 'Invited' column — provenance + date (✉ mail date / 🔗 first-response date) replaces the email-suffix icon ([30729d5](https://github.com/gerchowl/kairos/commit/30729d503fa1db5d9c9d27d910d53eada2fb8bdc))
+
 ## [0.6.2](https://github.com/gerchowl/kairos/compare/v0.6.1...v0.6.2) (2026-06-06)
 
 
