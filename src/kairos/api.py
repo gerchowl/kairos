@@ -20,6 +20,7 @@ from kairos.auth import get_base_url, require_api_key
 from kairos.db import (
     add_response,
     add_slots,
+    bump_slot_sequence,
     create_invite,
     create_poll,
     delete_poll,
@@ -33,9 +34,9 @@ from kairos.db import (
     update_poll,
     update_response,
 )
-from kairos.email_service import send_decision_email, send_invite_email
+from kairos.email_service import send_decision_email, send_imip, send_invite_email
 from kairos.helpers import convergence, format_slot
-from kairos.ics import build_ics
+from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
 from kairos.web import (
     _valid_timezone,
@@ -389,3 +390,40 @@ def email_decision_endpoint(poll_id: str, body: MailIn, request: Request,
 @router.get("/polls/{poll_id}/event.ics")
 def event_ics_endpoint(poll_id: str, request: Request, user: dict = Depends(require_api_key)):
     return ics_response(_get_or_404(poll_id), request)
+
+
+@router.post("/imip/poll")
+def imip_poll_endpoint(user: dict = Depends(require_api_key)):
+    """Run one IMAP poll cycle for inbound iMIP replies; returns the count
+    applied. Operators schedule this (cron / systemd timer hitting the API).
+    No-op unless KAIROS_IMIP + IMAP host are configured."""
+    from kairos.imip_inbound import poll_mailbox
+    return {"applied": poll_mailbox()}
+
+
+@router.post("/polls/{poll_id}/imip-decision")
+def imip_decision_endpoint(poll_id: str, request: Request,
+                           user: dict = Depends(require_api_key)):
+    """Hybrid-C finalist step: send a native iMIP REQUEST for the decided slot
+    to every participant, so they get real Accept/Maybe/Decline buttons and
+    their reply flows back via the IMAP poller. Replies route to IMIP_ORGANIZER."""
+    if not (settings.IMIP_ENABLED and settings.IMIP_ORGANIZER):
+        raise HTTPException(400, "iMIP not configured (KAIROS_IMIP / KAIROS_IMIP_ORGANIZER)")
+    poll = _get_or_404(poll_id)
+    slot = decided_slot_of(poll)
+    if not slot:
+        raise HTTPException(400, "Poll has no decided date yet")
+    seq = bump_slot_sequence(slot["id"])
+    poll_url = _share_url(request, poll)
+    subject = f"Invitation: {poll['title']} — {format_slot(slot, poll['mode'])}"
+    sent = []
+    for email in recipient_emails(poll_id):
+        ics = build_request_ics(poll, slot, email,
+                                organizer_email=settings.IMIP_ORGANIZER,
+                                organizer_name=settings.IMIP_ORGANIZER_NAME,
+                                sequence=seq, url=poll_url)
+        if send_imip(email, subject, f"{poll['title']} — {format_slot(slot, poll['mode'])}\n{poll_url}",
+                     ics, "REQUEST", settings.IMIP_ORGANIZER, settings.IMIP_ORGANIZER_NAME):
+            log_contact(poll_id, email, "decision")
+            sent.append(email)
+    return {"sent": len(sent), "recipients": sent}

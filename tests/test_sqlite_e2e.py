@@ -217,3 +217,132 @@ def test_via_link_respondent_optional_toggle(tmp_path, monkeypatch):
         assert r.json() == {"updated": True}
         conv = convergence(poll, get_responses(pid), [])
         assert conv["state"] == "partial"
+
+
+def test_reverse_calendar_feed_and_deeplink_vote(tmp_path, monkeypatch):
+    """KAIROS_FEED on: subscribe-able candidate feed + deep-link Accept/Decline
+    that upserts one slot at a time on the invitee's response."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
+    from kairos.main import create_app
+    api = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "Reverse cal", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}, {"date": "2026-07-07"}]}).json()
+        pid, token = poll["id"], poll["public_token"]
+        s1, s2 = poll["slots"][0]["id"], poll["slots"][1]["id"]
+
+        # public candidate feed while open: TENTATIVE events, subscribe-able
+        feed = c.get(f"/scheduler/p/{token}/event.ics")
+        assert feed.status_code == 200
+        assert feed.headers["content-type"].startswith("text/calendar")
+        assert feed.text.count("BEGIN:VEVENT") == 2 and "STATUS:TENTATIVE" in feed.text
+
+        # an invite -> per-invite feed carries deep-link vote URLs
+        from kairos.db import create_invite, get_responses
+        itok = create_invite(pid, "bob@x.ch", required=True, name="Bob")["token"]
+        ifeed = c.get(f"/scheduler/p/i/{itok}/feed.ics")
+        assert ifeed.status_code == 200
+        unfolded = ifeed.text.replace("\r\n ", "")  # RFC 5545 unfold
+        assert f"/scheduler/p/i/{itok}/s/{s1}/yes" in unfolded
+
+        # tap a deep link -> records the vote, lands on the poll page
+        r = c.get(f"/scheduler/p/i/{itok}/s/{s1}/yes")
+        assert r.status_code == 200 and "Accepted" in r.text
+        resp = get_responses(pid)
+        assert len(resp) == 1 and resp[0]["slot_availabilities"][s1] == "yes"
+        assert resp[0]["respondent_email"] == "bob@x.ch"
+
+        # a second tap on the other slot upserts WITHOUT clobbering the first
+        c.get(f"/scheduler/p/i/{itok}/s/{s2}/no")
+        resp = get_responses(pid)
+        assert resp[0]["slot_availabilities"] == {s1: "yes", s2: "no"}
+
+        # invalid availability is rejected
+        assert c.get(f"/scheduler/p/i/{itok}/s/{s1}/perhaps").status_code == 404
+
+
+def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
+    """P3 hybrid-C finalist: /imip-decision sends a REQUEST for the decided slot
+    to each participant, bumping the slot SEQUENCE."""
+    from kairos import api, settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "IMIP_ENABLED", True)
+    monkeypatch.setattr(settings, "IMIP_ORGANIZER", "replies@kairos.ch")
+    monkeypatch.setattr(settings, "IMIP_ORGANIZER_NAME", "Kairos")
+    calls = []
+    monkeypatch.setattr(api, "send_imip",
+                        lambda to, subj, body, ics, method, oe, on: calls.append(
+                            {"to": to, "method": method, "ics": ics, "org": oe}) or True)
+    from kairos.main import create_app
+    h = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=h, json={
+            "title": "Decide me", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}, {"date": "2026-07-07"}]}).json()
+        pid, s1 = poll["id"], poll["slots"][0]["id"]
+        from kairos.db import create_invite, get_slot_sequence
+        create_invite(pid, "bob@x.ch", required=True, name="Bob")
+        c.post(f"/scheduler/api/polls/{pid}/decide", headers=h, json={"slot_id": s1})
+        r = c.post(f"/scheduler/api/polls/{pid}/imip-decision", headers=h)
+        assert r.status_code == 200 and r.json()["sent"] == 1
+        assert calls[0]["to"] == "bob@x.ch" and calls[0]["method"] == "REQUEST"
+        assert "METHOD:REQUEST" in calls[0]["ics"] and calls[0]["org"] == "replies@kairos.ch"
+        assert get_slot_sequence(s1) == 1  # bumped 0 -> 1
+
+
+def test_imip_decision_requires_config(tmp_path, monkeypatch):
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "IMIP_ENABLED", False)
+    from kairos.main import create_app
+    h = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=h, json={
+            "title": "x", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        assert c.post(f"/scheduler/api/polls/{poll['id']}/imip-decision", headers=h).status_code == 400
+
+
+def test_slot_sequence_migration_and_bump(tmp_path, monkeypatch):
+    """ical_sequence column is added by migration and bumps monotonically."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    from kairos.main import create_app
+    api = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "Seq", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        sid = poll["slots"][0]["id"]
+        from kairos.db import bump_slot_sequence, get_slot_sequence
+        assert get_slot_sequence(sid) == 0
+        assert bump_slot_sequence(sid) == 1
+        assert bump_slot_sequence(sid) == 2
+        assert get_slot_sequence(sid) == 2
+
+
+def test_feed_disabled_by_default(tmp_path, monkeypatch):
+    """With KAIROS_FEED off, open-poll feeds + deep links don't exist (404)."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "FEED_ENABLED", False)
+    from kairos.main import create_app
+    api = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "No feed", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        # open poll + feed off -> falls through to the decided-event path (none yet)
+        assert c.get(f"/scheduler/p/{poll['public_token']}/event.ics").status_code == 404
+        from kairos.db import create_invite
+        itok = create_invite(poll["id"], "b@x.ch")["token"]
+        assert c.get(f"/scheduler/p/i/{itok}/feed.ics").status_code == 404
+        assert c.get(f"/scheduler/p/i/{itok}/s/{poll['slots'][0]['id']}/yes").status_code == 404

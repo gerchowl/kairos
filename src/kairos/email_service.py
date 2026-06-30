@@ -49,11 +49,44 @@ def _sender_headers(msg, sender_name: str, reply_to: str | None):
         msg["Reply-To"] = reply_to
 
 
-def _ics_part(ics_content: str) -> MIMEText:
+def _calendar_part(ics_content: str, method: str = "PUBLISH") -> MIMEText:
     part = MIMEText(ics_content, "calendar", "utf-8")
-    part.set_param("method", "PUBLISH")
+    part.set_param("method", method)
     part.add_header("Content-Disposition", "attachment", filename=ICS_FILENAME)
     return part
+
+
+def _ics_part(ics_content: str) -> MIMEText:
+    return _calendar_part(ics_content, "PUBLISH")
+
+
+def build_imip_message(to_email: str, subject: str, body_text: str,
+                       ics_content: str, method: str,
+                       organizer_email: str, organizer_name: str) -> MIMEMultipart:
+    """iMIP REQUEST/CANCEL message. From = ORGANIZER mailbox so the client's
+    METHOD:REPLY comes back to the mailbox Kairos polls (no Reply-To override)."""
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = subject
+    msg["To"] = to_email
+    msg["From"] = formataddr((organizer_name, organizer_email))
+    msg.attach(MIMEText(body_text, "plain"))
+    msg.attach(_calendar_part(ics_content, method))
+    return msg
+
+
+def send_imip(to_email: str, subject: str, body_text: str, ics_content: str,
+              method: str, organizer_email: str, organizer_name: str) -> bool:
+    """Send one iMIP REQUEST/CANCEL. False if SMTP not configured or send fails."""
+    if not is_configured():
+        return False
+    msg = build_imip_message(to_email, subject, body_text, ics_content, method,
+                             organizer_email, organizer_name)
+    try:
+        with _smtp_session() as server:
+            server.send_message(msg)
+        return True
+    except Exception:
+        return False
 
 
 def build_invite_message(to_email: str, poll_title: str, invite_url: str,

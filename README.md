@@ -30,6 +30,32 @@ uvx --from 'kairos-scheduler[mysql]' kairos --host 0.0.0.0
 - Decide a final date → .ics download + "email everyone" with the file attached
 - Light/dark colorblind-friendly theme ([Dalton](https://github.com/gerchowl/dalton-colorscheme))
 - Agents: REST API (Bearer), `/llms.txt`, OpenAPI, Swagger UI, MCP server
+- **Reverse-calendar (optional):** push candidate slots *into* the respondent's
+  calendar instead of reading their free/busy — subscribe-able feeds + native
+  iMIP Accept/Maybe/Decline. Off by default (see below).
+
+## Reverse the calendar (iMIP) — optional
+
+Instead of asking for calendar access, Kairos can push the candidate slots **into
+the respondent's calendar** and let them Accept/Maybe/Decline — capturing what's
+*truly* blocking, not mechanical free/busy. Two layers, both opt-in:
+
+- **Candidate feed** (`KAIROS_FEED=on`) — a subscribe-able, disposable `.ics`
+  calendar of the poll's slots. The per-invite feed
+  (`/p/i/<token>/feed.ics`) embeds deep-link Accept/Maybe/Decline URLs; tapping
+  one records that slot and lands on the poll page (the instant surface —
+  subscribed feeds refresh slowly, Google ~daily, so never rely on the calendar
+  reflecting a vote quickly).
+- **Native iMIP invitations** (`KAIROS_IMIP=on`) — real `METHOD:REQUEST`
+  invites with Accept/Maybe/Decline buttons. `KAIROS_IMIP_ORGANIZER` is the
+  mailbox replies route to; it **must equal** the IMAP mailbox Kairos polls
+  (`KAIROS_IMAP_HOST/PORT/USER/PASSWORD/MAILBOX`). Schedule `POST /api/imip/poll`
+  (cron / systemd timer, Bearer auth) to ingest replies; `POST
+  /api/polls/{id}/imip-decision` sends the decided slot as a native invite.
+
+See `docs/design/reverse-calendar-imip.md` and issue #23 for the full design.
+
+## Deployment model
 
 ## Deployment model
 

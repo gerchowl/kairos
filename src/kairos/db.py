@@ -125,9 +125,34 @@ def init_schema():
     _ensure_column(cursor, "sched_invites", "name", "name VARCHAR(255) NULL")
     _ensure_column(cursor, "sched_responses", "notified_at", "notified_at TIMESTAMP NULL")
     _ensure_column(cursor, "sched_responses", "required", "required BOOLEAN DEFAULT TRUE")
+    # iMIP SEQUENCE per slot UID (issue #23): bumped on edit/cancel so clients
+    # accept updates and tombstone the right event.
+    _ensure_column(cursor, "sched_poll_slots", "ical_sequence", "ical_sequence INT DEFAULT 0")
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def get_slot_sequence(slot_id: str) -> int:
+    """Current iMIP SEQUENCE for a slot (0 if never sent)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ical_sequence FROM sched_poll_slots WHERE id = %s", (slot_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def bump_slot_sequence(slot_id: str) -> int:
+    """Increment and return a slot's iMIP SEQUENCE (call before CANCEL/re-REQUEST)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE sched_poll_slots SET ical_sequence = COALESCE(ical_sequence, 0) + 1 WHERE id = %s", (slot_id,))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return get_slot_sequence(slot_id)
 
 
 # -- Polls --
