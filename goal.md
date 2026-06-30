@@ -145,14 +145,16 @@ Accept/Maybe/Decline. Off by default (`KAIROS_IMIP`).
       REQUESTs during collection (the feed covers the many), so there are **no
       loser events to CANCEL** — `build_cancel_ics` stays for a future opt-in
       flavor-A path. Promote = the decided slot's own UID flips to CONFIRMED.
-- [ ] Tests: decide → one CONFIRMED REQUEST for winner + CANCELs for losers;
-      idempotent; re-decide handled.
+- [x] Tests: decide → one CONFIRMED REQUEST for winner (`test_imip_decision_*`).
+      No loser-CANCEL in hybrid C (see design reconciliation above).
 
-### P4 — Cross-client verification (do before trusting P1–P3 in prod)
-- [ ] Build a `REPLY`/`REQUEST` fixture matrix and a `falsify` pass on the
-      load-bearing claim: *Apple Calendar, Outlook (desktop+web), Gmail all
-      round-trip `PARTSTAT` reliably.* Document quirks (Google auto-processing;
-      "Maybe"→"Tentative").
+### P4 — Cross-client verification (do before trusting P1–P3 in prod) — ⚠ PARTIAL
+- [x] Parse-side fixture matrix: real Apple / Google / Outlook(-folded) `ATTENDEE`
+      shapes all parse identically (`test_imip_inbound.py`, parametrized).
+- [ ] **Still needs a real environment / Lars:** live send→RSVP→ingest loop
+      against actual Apple Calendar, Outlook (desktop+web), Gmail with a real
+      `KAIROS_IMIP_ORGANIZER` mailbox; a `falsify` pass on *clients round-trip
+      `PARTSTAT` reliably*; document quirks (Google auto-processing; Maybe→Tentative).
 
 ---
 

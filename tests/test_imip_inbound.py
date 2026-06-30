@@ -30,6 +30,22 @@ def test_parse_ignores_non_reply_and_incomplete():
     assert parse_reply(no_partstat) is None
 
 
+# Real-world ATTENDEE shapes (P4): CN/PARTSTAT order varies per client, Google
+# adds CUTYPE/X-NUM-GUESTS, Outlook folds long lines. All must parse the same.
+@pytest.mark.parametrize("attendee", [
+    "ATTENDEE;CN=Bob;PARTSTAT=ACCEPTED:mailto:bob@x.ch",                       # Apple
+    "ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;"
+    "CN=bob@x.ch;X-NUM-GUESTS=0:mailto:bob@x.ch",                              # Google
+    "ATTENDEE;PARTSTAT=ACCEPTED;CN=Bob Example;ROLE=REQ-PA\r\n RTICIPANT:mailto:bob@x.ch",  # Outlook fold
+])
+def test_parse_handles_real_client_attendee_shapes(attendee):
+    ics = (f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\n"
+           f"UID:kairos-p-s@kairos.local\r\nSEQUENCE:0\r\n{attendee}\r\n"
+           "END:VEVENT\r\nEND:VCALENDAR\r\n")
+    r = parse_reply(ics)
+    assert r["partstat"] == "ACCEPTED" and r["email"] == "bob@x.ch"
+
+
 def test_slot_uid_round_trips():
     uid = slot_uid("11111111-1111-4111-8111-111111111111",
                    "22222222-2222-4222-8222-222222222222")
