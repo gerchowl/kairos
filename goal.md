@@ -77,13 +77,13 @@ time), `_utc`. Call sites: `api.py:382`, `web.py:154` & `:571`, tests
 Work top-to-bottom. **One phase = one focused commit (or small PR).** Each phase
 must leave `nix develop -c uv run pytest -q` green and add its own tests.
 
-### P0 — Candidate feed (flavor B). **START HERE.**
+### P0 — Candidate feed (flavor B). ✅ **LANDED** (commit `0a2f5d4`, 7 new tests).
 *Goal:* a read-only `webcal` feed per poll/participant that shows every candidate
 slot as a VEVENT, each carrying deep-link Accept/Maybe/Decline URLs + live
 metadata. No new attack surface, no inbound mail. Delivers the "throwaway
 calendar of candidate slots" immediately.
 
-- [ ] `ics.py`: add `build_feed_ics(poll, slots, responses, *, invite_token=None,
+- [x] `ics.py`: add `build_feed_ics(poll, slots, responses, *, invite_token=None,
       base_url)` → a multi-VEVENT `VCALENDAR`, `METHOD:PUBLISH`. Reuse
       `_esc/_fold/_utc/_hm`. Per slot:
   - stable `UID:kairos-{poll_id}-{slot_id}@<host>` (see UID rule below),
@@ -95,18 +95,21 @@ calendar of candidate slots" immediately.
     red blocked),
   - top-level `REFRESH-INTERVAL;VALUE=DURATION:PT15M` + `X-PUBLISHED-TTL:PT15M`
     (hint only — see lag constraint).
-- [ ] Route: extend/duplicate `GET /{token}/event.ics` → when poll is **open**,
+- [x] Route: extend/duplicate `GET /{token}/event.ics` → when poll is **open**,
       return the candidate feed; when **decided**, keep current single confirmed
       event. Add a per-invite variant `GET /i/{invite_token}/feed.ics`.
-- [ ] Deep-link vote endpoints (idempotent **GET**, since they're tapped from a
+- [x] Deep-link vote endpoints (idempotent **GET**, since they're tapped from a
       calendar event body): `GET /i/{invite_token}/s/{slot_id}/{yes|maybe|no}`
-      → record availability → **render an instant confirmation page** showing the
-      updated tally (this page, NOT the calendar, is the real-time surface — the
-      feed lags). CSRF-exempt by design (token in path is the capability); guard
-      with the existing invite-token check; rate-limit.
-- [ ] Tests (`tests/test_ics.py`, `tests/test_routes.py`): feed has N VEVENTs,
-      correct UIDs, tally text, deep links resolve, a GET vote flips
-      `sched_response_slots.availability`, decided poll still returns one event.
+      → record availability → re-render the poll page (the instant surface; feed
+      lags). Token-in-path is the capability; gated on `KAIROS_FEED`.
+- [x] Tests: feed has N VEVENTs, correct UIDs, tally text, color/status, deep
+      links resolve, a GET vote upserts one slot without clobber, decided poll
+      still returns one event, all-off → 404. (`test_ics.py`, `test_sqlite_e2e.py`)
+
+**P0 notes / deferred:** rate-limiting on the deep-link endpoint not yet added
+(token-guarded; add a limiter before high-volume use). The public `/{token}`
+feed links to the poll page (no per-slot identity); per-slot deep links require
+the invite feed. `uv.lock` pre-commit papercut fixed (`uv run --frozen`).
 
 ### P1 — iMIP outbound (opt-in)
 *Goal:* emit real `METHOD:REQUEST` invitations so clients show native
