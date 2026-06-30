@@ -11,6 +11,7 @@ KAIROS_BRAND       display name (default "Kairos")
 KAIROS_HOME_URL    brand-link target in the navbar (default the app itself)
 SESSION_SECRET     signing key for cookies/CSRF (required outside demo mode)
 SMTP_HOST/PORT/USER/PASSWORD/FROM   outbound mail (optional; unauth relay ok)
+KAIROS_FEED        reverse-calendar slot feeds + deep-link voting: off (default) | on
 """
 
 import os
@@ -36,6 +37,11 @@ OPERATOR = os.environ.get("KAIROS_OPERATOR", "")            # name / org
 OPERATOR_ADDRESS = os.environ.get("KAIROS_OPERATOR_ADDRESS", "")  # postal address, comma-separated
 OPERATOR_EMAIL = os.environ.get("KAIROS_OPERATOR_EMAIL", "")
 LEGAL_EXTRA = os.environ.get("KAIROS_LEGAL_EXTRA", "")      # free-form extra paragraph
+
+# Reverse-calendar feed (issue #23): subscribe-able candidate-slot .ics feeds +
+# deep-link Accept/Maybe/Decline. Off by default — opt in per deployment, since
+# it exposes additional public (token-guarded) endpoints. See goal.md / docs.
+FEED_ENABLED = os.environ.get("KAIROS_FEED", "off").strip().lower() in ("1", "on", "true", "yes")
 
 
 def session_secret() -> str:

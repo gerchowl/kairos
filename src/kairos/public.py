@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from kairos import settings
 from kairos.auth import RESPONSE_REF_MAX_AGE, get_user, load_response_ref, sign_response_ref
@@ -26,9 +26,10 @@ from kairos.helpers import (
     timeslot_payload,
 )
 from kairos.http import form_data, valid_email
+from kairos.ics import build_feed_ics
 from kairos.notifications import notify_all_responded, notify_new_response
 from kairos.templating import render
-from kairos.web import ics_response
+from kairos.web import get_base_url, ics_response
 
 P = settings.PREFIX
 router = APIRouter(prefix=f"{P}/p")
@@ -174,6 +175,35 @@ def _handle_submit(request: Request, poll: dict, action: str, form, invite: dict
     return page
 
 
+def _feed_response(poll: dict, request: Request, invite_token: str | None = None) -> Response:
+    """Read-only candidate-slot feed (.ics) for a still-open poll."""
+    responses = get_responses(poll["id"])
+    total, _ = expected_counts(get_invites(poll["id"]), responses)
+    body = build_feed_ics(poll, poll["slots"], responses,
+                          base_url=get_base_url(request), prefix=P,
+                          invite_token=invite_token, total_expected=total)
+    return Response(content=body, media_type="text/calendar",
+                    headers={"Content-Disposition": 'inline; filename="kairos-candidates.ics"'})
+
+
+def _record_single_vote(request: Request, poll: dict, invite: dict, slot_id: str, availability: str):
+    """Deep-link vote: upsert just this one slot on the invitee's response,
+    leaving any other slot answers untouched."""
+    email = invite["email"]
+    existing, user = _existing_response(request, poll, email)
+    if existing:
+        update_response(existing["id"], existing["respondent_name"],
+                        {slot_id: availability},
+                        user_id=(user or {}).get("uid"), email=email)
+    else:
+        name = invite.get("name") or email
+        add_response(poll["id"], name, email, {slot_id: availability},
+                     user_id=(user or {}).get("uid"), invite_id=invite["id"])
+        mark_invite_responded(invite["id"])
+        notify_new_response(poll["id"], name)
+        notify_all_responded(poll["id"])
+
+
 # -- Public poll routes --
 
 @router.get("/{token}/event.ics")
@@ -181,6 +211,10 @@ def public_poll_ics(token: str, request: Request):
     poll = get_poll_by_token(token)
     if not poll:
         raise HTTPException(404)
+    # While open, an enabled deployment serves the subscribe-able candidate
+    # feed; once decided (or feed disabled) it's the single confirmed event.
+    if settings.FEED_ENABLED and poll["status"] == "open":
+        return _feed_response(poll, request)
     return ics_response(poll, request)
 
 
@@ -226,3 +260,48 @@ def submit_invite_response(invite_token: str, request: Request, form=Depends(for
         return _not_found("Poll not found")
 
     return _handle_submit(request, poll, f"{P}/p/i/{invite_token}", form, invite=invite)
+
+
+# -- Reverse-calendar feed + deep-link voting (gated on KAIROS_FEED) --
+
+@router.get("/i/{invite_token}/feed.ics")
+def invite_feed_ics(invite_token: str, request: Request):
+    """Per-invitee candidate feed: every slot carries deep-link vote URLs."""
+    if not settings.FEED_ENABLED:
+        raise HTTPException(404)
+    invite = get_invite_by_token(invite_token)
+    if not invite:
+        raise HTTPException(404)
+    poll = get_poll(invite["poll_id"])
+    if not poll:
+        raise HTTPException(404)
+    return _feed_response(poll, request, invite_token=invite_token)
+
+
+@router.get("/i/{invite_token}/s/{slot_id}/{availability}")
+def deep_link_vote(invite_token: str, slot_id: str, availability: str, request: Request):
+    """Tapped from a calendar event body: record one slot's answer, then land
+    on the poll page — the instant-feedback surface (the feed itself lags)."""
+    if not settings.FEED_ENABLED:
+        raise HTTPException(404)
+    if availability not in ("yes", "maybe", "no"):
+        return _not_found("Invalid vote", "Use accept, maybe, or decline.")
+    invite = get_invite_by_token(invite_token)
+    if not invite:
+        return _not_found("Invalid invite link", "This invite may be invalid or expired.")
+    poll = get_poll(invite["poll_id"])
+    if not poll:
+        return _not_found("Poll not found")
+
+    action = f"{P}/p/i/{invite_token}"
+    slot = next((s for s in poll["slots"] if s["id"] == slot_id), None)
+    if not slot:
+        return _not_found("Unknown slot", "That option is no longer part of this poll.")
+    if poll["status"] != "open":
+        return _render_poll_page(poll, action, request, invite=invite,
+                                 msg="This poll is closed — your vote was not changed.")
+
+    _record_single_vote(request, poll, invite, slot_id, availability)
+    label = {"yes": "Accepted", "maybe": "Maybe", "no": "Declined"}[availability]
+    return _render_poll_page(poll, action, request, invite=invite,
+                             msg=f"{label}: {format_slot(slot, poll['mode'])}. Updated tally below.")

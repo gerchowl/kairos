@@ -8,6 +8,6 @@ repos:
         types: [python]
       - id: pytest
         name: pytest — full suite (sqlite, fast)
-        entry: sh -c 'uv run pytest tests -q'
+        entry: sh -c 'uv run --frozen pytest tests -q'
         language: system
         pass_filenames: false

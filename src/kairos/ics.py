@@ -48,16 +48,105 @@ def _utc(d: date_t, t, tz: ZoneInfo) -> str:
     return local.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def build_ics(poll: dict, slot: dict, url: str | None = None) -> str:
-    """VCALENDAR with the decided slot as a confirmed event."""
+def _dt_lines(poll: dict, slot: dict) -> tuple[str, str]:
+    """DTSTART/DTEND content lines for a slot: UTC interval for time_slot polls
+    (via the poll's IANA tz), exclusive all-day DATE values otherwise."""
     d = _as_date(slot["date"])
     if slot.get("start_time") and slot.get("end_time"):
         tz = ZoneInfo(poll.get("timezone") or "Europe/Zurich")
-        dtstart = f"DTSTART:{_utc(d, slot['start_time'], tz)}"
-        dtend = f"DTEND:{_utc(d, slot['end_time'], tz)}"
-    else:
-        dtstart = f"DTSTART;VALUE=DATE:{d.strftime('%Y%m%d')}"
-        dtend = f"DTEND;VALUE=DATE:{(d + timedelta(days=1)).strftime('%Y%m%d')}"
+        return (f"DTSTART:{_utc(d, slot['start_time'], tz)}",
+                f"DTEND:{_utc(d, slot['end_time'], tz)}")
+    return (f"DTSTART;VALUE=DATE:{d.strftime('%Y%m%d')}",
+            f"DTEND;VALUE=DATE:{(d + timedelta(days=1)).strftime('%Y%m%d')}")
+
+
+def _now_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def slot_uid(poll_id: str, slot_id: str) -> str:
+    """Stable per-slot UID — reused across feed refreshes, iMIP REQUEST and
+    CANCEL so a client tracks one event through its whole lifecycle."""
+    return f"kairos-{poll_id}-{slot_id}@kairos.local"
+
+
+def _tally(slot_id: str, responses: list[dict]) -> tuple[int, int, int]:
+    """(yes, maybe, no) counts for a slot across responses."""
+    avs = [r["slot_availabilities"].get(slot_id) for r in responses]
+    return (sum(a == "yes" for a in avs),
+            sum(a == "maybe" for a in avs),
+            sum(a == "no" for a in avs))
+
+
+def _slot_status(yes: int, maybe: int, total_expected: int) -> str:
+    """Convergence label mirrored into the event for machines + color."""
+    if total_expected and yes >= total_expected:
+        return "ready"
+    if yes or maybe:
+        return "partial"
+    return "open"
+
+
+# RFC 7986 COLOR (CSS3 names) by convergence — the overlay becomes the heatmap.
+_STATUS_COLOR = {"ready": "green", "partial": "orange"}
+
+
+def build_feed_ics(poll: dict, slots: list[dict], responses: list[dict], *,
+                   base_url: str = "", prefix: str = "",
+                   invite_token: str | None = None,
+                   total_expected: int = 0) -> str:
+    """Read-only candidate-slot feed (flavor B): one TENTATIVE VEVENT per slot,
+    each carrying the live tally, convergence color, and — for an invite feed —
+    deep-link Accept/Maybe/Decline URLs the calendar surfaces in the event body.
+
+    NOTE: subscribed feeds are eventually-consistent (Google ~daily, not
+    controllable). The deep-link landing page, not this feed, is the
+    instant-feedback surface. See docs/design/reverse-calendar-imip.md.
+    """
+    poll_url = f"{base_url}{prefix}/p/{poll['public_token']}"
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//kairos//scheduler//EN",
+        "METHOD:PUBLISH",
+        "CALSCALE:GREGORIAN",
+        f"X-WR-CALNAME:{_esc(poll['title'])} — Kairos",
+        "REFRESH-INTERVAL;VALUE=DURATION:PT15M",
+        "X-PUBLISHED-TTL:PT15M",
+    ]
+    stamp = _now_stamp()
+    for slot in slots:
+        dtstart, dtend = _dt_lines(poll, slot)
+        yes, maybe, no = _tally(slot["id"], responses)
+        status = _slot_status(yes, maybe, total_expected)
+        desc = [f"{yes} yes · {maybe} maybe · {no} no"]
+        if invite_token:
+            vote = f"{base_url}{prefix}/p/i/{invite_token}/s/{slot['id']}"
+            desc += [f"Accept: {vote}/yes", f"Maybe: {vote}/maybe", f"Decline: {vote}/no"]
+        desc.append(poll_url)
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{slot_uid(poll['id'], slot['id'])}",
+            f"DTSTAMP:{stamp}",
+            dtstart,
+            dtend,
+            f"SUMMARY:{_esc(poll['title'])}",
+            f"DESCRIPTION:{_esc(chr(10).join(desc))}",
+            f"URL:{poll_url}",
+            "STATUS:TENTATIVE",
+            f"X-KAIROS-POLL-ID:{poll['id']}",
+            f"X-KAIROS-SLOT-STATUS:{status}",
+        ]
+        if status in _STATUS_COLOR:
+            lines.append(f"COLOR:{_STATUS_COLOR[status]}")
+        lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(_fold(li) for li in lines) + "\r\n"
+
+
+def build_ics(poll: dict, slot: dict, url: str | None = None) -> str:
+    """VCALENDAR with the decided slot as a confirmed event."""
+    dtstart, dtend = _dt_lines(poll, slot)
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -66,7 +155,7 @@ def build_ics(poll: dict, slot: dict, url: str | None = None) -> str:
         "METHOD:PUBLISH",
         "BEGIN:VEVENT",
         f"UID:kairos-{poll['id']}@kairos.local",
-        f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+        f"DTSTAMP:{_now_stamp()}",
         dtstart,
         dtend,
         f"SUMMARY:{_esc(poll['title'])}",
