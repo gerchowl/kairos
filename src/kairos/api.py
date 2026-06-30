@@ -389,3 +389,12 @@ def email_decision_endpoint(poll_id: str, body: MailIn, request: Request,
 @router.get("/polls/{poll_id}/event.ics")
 def event_ics_endpoint(poll_id: str, request: Request, user: dict = Depends(require_api_key)):
     return ics_response(_get_or_404(poll_id), request)
+
+
+@router.post("/imip/poll")
+def imip_poll_endpoint(user: dict = Depends(require_api_key)):
+    """Run one IMAP poll cycle for inbound iMIP replies; returns the count
+    applied. Operators schedule this (cron / systemd timer hitting the API).
+    No-op unless KAIROS_IMIP + IMAP host are configured."""
+    from kairos.imip_inbound import poll_mailbox
+    return {"applied": poll_mailbox()}

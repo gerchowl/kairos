@@ -64,10 +64,26 @@ def _now_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+_UID_HOST = "@kairos.local"
+
+
 def slot_uid(poll_id: str, slot_id: str) -> str:
     """Stable per-slot UID — reused across feed refreshes, iMIP REQUEST and
     CANCEL so a client tracks one event through its whole lifecycle."""
-    return f"kairos-{poll_id}-{slot_id}@kairos.local"
+    return f"kairos-{poll_id}-{slot_id}{_UID_HOST}"
+
+
+def parse_slot_uid(uid: str) -> tuple[str, str] | None:
+    """Inverse of slot_uid: (poll_id, slot_id) from a reply's UID, else None.
+
+    Both ids are fixed-width uuid4 (36 chars), so the inner '{poll}-{slot}'
+    splits unambiguously despite the hyphens inside each uuid."""
+    if not uid.startswith("kairos-") or not uid.endswith(_UID_HOST):
+        return None
+    mid = uid[len("kairos-"):-len(_UID_HOST)]
+    if len(mid) != 73 or mid[36] != "-":  # 36 + '-' + 36
+        return None
+    return mid[:36], mid[37:]
 
 
 def _tally(slot_id: str, responses: list[dict]) -> tuple[int, int, int]:
