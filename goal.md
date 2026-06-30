@@ -111,47 +111,40 @@ calendar of candidate slots" immediately.
 feed links to the poll page (no per-slot identity); per-slot deep links require
 the invite feed. `uv.lock` pre-commit papercut fixed (`uv run --frozen`).
 
-### P1 — iMIP outbound (opt-in)
+### P1 — iMIP outbound. ✅ **LANDED** (commit `57868ef`).
 *Goal:* emit real `METHOD:REQUEST` invitations so clients show native
-Accept/Maybe/Decline. **Opt-in per participant/poll** (default stays feed).
+Accept/Maybe/Decline. Off by default (`KAIROS_IMIP`).
 
-- [ ] `ics.py`: `build_request_ics(poll, slot, attendee, organizer, *, sequence)`
-      → `METHOD:REQUEST`, `ORGANIZER;CN=…:mailto:…`,
-      `ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:…`,
+- [x] `ics.py`: `build_request_ics` / `build_cancel_ics` → `METHOD:REQUEST`/`CANCEL`,
+      `ORGANIZER` (= reply mailbox), `ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE`,
       stable `UID`, `SEQUENCE`.
-- [ ] Persist per-slot `UID` + `SEQUENCE` (new columns on `sched_poll_slots`, e.g.
-      `ical_uid`, `ical_sequence`; migration in `db.py`). UID rule: generate once,
-      never change; bump `SEQUENCE` on any slot edit.
-- [ ] Wire an opt-in send path through `email_service.py` (new
-      `templates/email/imip_request.*` + `.ics` attachment, `method=REQUEST`).
-      Log to `sched_contact_log`.
-- [ ] Settings flag (e.g. `KAIROS_IMIP=off|optin`) in `settings.py`. Tests.
+- [x] Per-slot `SEQUENCE` persisted (`ical_sequence` column + `get/bump_slot_sequence`).
+      UID stays deterministic (`slot_uid`), so no `ical_uid` column needed.
+- [x] Send path `email_service.send_imip` — `.ics` with `method=REQUEST/CANCEL`,
+      `From` = ORGANIZER mailbox (replies route to the IMAP inbox).
+- [x] Settings `KAIROS_IMIP` + `KAIROS_IMIP_ORGANIZER[_NAME]`. Tests (`test_imip.py`).
 
-### P2 — iMIP inbound (reply ingestion)
-*Goal:* receive `METHOD:REPLY`, parse `PARTSTAT`, update the poll. **This is the
-real lift + new attack surface — fail-closed, pluggable.**
+### P2 — iMIP inbound (reply ingestion). ✅ **LANDED** (commit `12c732c`).
+*Goal:* receive `METHOD:REPLY`, parse `PARTSTAT`, update the poll. **IMAP poll**
+(Lars's choice). Fail-closed.
 
-- [ ] New `src/kairos/imip_inbound.py`: parse a `text/calendar` `METHOD:REPLY`
-      (stdlib parsing, mirror `ics.py` ethos), extract `UID`, `ATTENDEE`,
-      `PARTSTAT`, `SEQUENCE`.
-- [ ] Identity match: `ATTENDEE mailto:` → `sched_invites.email` (scoped to the
-      poll via UID). Reject unknown/mismatched senders. Ignore stale `SEQUENCE`.
-- [ ] Ingress adapter (pluggable): webhook endpoint (SendGrid/Postmark inbound
-      parse) **or** IMAP poll — pick per Lars's infra (OPEN QUESTION below).
-      Verify provider signature; size-limit; quarantine on parse failure.
-- [ ] Map `PARTSTAT` → `availability`, upsert `sched_response_slots`. Tests with
-      captured `REPLY` fixtures from Apple / Outlook / Gmail.
+- [x] `src/kairos/imip_inbound.py`: stdlib `parse_reply` (UID/ATTENDEE/PARTSTAT/
+      SEQUENCE) + `ics.parse_slot_uid` (fixed-width UID inverse).
+- [x] Identity match `ATTENDEE mailto:` → known invite scoped to poll via UID;
+      reject unknown senders; drop stale `SEQUENCE`.
+- [x] `poll_mailbox()` IMAP-polls the ORGANIZER mailbox (opt-in, per-message
+      fail-closed), exposed at `POST /api/imip/poll` for an operator cron/timer.
+- [x] `PARTSTAT`→`availability` upsert. 9 tests incl. unknown-attendee/UID/stale.
 
-### P3 — Decision reconciliation (revoke + finalize)
-*Goal:* deciding a date revokes the other proposals and confirms the winner — on
-everyone's calendars.
+### P3 — Decision-time iMIP (hybrid-C finalist). ✅ **LANDED** (commit `f7745d8`).
+*Goal:* deciding a date sends the winner as a native RSVP-able invite.
 
-- [ ] On `decide`: for every non-winning slot with an emitted UID, send
-      `METHOD:CANCEL` (bump `SEQUENCE`). For the feed, drop them on next refresh.
-- [ ] **Promote the winning slot's existing UID** to `STATUS:CONFIRMED` via a
-      fresh `METHOD:REQUEST` (no new UID → the accepted hold *becomes* the
-      meeting; prior acceptors stay accepted). Fold into existing `email-decision`
-      flow (`web.py:558` / `api.py:371`).
+- [x] `POST /api/polls/{id}/imip-decision` → `METHOD:REQUEST` (CONFIRMED) for the
+      decided slot to every participant, bumping `SEQUENCE`; replies via IMAP poller.
+- [x] **Design reconciliation:** under hybrid C we do *not* fan out per-slot
+      REQUESTs during collection (the feed covers the many), so there are **no
+      loser events to CANCEL** — `build_cancel_ics` stays for a future opt-in
+      flavor-A path. Promote = the decided slot's own UID flips to CONFIRMED.
 - [ ] Tests: decide → one CONFIRMED REQUEST for winner + CANCELs for losers;
       idempotent; re-decide handled.
 
