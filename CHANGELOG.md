@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0](https://github.com/gerchowl/kairos/compare/v0.7.0...v0.8.0) (2026-06-30)
+
+
+### Features
+
+* reverse the calendar — candidate feeds + native iMIP ([#24](https://github.com/gerchowl/kairos/issues/24)) ([d00704a](https://github.com/gerchowl/kairos/commit/d00704a6326168a3ea5ef2de07aac03f3436d61b)), closes [#23](https://github.com/gerchowl/kairos/issues/23)
+
+
+### Documentation
+
+* cookie/consent position — strictly-necessary only, disclosure not banner; theme pref disclosed on /privacy ([cf43e7c](https://github.com/gerchowl/kairos/commit/cf43e7cbcbef29130d0b46af3cba86c6f1c28a04))
+
 ## [0.7.0](https://github.com/gerchowl/kairos/compare/v0.6.2...v0.7.0) (2026-06-06)
 
 
