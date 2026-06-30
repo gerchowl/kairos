@@ -144,6 +144,67 @@ def build_feed_ics(poll: dict, slots: list[dict], responses: list[dict], *,
     return "\r\n".join(_fold(li) for li in lines) + "\r\n"
 
 
+def _imip_ics(poll: dict, slot: dict, *, method: str, status: str,
+              organizer_email: str, organizer_name: str | None,
+              attendee_email: str, attendee_name: str | None,
+              sequence: int, partstat: str, rsvp: bool,
+              url: str | None = None) -> str:
+    """One iMIP VEVENT (REQUEST or CANCEL) addressed to a single attendee.
+
+    ORGANIZER is the mailbox Kairos polls for replies (so a client's
+    METHOD:REPLY comes back where we can read it). UID/SEQUENCE track the slot
+    across its whole lifecycle. See docs/design/reverse-calendar-imip.md.
+    """
+    dtstart, dtend = _dt_lines(poll, slot)
+    org_cn = f";CN={_esc(organizer_name)}" if organizer_name else ""
+    att_cn = f";CN={_esc(attendee_name)}" if attendee_name else ""
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//kairos//scheduler//EN",
+        f"METHOD:{method}",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VEVENT",
+        f"UID:{slot_uid(poll['id'], slot['id'])}",
+        f"DTSTAMP:{_now_stamp()}",
+        f"SEQUENCE:{sequence}",
+        dtstart,
+        dtend,
+        f"SUMMARY:{_esc(poll['title'])}",
+        f"ORGANIZER{org_cn}:mailto:{organizer_email}",
+        (f"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT={partstat};"
+         f"RSVP={'TRUE' if rsvp else 'FALSE'}{att_cn}:mailto:{attendee_email}"),
+        f"STATUS:{status}",
+    ]
+    if poll.get("description"):
+        lines.append(f"DESCRIPTION:{_esc(poll['description'])}")
+    if url:
+        lines.append(f"URL:{url}")
+    lines += ["END:VEVENT", "END:VCALENDAR"]
+    return "\r\n".join(_fold(li) for li in lines) + "\r\n"
+
+
+def build_request_ics(poll: dict, slot: dict, attendee_email: str, *,
+                      organizer_email: str, organizer_name: str | None = None,
+                      sequence: int = 0, attendee_name: str | None = None,
+                      url: str | None = None) -> str:
+    """iMIP METHOD:REQUEST — surfaces native Accept/Maybe/Decline in the client."""
+    return _imip_ics(poll, slot, method="REQUEST", status="CONFIRMED",
+                     organizer_email=organizer_email, organizer_name=organizer_name,
+                     attendee_email=attendee_email, attendee_name=attendee_name,
+                     sequence=sequence, partstat="NEEDS-ACTION", rsvp=True, url=url)
+
+
+def build_cancel_ics(poll: dict, slot: dict, attendee_email: str, *,
+                     organizer_email: str, organizer_name: str | None = None,
+                     sequence: int = 1) -> str:
+    """iMIP METHOD:CANCEL — clients auto-remove the event (losing slots on decide)."""
+    return _imip_ics(poll, slot, method="CANCEL", status="CANCELLED",
+                     organizer_email=organizer_email, organizer_name=organizer_name,
+                     attendee_email=attendee_email, attendee_name=None,
+                     sequence=sequence, partstat="NEEDS-ACTION", rsvp=False)
+
+
 def build_ics(poll: dict, slot: dict, url: str | None = None) -> str:
     """VCALENDAR with the decided slot as a confirmed event."""
     dtstart, dtend = _dt_lines(poll, slot)

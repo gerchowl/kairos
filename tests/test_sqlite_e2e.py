@@ -265,6 +265,25 @@ def test_reverse_calendar_feed_and_deeplink_vote(tmp_path, monkeypatch):
         assert c.get(f"/scheduler/p/i/{itok}/s/{s1}/perhaps").status_code == 404
 
 
+def test_slot_sequence_migration_and_bump(tmp_path, monkeypatch):
+    """ical_sequence column is added by migration and bumps monotonically."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    from kairos.main import create_app
+    api = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "Seq", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        sid = poll["slots"][0]["id"]
+        from kairos.db import bump_slot_sequence, get_slot_sequence
+        assert get_slot_sequence(sid) == 0
+        assert bump_slot_sequence(sid) == 1
+        assert bump_slot_sequence(sid) == 2
+        assert get_slot_sequence(sid) == 2
+
+
 def test_feed_disabled_by_default(tmp_path, monkeypatch):
     """With KAIROS_FEED off, open-poll feeds + deep links don't exist (404)."""
     from kairos import settings

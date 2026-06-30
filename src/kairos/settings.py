@@ -12,6 +12,10 @@ KAIROS_HOME_URL    brand-link target in the navbar (default the app itself)
 SESSION_SECRET     signing key for cookies/CSRF (required outside demo mode)
 SMTP_HOST/PORT/USER/PASSWORD/FROM   outbound mail (optional; unauth relay ok)
 KAIROS_FEED        reverse-calendar slot feeds + deep-link voting: off (default) | on
+KAIROS_IMIP        native iMIP invitations (Accept/Maybe/Decline): off (default) | on
+KAIROS_IMIP_ORGANIZER       reply mailbox = ORGANIZER mailto (must equal IMAP mailbox)
+KAIROS_IMIP_ORGANIZER_NAME  ORGANIZER display name (default KAIROS_BRAND)
+KAIROS_IMAP_HOST/PORT/USER/PASSWORD/MAILBOX   inbound iMIP reply polling (P2)
 """
 
 import os
@@ -42,6 +46,20 @@ LEGAL_EXTRA = os.environ.get("KAIROS_LEGAL_EXTRA", "")      # free-form extra pa
 # deep-link Accept/Maybe/Decline. Off by default — opt in per deployment, since
 # it exposes additional public (token-guarded) endpoints. See goal.md / docs.
 FEED_ENABLED = os.environ.get("KAIROS_FEED", "off").strip().lower() in ("1", "on", "true", "yes")
+
+# Native iMIP invitations (RFC 6047): real Accept/Maybe/Decline buttons in the
+# client. Off by default. IMIP_ORGANIZER is the mailbox Kairos polls for replies
+# (it MUST equal the IMAP mailbox below) — clients send METHOD:REPLY there.
+IMIP_ENABLED = os.environ.get("KAIROS_IMIP", "off").strip().lower() in ("1", "on", "true", "yes")
+IMIP_ORGANIZER = os.environ.get("KAIROS_IMIP_ORGANIZER", "")
+IMIP_ORGANIZER_NAME = os.environ.get("KAIROS_IMIP_ORGANIZER_NAME", BRAND)
+
+# Inbound iMIP reply ingestion via IMAP poll (P2). Same mailbox as IMIP_ORGANIZER.
+IMAP_HOST = os.environ.get("KAIROS_IMAP_HOST", "")
+IMAP_PORT = int(os.environ.get("KAIROS_IMAP_PORT", "993"))
+IMAP_USER = os.environ.get("KAIROS_IMAP_USER", "")
+IMAP_PASSWORD = os.environ.get("KAIROS_IMAP_PASSWORD", "")
+IMAP_MAILBOX = os.environ.get("KAIROS_IMAP_MAILBOX", "INBOX")
 
 
 def session_secret() -> str:

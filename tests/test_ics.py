@@ -2,7 +2,7 @@
 
 from datetime import date, time, timedelta
 
-from kairos.ics import build_feed_ics, build_ics, slot_uid
+from kairos.ics import build_cancel_ics, build_feed_ics, build_ics, build_request_ics, slot_uid
 
 POLL = {"id": "p1", "title": "Team retreat, June; planning", "description": "Two\nlines",
         "timezone": "Europe/Zurich", "status": "decided", "decided_slot_id": "t1"}
@@ -109,3 +109,37 @@ def test_feed_lines_are_folded():
     feed = build_feed_ics(dict(FEED_POLL, title="y" * 200), FEED_SLOTS, [], base_url="https://x")
     for line in feed.split("\r\n"):
         assert len(line.encode()) <= 76
+
+
+# -- iMIP REQUEST / CANCEL (build_request_ics / build_cancel_ics) --
+
+_SLOT = {"id": "s1", "date": date(2026, 7, 6), "start_time": time(9, 0), "end_time": time(9, 30)}
+
+
+def test_request_is_imip_invitation():
+    ics = _unfold(build_request_ics(FEED_POLL, _SLOT, "bob@x.ch",
+                                    organizer_email="replies@kairos.ch", organizer_name="Kairos",
+                                    sequence=0, attendee_name="Bob"))
+    assert "METHOD:REQUEST" in ics
+    assert "ORGANIZER;CN=Kairos:mailto:replies@kairos.ch" in ics
+    assert "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Bob:mailto:bob@x.ch" in ics
+    assert "SEQUENCE:0" in ics
+    assert "STATUS:CONFIRMED" in ics
+    assert f"UID:{slot_uid('p9', 's1')}" in ics
+    assert "DTSTART:20260706T070000Z" in ics  # 09:00 CEST -> UTC
+
+
+def test_cancel_revokes_same_uid():
+    ics = build_cancel_ics(FEED_POLL, _SLOT, "bob@x.ch",
+                           organizer_email="replies@kairos.ch", sequence=2)
+    assert "METHOD:CANCEL" in ics
+    assert "STATUS:CANCELLED" in ics
+    assert "SEQUENCE:2" in ics
+    # same UID as the REQUEST so the client tombstones the right event
+    assert f"UID:{slot_uid('p9', 's1')}" in ics
+
+
+def test_request_escapes_attendee_cn():
+    ics = _unfold(build_request_ics(FEED_POLL, _SLOT, "x@y.ch",
+                                    organizer_email="o@z.ch", attendee_name="Doe, Jane"))
+    assert "CN=Doe\\, Jane:mailto:x@y.ch" in ics
