@@ -265,6 +265,50 @@ def test_reverse_calendar_feed_and_deeplink_vote(tmp_path, monkeypatch):
         assert c.get(f"/scheduler/p/i/{itok}/s/{s1}/perhaps").status_code == 404
 
 
+def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
+    """P3 hybrid-C finalist: /imip-decision sends a REQUEST for the decided slot
+    to each participant, bumping the slot SEQUENCE."""
+    from kairos import api, settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "IMIP_ENABLED", True)
+    monkeypatch.setattr(settings, "IMIP_ORGANIZER", "replies@kairos.ch")
+    monkeypatch.setattr(settings, "IMIP_ORGANIZER_NAME", "Kairos")
+    calls = []
+    monkeypatch.setattr(api, "send_imip",
+                        lambda to, subj, body, ics, method, oe, on: calls.append(
+                            {"to": to, "method": method, "ics": ics, "org": oe}) or True)
+    from kairos.main import create_app
+    h = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=h, json={
+            "title": "Decide me", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}, {"date": "2026-07-07"}]}).json()
+        pid, s1 = poll["id"], poll["slots"][0]["id"]
+        from kairos.db import create_invite, get_slot_sequence
+        create_invite(pid, "bob@x.ch", required=True, name="Bob")
+        c.post(f"/scheduler/api/polls/{pid}/decide", headers=h, json={"slot_id": s1})
+        r = c.post(f"/scheduler/api/polls/{pid}/imip-decision", headers=h)
+        assert r.status_code == 200 and r.json()["sent"] == 1
+        assert calls[0]["to"] == "bob@x.ch" and calls[0]["method"] == "REQUEST"
+        assert "METHOD:REQUEST" in calls[0]["ics"] and calls[0]["org"] == "replies@kairos.ch"
+        assert get_slot_sequence(s1) == 1  # bumped 0 -> 1
+
+
+def test_imip_decision_requires_config(tmp_path, monkeypatch):
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "IMIP_ENABLED", False)
+    from kairos.main import create_app
+    h = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=h, json={
+            "title": "x", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        assert c.post(f"/scheduler/api/polls/{poll['id']}/imip-decision", headers=h).status_code == 400
+
+
 def test_slot_sequence_migration_and_bump(tmp_path, monkeypatch):
     """ical_sequence column is added by migration and bumps monotonically."""
     from kairos import settings
