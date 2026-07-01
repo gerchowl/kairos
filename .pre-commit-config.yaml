@@ -17,3 +17,15 @@ repos:
         language: system
         pass_filenames: false
         files: '(^docs/adr/|^FEATURE-MATRIX\.md$)'
+      - id: adr-0004-stdlib-ics
+        name: "ADR-0004 — iCalendar stays stdlib-only (no icalendar/vobject)"
+        entry: bash -c 'if grep -REn "(import|from)[[:space:]]+(icalendar|vobject)" src/kairos/ics.py src/kairos/imip_inbound.py; then echo "ADR-0004 violation — 3rd-party calendar lib import (stdlib only; guardrails-ok to override)"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        files: '^src/kairos/(ics|imip_inbound)\.py$'
+      - id: adr-0007-no-3p-shortener
+        name: "ADR-0007 — no third-party URL shortener"
+        entry: bash -c 'if grep -REn "tinyurl|bit\.ly|is\.gd|goo\.gl|ow\.ly" src/; then echo "ADR-0007 violation — third-party shortener; use the self-hosted /v/ endpoint"; exit 1; fi'
+        language: system
+        pass_filenames: false
+        files: '^src/'
