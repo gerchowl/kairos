@@ -420,15 +420,28 @@ def imip_decision_endpoint(poll_id: str, request: Request,
     prior = any(c.get("kind") == "decision" for c in get_contact_log(poll_id))
     seq = bump_slot_sequence(slot["id"]) if prior else get_slot_sequence(slot["id"])
     poll_url = _share_url(request, poll)
-    subject = f"Invitation: {poll['title']} — {format_slot(slot, poll['mode'])}"
+    label = format_slot(slot, poll["mode"])
+    subject = f"Invitation: {poll['title']} — {label}"
+    base = get_base_url(request)
+    invites = {i["email"]: i for i in get_invites(poll_id)}
     sent = []
     for email in recipient_emails(poll_id):
+        inv = invites.get(email)
+        # Per-invitee one-click RSVP links in the DESCRIPTION: Gmail renders these
+        # (clickable) in its event card even when it suppresses native RSVP for a
+        # Gmail-organized invite, so every client gets a working Accept/Maybe/Decline.
+        if inv and settings.FEED_ENABLED:
+            vb = f"{base}{P}/p/i/{inv['token']}/s/{slot['id']}"
+            desc = (f"{poll['title']} — {label}\n\nRSVP (one click):\n"
+                    f"Accept: {vb}/yes\nMaybe: {vb}/maybe\nDecline: {vb}/no\n\nPoll: {poll_url}")
+        else:
+            desc = f"{poll['title']} — {label}\nPoll: {poll_url}"
         ics = build_request_ics(poll, slot, email,
                                 organizer_email=settings.IMIP_ORGANIZER,
                                 organizer_name=settings.IMIP_ORGANIZER_NAME,
-                                sequence=seq, url=poll_url)
-        if send_imip(email, subject, f"{poll['title']} — {format_slot(slot, poll['mode'])}\n{poll_url}",
-                     ics, "REQUEST", settings.IMIP_ORGANIZER, settings.IMIP_ORGANIZER_NAME):
+                                sequence=seq, url=poll_url, description=desc)
+        if send_imip(email, subject, desc, ics, "REQUEST",
+                     settings.IMIP_ORGANIZER, settings.IMIP_ORGANIZER_NAME):
             log_contact(poll_id, email, "decision")
             sent.append(email)
     return {"sent": len(sent), "recipients": sent}

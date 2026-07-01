@@ -164,7 +164,7 @@ def _imip_ics(poll: dict, slot: dict, *, method: str, status: str,
               organizer_email: str, organizer_name: str | None,
               attendee_email: str, attendee_name: str | None,
               sequence: int, partstat: str, rsvp: bool,
-              url: str | None = None) -> str:
+              url: str | None = None, description: str | None = None) -> str:
     """One iMIP VEVENT (REQUEST or CANCEL) addressed to a single attendee.
 
     ORGANIZER is the mailbox Kairos polls for replies (so a client's
@@ -192,8 +192,9 @@ def _imip_ics(poll: dict, slot: dict, *, method: str, status: str,
          f"RSVP={'TRUE' if rsvp else 'FALSE'}{att_cn}:mailto:{attendee_email}"),
         f"STATUS:{status}",
     ]
-    if poll.get("description"):
-        lines.append(f"DESCRIPTION:{_esc(poll['description'])}")
+    desc = description if description is not None else poll.get("description")
+    if desc:
+        lines.append(f"DESCRIPTION:{_esc(desc)}")
     if url:
         lines.append(f"URL:{url}")
     lines += ["END:VEVENT", "END:VCALENDAR"]
@@ -203,12 +204,17 @@ def _imip_ics(poll: dict, slot: dict, *, method: str, status: str,
 def build_request_ics(poll: dict, slot: dict, attendee_email: str, *,
                       organizer_email: str, organizer_name: str | None = None,
                       sequence: int = 0, attendee_name: str | None = None,
-                      url: str | None = None) -> str:
-    """iMIP METHOD:REQUEST — surfaces native Accept/Maybe/Decline in the client."""
+                      url: str | None = None, description: str | None = None) -> str:
+    """iMIP METHOD:REQUEST — surfaces native Accept/Maybe/Decline in the client.
+
+    description overrides the poll's own; used to embed per-invitee deep-link
+    vote URLs, which Gmail renders (clickable) in its event card even when it
+    suppresses native RSVP for a Gmail-organized invite."""
     return _imip_ics(poll, slot, method="REQUEST", status="CONFIRMED",
                      organizer_email=organizer_email, organizer_name=organizer_name,
                      attendee_email=attendee_email, attendee_name=attendee_name,
-                     sequence=sequence, partstat="NEEDS-ACTION", rsvp=True, url=url)
+                     sequence=sequence, partstat="NEEDS-ACTION", rsvp=True,
+                     url=url, description=description)
 
 
 def build_cancel_ics(poll: dict, slot: dict, attendee_email: str, *,

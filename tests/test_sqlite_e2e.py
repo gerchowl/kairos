@@ -274,6 +274,7 @@ def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "IMIP_ENABLED", True)
     monkeypatch.setattr(settings, "IMIP_ORGANIZER", "replies@kairos.ch")
     monkeypatch.setattr(settings, "IMIP_ORGANIZER_NAME", "Kairos")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
     calls = []
     monkeypatch.setattr(api, "send_imip",
                         lambda to, subj, body, ics, method, oe, on: calls.append(
@@ -286,12 +287,14 @@ def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
             "slots": [{"date": "2026-07-06"}, {"date": "2026-07-07"}]}).json()
         pid, s1 = poll["id"], poll["slots"][0]["id"]
         from kairos.db import create_invite, get_slot_sequence
-        create_invite(pid, "bob@x.ch", required=True, name="Bob")
+        tok = create_invite(pid, "bob@x.ch", required=True, name="Bob")["token"]
         c.post(f"/scheduler/api/polls/{pid}/decide", headers=h, json={"slot_id": s1})
         r = c.post(f"/scheduler/api/polls/{pid}/imip-decision", headers=h)
         assert r.status_code == 200 and r.json()["sent"] == 1
         assert calls[0]["to"] == "bob@x.ch" and calls[0]["method"] == "REQUEST"
         assert "METHOD:REQUEST" in calls[0]["ics"] and calls[0]["org"] == "replies@kairos.ch"
+        # Per-invitee one-click RSVP deep link embedded in the DESCRIPTION.
+        assert f"/p/i/{tok}/s/{s1}/yes" in calls[0]["ics"].replace("\r\n ", "")
         # First send stays at SEQUENCE:0 (a re-send would bump it).
         assert "SEQUENCE:0" in calls[0]["ics"]
         assert get_slot_sequence(s1) == 0
