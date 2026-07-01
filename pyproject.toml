@@ -1,6 +1,6 @@
 [project]
 name = "kairos-scheduler"
-version = "0.7.0"
+version = "0.8.0"
 description = "when2meet-style scheduling polls — self-hostable, reverse-proxy-auth friendly, agent-first API"
 readme = "README.md"
 license = { text = "MIT" }
