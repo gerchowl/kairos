@@ -64,13 +64,20 @@ def build_imip_message(to_email: str, subject: str, body_text: str,
                        ics_content: str, method: str,
                        organizer_email: str, organizer_name: str) -> MIMEMultipart:
     """iMIP REQUEST/CANCEL message. From = ORGANIZER mailbox so the client's
-    METHOD:REPLY comes back to the mailbox Kairos polls (no Reply-To override)."""
-    msg = MIMEMultipart("mixed")
+    METHOD:REPLY comes back to the mailbox Kairos polls (no Reply-To override).
+
+    The calendar is the richer part of a multipart/alternative (text/calendar
+    with method=REQUEST, INLINE — not an attachment). Gmail/Apple only render
+    native Accept/Maybe/Decline for this shape; a mixed attachment gets imported
+    as a plain event with no RSVP (and Apple then replies without PARTSTAT)."""
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["To"] = to_email
     msg["From"] = formataddr((organizer_name, organizer_email))
-    msg.attach(MIMEText(body_text, "plain"))
-    msg.attach(_calendar_part(ics_content, method))
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
+    cal = MIMEText(ics_content, "calendar", "utf-8")
+    cal.set_param("method", method)  # Content-Type: text/calendar; charset=utf-8; method=REQUEST
+    msg.attach(cal)
     return msg
 
 

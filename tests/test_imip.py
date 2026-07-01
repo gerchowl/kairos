@@ -22,8 +22,12 @@ def test_request_message_routes_replies_to_organizer():
     # From is the ORGANIZER mailbox -> client REPLY lands in the polled inbox
     assert "replies@kairos.ch" in msg["From"]
     assert "Reply-To" not in msg
+    # Must be multipart/alternative with the calendar INLINE (not an attachment),
+    # or Gmail/Apple won't render native RSVP. See build_imip_message.
+    assert msg.get_content_subtype() == "alternative"
     cal = _calendar_part(msg)
     assert cal.get_param("method") == "REQUEST"
+    assert cal.get_content_disposition() != "attachment"
     assert "METHOD:REQUEST" in cal.get_payload(decode=True).decode()
 
 
