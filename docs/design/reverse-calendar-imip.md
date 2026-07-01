@@ -144,3 +144,46 @@ never iMIP more than a shortlist. `SEQUENCE`/`UID` lifecycle correctness.
 - After release, bump pin in duplet `apps/scheduler/pyproject.toml` + `uv lock` +
   `deploy.sh ent scheduler`. (Kairos uses `pymysql`; the duplet adapter keeps
   `mysql-connector-python` for vendored `duplet_common`.)
+
+---
+
+## Live cross-client verification (2026-07-01) — what actually shipped
+
+Tested end-to-end on the ETH `ent` deployment with a real Gmail organizer
+mailbox (SMTP+IMAP), inviting Google / Apple / Outlook accounts.
+
+| Client | Native iMIP RSVP | Notes |
+|---|---|---|
+| **Outlook / Exchange** | ✅ | textbook `PARTSTAT` reply; ingested first try |
+| **Apple / iCloud** | ✅ (after the MIME fix) | needed inline `multipart/alternative`; as an attachment it replied with **no** `ATTENDEE`/`PARTSTAT` |
+| **Google / Gmail** | ❌ native, ✅ via deep-links | Google won't render native RSVP for a **Gmail-organized** event (reconciles against the organizer's own Google Calendar). Covered by the deep-link fallback. |
+
+### Fixes this surfaced (all shipped)
+- **Inline `multipart/alternative`** for the REQUEST (not a `mixed` attachment) —
+  the thing that made Apple/Outlook render native RSVP.
+- `CUTYPE=INDIVIDUAL` + first send at `SEQUENCE:0` (a first-seen event at >0
+  suppresses Gmail's RSVP card; only re-sends bump).
+- **Deep-link Accept/Maybe/Decline in the DESCRIPTION** — Gmail renders the
+  description, so its card carries clickable one-click RSVP even without native
+  buttons. Present on both the finalist invite and the candidate feed.
+- **Self-hosted short links** (`/v/<code>`, dedup) so plain-text calendar
+  DESCRIPTIONs stay clean and capability tokens never touch a 3rd-party shortener.
+- **Honest HTML invite email**: two ways to respond (open poll / subscribe the
+  candidate feed), a `webcal` Subscribe button, and a plain-language refresh-lag
+  caveat. Plus the thesis footer ("no calendar access").
+
+### Agent-native invitee surface
+The invite link is self-describing with **no API key** (the token is the identity):
+`GET /p/i/<token>/agent.json` → poll, options, your current vote, one-click vote
+URLs; `feed.ics` for the calendar view; `/s/<slot>/<yes|maybe|no>` to vote.
+Documented in `/llms.txt`; pitched in the invite email. Hand your assistant the
+link and it RSVPs for you.
+
+### Deployment gotchas captured
+- `deploy_env` writes the raw sops decrypt; a `$` in a secret value broke
+  `set -u` sourcing → wrap values with `shlex.quote` (a `$`-containing "app
+  password" was actually the tell that it wasn't a real Google App Password).
+- Gmail SMTP/IMAP needs a real **App Password** (16 lowercase, 2-Step on;
+  passkeys don't unlock App Passwords).
+- Deploy runs from vm-dev over Tailscale → `ethz-heimdall` jump → `dupletent`;
+  vm-dev got its own sops age recipient (ent-scoped) + an authorized ETH key.

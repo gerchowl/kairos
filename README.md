@@ -53,9 +53,18 @@ the respondent's calendar** and let them Accept/Maybe/Decline — capturing what
   (cron / systemd timer, Bearer auth) to ingest replies; `POST
   /api/polls/{id}/imip-decision` sends the decided slot as a native invite.
 
-See `docs/design/reverse-calendar-imip.md` and issue #23 for the full design.
+**Cross-client reality (verified live):** Outlook and Apple render **native**
+Accept/Maybe/Decline; **Gmail does not** for a Gmail-organized event (Google
+policy) — the deep-link Accept/Maybe/Decline in the event description covers it,
+so every client gets one-click RSVP. For native Gmail RSVP, use a non-Gmail
+(custom-domain) organizer.
 
-## Deployment model
+**Agent-native (no API key):** the invite link self-describes —
+`GET /p/i/<token>/agent.json` returns the options, your current vote, and the
+one-click vote URLs (also `feed.ics`, and `/s/<slot>/<yes|maybe|no>` to vote).
+Hand your assistant the link and it RSVPs for you. See `/llms.txt`.
+
+See `docs/design/reverse-calendar-imip.md` and issue #23 for the full design.
 
 ## Deployment model
 
