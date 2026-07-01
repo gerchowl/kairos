@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.9.0](https://github.com/gerchowl/kairos/compare/v0.8.0...v0.9.0) (2026-07-01)
+
+
+### Features
+
+* **agent:** agent-native invitee surface + email pitch ([403331a](https://github.com/gerchowl/kairos/commit/403331a5f10e1c14ee7863c6b2f1fbffd8e71256))
+* **imip:** cheeky 'no calendar access' footer in the invite email ([5c6c0ea](https://github.com/gerchowl/kairos/commit/5c6c0ea2187ce7e186f7bb851875f71f5613802f))
+* **imip:** embed per-invitee one-click RSVP deep links in the DESCRIPTION ([68bb5e0](https://github.com/gerchowl/kairos/commit/68bb5e0988c993cda2099dcb2bffe7c605d91cd3))
+* **imip:** self-hosted short links for vote URLs in the DESCRIPTION ([335fd9c](https://github.com/gerchowl/kairos/commit/335fd9c3251e13e31da0ab84a5583235fcdc40f4))
+* **imip:** short links in the feed + honest HTML how-to invite email ([6c78e88](https://github.com/gerchowl/kairos/commit/6c78e88302aea7929df01c096ca3d0684efb0bc9))
+
+
+### Bug Fixes
+
+* **imip:** CUTYPE=INDIVIDUAL + first REQUEST at SEQUENCE:0 (Gmail RSVP) ([2721051](https://github.com/gerchowl/kairos/commit/2721051c08bc060c8aefd597a1b745c6d0f897f3))
+* **imip:** send REQUEST as inline multipart/alternative, not attachment ([2e56698](https://github.com/gerchowl/kairos/commit/2e56698e8584e130fd394501060ee4be9de43f45))
+
+
+### Documentation
+
+* cross-client verification results + agent-native invitee flow ([d0fde93](https://github.com/gerchowl/kairos/commit/d0fde9393cf17e060c9535ac34a0921437ef2359))
+
 ## [0.8.0](https://github.com/gerchowl/kairos/compare/v0.7.0...v0.8.0) (2026-06-30)
 
 
