@@ -97,13 +97,22 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 
 ## Domain (product identity)
 
-Availability pass (RDAP, 2026-07-01) — bare `kairos.{app,dev,com,tools,day}` are
-all **taken** (common Greek word). Available & brandable:
+**Namecheap-verified, 2026-07-01** (RDAP alone was unreliable for `.io`/`.sh` —
+several "available" RDAP hits were actually taken; a real registrar check is
+required before buying).
 
-- `kairos.sh` — short, dev/self-host flavor (recommended for the OSS/self-host angle)
-- `kairosscheduler.com`, `kairospoll.com` — descriptive, SEO-friendly
-- `trykairos.io`, `kairosapp.io`, `kairoshq.io`, `whenkairos.com` — product/landing
-- `kairos.rsvp` — on-theme (Google TLD) if the niche read is wanted
+**Available (verified):**
+| Domain | Price | Note |
+|---|---|---|
+| `kairosscheduler.com` | $14.98/yr ($6.79 first-yr promo) | descriptive, SEO-friendly — recommended |
+| `kairospoll.com` | $14.98/yr ($6.79 first-yr) | short, on-purpose |
+| `whenkairos.com` | $14.98/yr ($6.79 first-yr) | when2meet-flavored |
+
+**Taken (verified — corrects earlier RDAP false-positives):** `kairos.sh`,
+`kairos.io`, `kairos.app`, `kairos.dev`, `kairos.com`, `trykairos.io`,
+`trykairos.com` (premium $995), `kairosapp.io`, `kairoshq.com/.io`. Bare
+`kairos.*` is effectively gone (common Greek word); premium asks are steep
+(`kairos.xyz` $399k, `kairos.tech` $12k, `kairos.so` $3.9k).
 
 Mail (M1) needs DKIM/DMARC on whichever is chosen; a non-Gmail organizer here is
 also what unblocks native Gmail RSVP (ADR-0006 / M5).
