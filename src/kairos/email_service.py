@@ -132,7 +132,9 @@ Two ways to respond:
 
 Open the poll and pick times: {invite_url}{subscribe_txt}
 
-No account needed."""
+No account. No calendar access. Every other scheduler wants to read your whole
+calendar to guess when you're free — {settings.BRAND} just asks you. (You're the
+only one who knows what's actually movable.)"""
 
     html = env.get_template("email/invite.html").render(
         sender_name=sender_name, poll_title=poll_title, invite_url=invite_url,
