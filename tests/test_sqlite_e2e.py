@@ -292,7 +292,14 @@ def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
         assert r.status_code == 200 and r.json()["sent"] == 1
         assert calls[0]["to"] == "bob@x.ch" and calls[0]["method"] == "REQUEST"
         assert "METHOD:REQUEST" in calls[0]["ics"] and calls[0]["org"] == "replies@kairos.ch"
-        assert get_slot_sequence(s1) == 1  # bumped 0 -> 1
+        # First send stays at SEQUENCE:0 (a re-send would bump it).
+        assert "SEQUENCE:0" in calls[0]["ics"]
+        assert get_slot_sequence(s1) == 0
+
+        # A second decision (re-send) bumps to an update at SEQUENCE:1.
+        calls.clear()
+        c.post(f"/scheduler/api/polls/{pid}/imip-decision", headers=h)
+        assert "SEQUENCE:1" in calls[0]["ics"] and get_slot_sequence(s1) == 1
 
 
 def test_imip_decision_requires_config(tmp_path, monkeypatch):

@@ -188,7 +188,7 @@ def _imip_ics(poll: dict, slot: dict, *, method: str, status: str,
         dtend,
         f"SUMMARY:{_esc(poll['title'])}",
         f"ORGANIZER{org_cn}:mailto:{organizer_email}",
-        (f"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT={partstat};"
+        (f"ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT={partstat};"
          f"RSVP={'TRUE' if rsvp else 'FALSE'}{att_cn}:mailto:{attendee_email}"),
         f"STATUS:{status}",
     ]

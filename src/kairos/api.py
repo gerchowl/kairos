@@ -29,6 +29,7 @@ from kairos.db import (
     get_invites,
     get_poll,
     get_responses,
+    get_slot_sequence,
     list_polls,
     log_contact,
     update_poll,
@@ -413,7 +414,11 @@ def imip_decision_endpoint(poll_id: str, request: Request,
     slot = decided_slot_of(poll)
     if not slot:
         raise HTTPException(400, "Poll has no decided date yet")
-    seq = bump_slot_sequence(slot["id"])
+    # First send for this poll's finalist stays at SEQUENCE:0 — a first-seen
+    # event at SEQUENCE>0 confuses some clients (notably Gmail's RSVP rendering).
+    # Only a re-send (a prior decision already went out) bumps it to an update.
+    prior = any(c.get("kind") == "decision" for c in get_contact_log(poll_id))
+    seq = bump_slot_sequence(slot["id"]) if prior else get_slot_sequence(slot["id"])
     poll_url = _share_url(request, poll)
     subject = f"Invitation: {poll['title']} — {format_slot(slot, poll['mode'])}"
     sent = []
