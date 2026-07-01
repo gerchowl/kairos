@@ -11,3 +11,9 @@ repos:
         entry: sh -c 'uv run --frozen pytest tests -q'
         language: system
         pass_filenames: false
+      - id: adr-matrix
+        name: adr-matrix — every Accepted ADR is cited in FEATURE-MATRIX.md
+        entry: guardrails-adr-matrix
+        language: system
+        pass_filenames: false
+        files: '(^docs/adr/|^FEATURE-MATRIX\.md$)'
