@@ -36,7 +36,7 @@ from kairos.db import (
     update_poll,
     update_response,
 )
-from kairos.email_service import send_decision_email, send_imip, send_invite_email
+from kairos.email_service import send_decision_email, send_imip, send_invite_email, webcal_from
 from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
@@ -338,8 +338,9 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
         invite = create_invite(poll_id, email, required=body.required,
                                 name=names.get(email))
         invite_url = f"{base}{P}/p/i/{invite['token']}"
+        sub = webcal_from(invite_url) if settings.FEED_ENABLED else None
         sent = send_invite_email(email, poll["title"], invite_url,
-                                 actor["name"], reply_to=actor["email"])
+                                 actor["name"], reply_to=actor["email"], subscribe_url=sub)
         if sent:
             log_contact(poll_id, email, "invite", invite["id"])
         results.append({"email": email, "invite_url": invite_url,

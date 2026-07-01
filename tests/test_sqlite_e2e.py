@@ -241,13 +241,16 @@ def test_reverse_calendar_feed_and_deeplink_vote(tmp_path, monkeypatch):
         assert feed.headers["content-type"].startswith("text/calendar")
         assert feed.text.count("BEGIN:VEVENT") == 2 and "STATUS:TENTATIVE" in feed.text
 
-        # an invite -> per-invite feed carries deep-link vote URLs
-        from kairos.db import create_invite, get_responses
+        # an invite -> per-invite feed carries (short) deep-link vote URLs
+        import re
+
+        from kairos.db import create_invite, get_responses, resolve_short_link
         itok = create_invite(pid, "bob@x.ch", required=True, name="Bob")["token"]
         ifeed = c.get(f"/scheduler/p/i/{itok}/feed.ics")
         assert ifeed.status_code == 200
         unfolded = ifeed.text.replace("\r\n ", "")  # RFC 5545 unfold
-        assert f"/scheduler/p/i/{itok}/s/{s1}/yes" in unfolded
+        codes = re.findall(r"/scheduler/v/([\w-]+)", unfolded)
+        assert codes and any(resolve_short_link(x) == f"/scheduler/p/i/{itok}/s/{s1}/yes" for x in codes)
 
         # tap a deep link -> records the vote, lands on the poll page
         r = c.get(f"/scheduler/p/i/{itok}/s/{s1}/yes")

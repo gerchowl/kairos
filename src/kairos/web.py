@@ -29,7 +29,7 @@ from kairos.db import (
     update_response_contact,
 )
 from kairos.dbconn import db_now
-from kairos.email_service import send_decision_email, send_invite_email, send_update_emails
+from kairos.email_service import send_decision_email, send_invite_email, send_update_emails, webcal_from
 from kairos.helpers import (
     TIMEZONES,
     convergence,
@@ -474,7 +474,9 @@ def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 â
         return sum(1 for t in slot_times if t > resp["updated_at"])
 
     def send_reminder(email, url, invite_id=None):
-        if send_invite_email(email, poll["title"], url, sender, reply_to=reply, reminder=True):
+        sub = webcal_from(url) if settings.FEED_ENABLED else None
+        if send_invite_email(email, poll["title"], url, sender, reply_to=reply,
+                             reminder=True, subscribe_url=sub):
             log_contact(poll["id"], email, "reminder", invite_id)
             counts["invited"] += 1
             return True

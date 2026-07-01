@@ -110,7 +110,7 @@ _STATUS_COLOR = {"ready": "green", "partial": "orange"}
 def build_feed_ics(poll: dict, slots: list[dict], responses: list[dict], *,
                    base_url: str = "", prefix: str = "",
                    invite_token: str | None = None,
-                   total_expected: int = 0) -> str:
+                   total_expected: int = 0, shorten=None) -> str:
     """Read-only candidate-slot feed (flavor B): one TENTATIVE VEVENT per slot,
     each carrying the live tally, convergence color, and — for an invite feed —
     deep-link Accept/Maybe/Decline URLs the calendar surfaces in the event body.
@@ -137,8 +137,9 @@ def build_feed_ics(poll: dict, slots: list[dict], responses: list[dict], *,
         status = _slot_status(yes, maybe, total_expected)
         desc = [f"{yes} yes · {maybe} maybe · {no} no"]
         if invite_token:
-            vote = f"{base_url}{prefix}/p/i/{invite_token}/s/{slot['id']}"
-            desc += [f"Accept: {vote}/yes", f"Maybe: {vote}/maybe", f"Decline: {vote}/no"]
+            for lbl, av in (("Accept", "yes"), ("Maybe", "maybe"), ("Decline", "no")):
+                path = f"{prefix}/p/i/{invite_token}/s/{slot['id']}/{av}"
+                desc.append(f"{lbl}: {shorten(path) if shorten else base_url + path}")
         desc.append(poll_url)
         lines += [
             "BEGIN:VEVENT",

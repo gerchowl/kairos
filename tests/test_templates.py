@@ -185,7 +185,18 @@ def test_email_invite():
         sender_name="Mallory <script>", poll_title="Poll & co",
         invite_url="https://x/scheduler/p/i/tok")
     assert "&lt;script&gt;" in html  # autoescape on
-    assert "Respond Now" in html
+    assert "Open the poll" in html
+    assert "Subscribe in my calendar" not in html  # no subscribe section without a URL
+
+
+def test_email_invite_subscribe_section():
+    html = env.get_template("email/invite.html").render(
+        sender_name="Al", poll_title="P",
+        invite_url="https://x/scheduler/p/i/tok",
+        subscribe_url="webcal://x/scheduler/p/i/tok/feed.ics")
+    assert "Subscribe in my calendar" in html
+    assert "webcal://x/scheduler/p/i/tok/feed.ics" in html
+    assert "catches up later" in html  # honest refresh-delay caveat
 
 
 def test_timeslot_payload_shape():

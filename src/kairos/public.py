@@ -12,6 +12,7 @@ from kairos.db import (
     get_poll_by_token,
     get_response,
     get_responses,
+    make_short_link,
     mark_invite_responded,
     update_response,
 )
@@ -179,9 +180,13 @@ def _feed_response(poll: dict, request: Request, invite_token: str | None = None
     """Read-only candidate-slot feed (.ics) for a still-open poll."""
     responses = get_responses(poll["id"])
     total, _ = expected_counts(get_invites(poll["id"]), responses)
+    base = get_base_url(request)
+    # Short, self-hosted vote links keep the plain-text DESCRIPTION clean.
+    def shorten(path):
+        return f"{base}{P}/v/{make_short_link(path)}"
     body = build_feed_ics(poll, poll["slots"], responses,
-                          base_url=get_base_url(request), prefix=P,
-                          invite_token=invite_token, total_expected=total)
+                          base_url=base, prefix=P, invite_token=invite_token,
+                          total_expected=total, shorten=shorten)
     return Response(content=body, media_type="text/calendar",
                     headers={"Content-Disposition": 'inline; filename="kairos-candidates.ics"'})
 
