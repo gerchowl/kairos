@@ -13,7 +13,7 @@
         # adr-matrix gate is wired in .pre-commit-config.yaml.
         default = pkgs.mkShell {
           packages = [ guardrails.lib.${system}.gates ]
-            ++ (with pkgs; [ uv ruff prek nodejs_24 python312 ]);
+            ++ (with pkgs; [ uv ruff prek gitleaks nodejs_24 python312 ]);
           shellHook = ''
             prek install --overwrite >/dev/null 2>&1 || true
           '';

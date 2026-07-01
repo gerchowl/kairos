@@ -107,3 +107,5 @@ jobs:
             for g in adr-matrix adr-0004-stdlib-ics adr-0007-no-3p-shortener; do
               echo "== $g =="; prek run "$g" --all-files
             done'
+      - name: Secret scan (S4 — full history)
+        run: nix develop -c gitleaks detect --redact --config .gitleaks.toml

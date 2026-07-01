@@ -29,3 +29,8 @@ repos:
         language: system
         pass_filenames: false
         files: '^src/'
+      - id: gitleaks
+        name: "S4 — no committed secrets (gitleaks)"
+        entry: gitleaks protect --staged --redact --config .gitleaks.toml
+        language: system
+        pass_filenames: false
