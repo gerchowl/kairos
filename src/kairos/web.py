@@ -23,12 +23,13 @@ from kairos.db import (
     mark_invite_notified,
     mark_notification_read,
     mark_response_notified,
+    resolve_short_link,
     update_invite,
     update_poll,
     update_response_contact,
 )
 from kairos.dbconn import db_now
-from kairos.email_service import send_decision_email, send_invite_email, send_update_emails
+from kairos.email_service import send_decision_email, send_invite_email, send_update_emails, webcal_from
 from kairos.helpers import (
     TIMEZONES,
     convergence,
@@ -162,6 +163,16 @@ def _error_page(user: dict, heading: str, detail: str, back: str, status_code: i
 
 
 # -- Routes --
+
+@router.get("/v/{code}")
+def short_link(code: str):
+    """Self-hosted tiny-url: resolve a short code to its target and redirect.
+    Keeps capability vote URLs short in plain-text calendar DESCRIPTIONs."""
+    target = resolve_short_link(code)
+    if not target:
+        raise HTTPException(404)
+    return RedirectResponse(target, status_code=307)
+
 
 @router.get("/")
 def dashboard(request: Request):
@@ -463,7 +474,9 @@ def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 â
         return sum(1 for t in slot_times if t > resp["updated_at"])
 
     def send_reminder(email, url, invite_id=None):
-        if send_invite_email(email, poll["title"], url, sender, reply_to=reply, reminder=True):
+        sub = webcal_from(url) if settings.FEED_ENABLED else None
+        if send_invite_email(email, poll["title"], url, sender, reply_to=reply,
+                             reminder=True, subscribe_url=sub):
             log_contact(poll["id"], email, "reminder", invite_id)
             counts["invited"] += 1
             return True

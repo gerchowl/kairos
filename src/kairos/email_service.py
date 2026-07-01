@@ -64,13 +64,20 @@ def build_imip_message(to_email: str, subject: str, body_text: str,
                        ics_content: str, method: str,
                        organizer_email: str, organizer_name: str) -> MIMEMultipart:
     """iMIP REQUEST/CANCEL message. From = ORGANIZER mailbox so the client's
-    METHOD:REPLY comes back to the mailbox Kairos polls (no Reply-To override)."""
-    msg = MIMEMultipart("mixed")
+    METHOD:REPLY comes back to the mailbox Kairos polls (no Reply-To override).
+
+    The calendar is the richer part of a multipart/alternative (text/calendar
+    with method=REQUEST, INLINE — not an attachment). Gmail/Apple only render
+    native Accept/Maybe/Decline for this shape; a mixed attachment gets imported
+    as a plain event with no RSVP (and Apple then replies without PARTSTAT)."""
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["To"] = to_email
     msg["From"] = formataddr((organizer_name, organizer_email))
-    msg.attach(MIMEText(body_text, "plain"))
-    msg.attach(_calendar_part(ics_content, method))
+    msg.attach(MIMEText(body_text, "plain", "utf-8"))
+    cal = MIMEText(ics_content, "calendar", "utf-8")
+    cal.set_param("method", method)  # Content-Type: text/calendar; charset=utf-8; method=REQUEST
+    msg.attach(cal)
     return msg
 
 
@@ -89,10 +96,17 @@ def send_imip(to_email: str, subject: str, body_text: str, ics_content: str,
         return False
 
 
+def webcal_from(invite_url: str) -> str:
+    """webcal:// subscription URL for an invite's candidate feed (the 'shared cal')."""
+    base = invite_url.replace("https://", "webcal://").replace("http://", "webcal://")
+    return f"{base}/feed.ics"
+
+
 def build_invite_message(to_email: str, poll_title: str, invite_url: str,
                          sender_name: str, reply_to: str | None = None,
                          reminder: bool = False,
-                         recipient_name: str | None = None) -> MIMEMultipart:
+                         recipient_name: str | None = None,
+                         subscribe_url: str | None = None) -> MIMEMultipart:
     msg = MIMEMultipart("alternative")
     msg["Subject"] = (f"Reminder — please respond: {poll_title}" if reminder
                       else f"You're invited: {poll_title}")
@@ -102,15 +116,33 @@ def build_invite_message(to_email: str, poll_title: str, invite_url: str,
     lead = ("a friendly reminder: please respond to the scheduling poll"
             if reminder else "invited you to respond to a scheduling poll")
     hi = f"Hi {recipient_name},\n\n" if recipient_name else ""
+    subscribe_txt = ""
+    if subscribe_url:
+        subscribe_txt = f"""
+
+Or add it to your own calendar and vote from there:
+  {subscribe_url}
+Every candidate time appears in your calendar with one-click Accept / Maybe / Decline.
+Note: a subscribed calendar refreshes on your app's own schedule — minutes to a day
+(Google can be ~daily). Your vote saves instantly on the website; the calendar copy
+catches up later.
+
+🤖 Have an assistant? This invite link is agent-native & self-describing
+({invite_url}/agent.json) — hand it the link and your AI reads the options and RSVPs
+for you. (Keep the link private — it votes as you.)"""
     text = f"""{hi}{sender_name} — {lead}: {poll_title}
 
-Click here to respond: {invite_url}
+Two ways to respond:
 
-No account needed — just click the link and pick your available times."""
+Open the poll and pick times: {invite_url}{subscribe_txt}
+
+No account. No calendar access. Every other scheduler wants to read your whole
+calendar to guess when you're free — {settings.BRAND} just asks you. (You're the
+only one who knows what's actually movable.)"""
 
     html = env.get_template("email/invite.html").render(
         sender_name=sender_name, poll_title=poll_title, invite_url=invite_url,
-        reminder=reminder, recipient_name=recipient_name)
+        reminder=reminder, recipient_name=recipient_name, subscribe_url=subscribe_url)
 
     msg.attach(MIMEText(text, "plain"))
     msg.attach(MIMEText(html, "html"))
@@ -146,12 +178,14 @@ The attached calendar file ({ICS_FILENAME}) adds the event to your calendar."""
 
 def send_invite_email(to_email: str, poll_title: str, invite_url: str,
                       sender_name: str, reply_to: str | None = None,
-                      reminder: bool = False, recipient_name: str | None = None) -> bool:
+                      reminder: bool = False, recipient_name: str | None = None,
+                      subscribe_url: str | None = None) -> bool:
     """Send an invite (or reminder) email. False if not configured / send fails."""
     if not is_configured():
         return False
     msg = build_invite_message(to_email, poll_title, invite_url, sender_name,
-                               reply_to, reminder=reminder, recipient_name=recipient_name)
+                               reply_to, reminder=reminder, recipient_name=recipient_name,
+                               subscribe_url=subscribe_url)
     try:
         with _smtp_session() as server:
             server.send_message(msg)

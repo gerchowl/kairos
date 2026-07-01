@@ -81,6 +81,18 @@ def create_app() -> FastAPI:
 6. `POST {P}/api/polls/{{id}}/decide` — fix the final slot
 7. `POST {P}/api/polls/{{id}}/email-decision` — mail everyone, .ics attached
 8. `GET  {P}/api/polls/{{id}}/event.ics` — calendar file
+
+## Invitee flow — no API key (the invite link IS the identity)
+
+Given an invite link `{P}/p/i/<token>` (personal — treat it as a secret; whoever
+holds it can vote as that person), an agent can RSVP with NO key:
+
+- `GET {P}/p/i/<token>/agent.json` — poll, options, your current vote, one-click vote URLs
+- `GET {P}/p/i/<token>/feed.ics`   — same options as a subscribe-able calendar
+- `GET {P}/p/i/<token>/s/<slot>/<yes|maybe|no>` — cast/replace your vote (idempotent)
+
+Hand your assistant the invite link; it self-describes via `agent.json`. Kairos
+never reads your calendar — you (or your agent) tell it what works.
 """
 
     @app.get(f"{P}/llms.txt", include_in_schema=False)

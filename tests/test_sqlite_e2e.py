@@ -241,13 +241,16 @@ def test_reverse_calendar_feed_and_deeplink_vote(tmp_path, monkeypatch):
         assert feed.headers["content-type"].startswith("text/calendar")
         assert feed.text.count("BEGIN:VEVENT") == 2 and "STATUS:TENTATIVE" in feed.text
 
-        # an invite -> per-invite feed carries deep-link vote URLs
-        from kairos.db import create_invite, get_responses
+        # an invite -> per-invite feed carries (short) deep-link vote URLs
+        import re
+
+        from kairos.db import create_invite, get_responses, resolve_short_link
         itok = create_invite(pid, "bob@x.ch", required=True, name="Bob")["token"]
         ifeed = c.get(f"/scheduler/p/i/{itok}/feed.ics")
         assert ifeed.status_code == 200
         unfolded = ifeed.text.replace("\r\n ", "")  # RFC 5545 unfold
-        assert f"/scheduler/p/i/{itok}/s/{s1}/yes" in unfolded
+        codes = re.findall(r"/scheduler/v/([\w-]+)", unfolded)
+        assert codes and any(resolve_short_link(x) == f"/scheduler/p/i/{itok}/s/{s1}/yes" for x in codes)
 
         # tap a deep link -> records the vote, lands on the poll page
         r = c.get(f"/scheduler/p/i/{itok}/s/{s1}/yes")
@@ -274,6 +277,7 @@ def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "IMIP_ENABLED", True)
     monkeypatch.setattr(settings, "IMIP_ORGANIZER", "replies@kairos.ch")
     monkeypatch.setattr(settings, "IMIP_ORGANIZER_NAME", "Kairos")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
     calls = []
     monkeypatch.setattr(api, "send_imip",
                         lambda to, subj, body, ics, method, oe, on: calls.append(
@@ -286,13 +290,29 @@ def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
             "slots": [{"date": "2026-07-06"}, {"date": "2026-07-07"}]}).json()
         pid, s1 = poll["id"], poll["slots"][0]["id"]
         from kairos.db import create_invite, get_slot_sequence
-        create_invite(pid, "bob@x.ch", required=True, name="Bob")
+        tok = create_invite(pid, "bob@x.ch", required=True, name="Bob")["token"]
         c.post(f"/scheduler/api/polls/{pid}/decide", headers=h, json={"slot_id": s1})
         r = c.post(f"/scheduler/api/polls/{pid}/imip-decision", headers=h)
         assert r.status_code == 200 and r.json()["sent"] == 1
         assert calls[0]["to"] == "bob@x.ch" and calls[0]["method"] == "REQUEST"
         assert "METHOD:REQUEST" in calls[0]["ics"] and calls[0]["org"] == "replies@kairos.ch"
-        assert get_slot_sequence(s1) == 1  # bumped 0 -> 1
+        # DESCRIPTION carries our own short links (/v/<code>) that resolve to the
+        # per-invitee vote path (capability kept private — no external shortener).
+        import re
+
+        from kairos.db import resolve_short_link
+        ics0 = calls[0]["ics"].replace("\r\n ", "")
+        m = re.search(r"/scheduler/v/([\w-]+)", ics0)  # first /v/ = Accept
+        assert m, ics0
+        assert resolve_short_link(m.group(1)) == f"/scheduler/p/i/{tok}/s/{s1}/yes"
+        # First send stays at SEQUENCE:0 (a re-send would bump it).
+        assert "SEQUENCE:0" in calls[0]["ics"]
+        assert get_slot_sequence(s1) == 0
+
+        # A second decision (re-send) bumps to an update at SEQUENCE:1.
+        calls.clear()
+        c.post(f"/scheduler/api/polls/{pid}/imip-decision", headers=h)
+        assert "SEQUENCE:1" in calls[0]["ics"] and get_slot_sequence(s1) == 1
 
 
 def test_imip_decision_requires_config(tmp_path, monkeypatch):
@@ -307,6 +327,23 @@ def test_imip_decision_requires_config(tmp_path, monkeypatch):
             "title": "x", "mode": "full_day", "creator": "alice",
             "slots": [{"date": "2026-07-06"}]}).json()
         assert c.post(f"/scheduler/api/polls/{poll['id']}/imip-decision", headers=h).status_code == 400
+
+
+def test_short_links_redirect_and_dedup(tmp_path, monkeypatch):
+    """Self-hosted tiny-url: /v/<code> redirects to its target; same target reuses code."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    from kairos.main import create_app
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        from kairos.db import make_short_link, resolve_short_link
+        target = "/scheduler/p/i/tok123/s/slot456/yes"
+        code = make_short_link(target)
+        assert 0 < len(code) <= 16
+        assert make_short_link(target) == code          # dedup: same target -> same code
+        assert resolve_short_link(code) == target
+        r = c.get(f"/scheduler/v/{code}", follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == target
+        assert c.get("/scheduler/v/nope", follow_redirects=False).status_code == 404
 
 
 def test_slot_sequence_migration_and_bump(tmp_path, monkeypatch):
@@ -326,6 +363,34 @@ def test_slot_sequence_migration_and_bump(tmp_path, monkeypatch):
         assert bump_slot_sequence(sid) == 1
         assert bump_slot_sequence(sid) == 2
         assert get_slot_sequence(sid) == 2
+
+
+def test_invite_agent_json(tmp_path, monkeypatch):
+    """Agent-native invitee surface: the invite link self-describes (no API key)."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
+    from kairos.main import create_app
+    h = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=h, json={
+            "title": "Agent poll", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        from kairos.db import create_invite
+        itok = create_invite(poll["id"], "bob@x.ch", required=True, name="Bob")["token"]
+        d = c.get(f"/scheduler/p/i/{itok}/agent.json").json()
+        assert d["you"]["email"] == "bob@x.ch" and d["poll"]["title"] == "Agent poll"
+        assert d["docs"].endswith("/scheduler/llms.txt")
+        s = d["slots"][0]
+        assert s["your_vote"] is None
+        assert s["vote"]["maybe"].endswith(f"/p/i/{itok}/s/{s['id']}/maybe")
+        # an agent votes by GETting the URL -> reflected on re-read
+        c.get(f"/scheduler/p/i/{itok}/s/{s['id']}/maybe")
+        d2 = c.get(f"/scheduler/p/i/{itok}/agent.json").json()
+        assert d2["slots"][0]["your_vote"] == "maybe"
+        monkeypatch.setattr(settings, "FEED_ENABLED", False)
+        assert c.get(f"/scheduler/p/i/{itok}/agent.json").status_code == 404
 
 
 def test_feed_disabled_by_default(tmp_path, monkeypatch):

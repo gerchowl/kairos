@@ -122,7 +122,7 @@ def test_request_is_imip_invitation():
                                     sequence=0, attendee_name="Bob"))
     assert "METHOD:REQUEST" in ics
     assert "ORGANIZER;CN=Kairos:mailto:replies@kairos.ch" in ics
-    assert "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Bob:mailto:bob@x.ch" in ics
+    assert "ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;CN=Bob:mailto:bob@x.ch" in ics
     assert "SEQUENCE:0" in ics
     assert "STATUS:CONFIRMED" in ics
     assert f"UID:{slot_uid('p9', 's1')}" in ics

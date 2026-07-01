@@ -12,6 +12,7 @@ from kairos.db import (
     get_poll_by_token,
     get_response,
     get_responses,
+    make_short_link,
     mark_invite_responded,
     update_response,
 )
@@ -179,9 +180,13 @@ def _feed_response(poll: dict, request: Request, invite_token: str | None = None
     """Read-only candidate-slot feed (.ics) for a still-open poll."""
     responses = get_responses(poll["id"])
     total, _ = expected_counts(get_invites(poll["id"]), responses)
+    base = get_base_url(request)
+    # Short, self-hosted vote links keep the plain-text DESCRIPTION clean.
+    def shorten(path):
+        return f"{base}{P}/v/{make_short_link(path)}"
     body = build_feed_ics(poll, poll["slots"], responses,
-                          base_url=get_base_url(request), prefix=P,
-                          invite_token=invite_token, total_expected=total)
+                          base_url=base, prefix=P, invite_token=invite_token,
+                          total_expected=total, shorten=shorten)
     return Response(content=body, media_type="text/calendar",
                     headers={"Content-Disposition": 'inline; filename="kairos-candidates.ics"'})
 
@@ -276,6 +281,45 @@ def invite_feed_ics(invite_token: str, request: Request):
     if not poll:
         raise HTTPException(404)
     return _feed_response(poll, request, invite_token=invite_token)
+
+
+@router.get("/i/{invite_token}/agent.json")
+def invite_agent_json(invite_token: str, request: Request):
+    """Agent-native invitee surface: the invite link IS the identity (no API key).
+    Returns the options, your current vote, and the one-click vote URLs — so you
+    can hand your assistant the invite link and it can RSVP for you."""
+    if not settings.FEED_ENABLED:
+        raise HTTPException(404)
+    invite = get_invite_by_token(invite_token)
+    if not invite:
+        raise HTTPException(404)
+    poll = get_poll(invite["poll_id"])
+    if not poll:
+        raise HTTPException(404)
+    base = get_base_url(request)
+    responses = get_responses(poll["id"])
+    mine = next((r for r in responses
+                 if (r.get("respondent_email") or "").lower() == (invite["email"] or "").lower()), None)
+    mine_av = (mine or {}).get("slot_availabilities", {})
+    slots = []
+    for s in poll["slots"]:
+        avs = [r["slot_availabilities"].get(s["id"]) for r in responses]
+        vb = f"{base}{P}/p/i/{invite_token}/s/{s['id']}"
+        slots.append({
+            "id": s["id"], "label": format_slot(s, poll["mode"]),
+            "tally": {"yes": avs.count("yes"), "maybe": avs.count("maybe"), "no": avs.count("no")},
+            "your_vote": mine_av.get(s["id"]),
+            "vote": {"yes": f"{vb}/yes", "maybe": f"{vb}/maybe", "no": f"{vb}/no"},
+        })
+    return {
+        "poll": {"title": poll["title"], "status": poll["status"], "timezone": poll.get("timezone")},
+        "you": {"name": invite.get("name"), "email": invite["email"]},
+        "slots": slots,
+        "subscribe": f"webcal://{request.url.hostname}{P}/p/i/{invite_token}/feed.ics",
+        "docs": f"{base}{P}/llms.txt",
+        "how_to_vote": "GET any slot's vote URL (yes|maybe|no) to cast/replace your answer. "
+                       "No auth needed — this invite link is your identity; keep it private.",
+    }
 
 
 @router.get("/i/{invite_token}/s/{slot_id}/{availability}")

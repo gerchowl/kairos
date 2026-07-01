@@ -29,12 +29,14 @@ from kairos.db import (
     get_invites,
     get_poll,
     get_responses,
+    get_slot_sequence,
     list_polls,
     log_contact,
+    make_short_link,
     update_poll,
     update_response,
 )
-from kairos.email_service import send_decision_email, send_imip, send_invite_email
+from kairos.email_service import send_decision_email, send_imip, send_invite_email, webcal_from
 from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
@@ -336,8 +338,9 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
         invite = create_invite(poll_id, email, required=body.required,
                                 name=names.get(email))
         invite_url = f"{base}{P}/p/i/{invite['token']}"
+        sub = webcal_from(invite_url) if settings.FEED_ENABLED else None
         sent = send_invite_email(email, poll["title"], invite_url,
-                                 actor["name"], reply_to=actor["email"])
+                                 actor["name"], reply_to=actor["email"], subscribe_url=sub)
         if sent:
             log_contact(poll_id, email, "invite", invite["id"])
         results.append({"email": email, "invite_url": invite_url,
@@ -413,17 +416,38 @@ def imip_decision_endpoint(poll_id: str, request: Request,
     slot = decided_slot_of(poll)
     if not slot:
         raise HTTPException(400, "Poll has no decided date yet")
-    seq = bump_slot_sequence(slot["id"])
+    # First send for this poll's finalist stays at SEQUENCE:0 — a first-seen
+    # event at SEQUENCE>0 confuses some clients (notably Gmail's RSVP rendering).
+    # Only a re-send (a prior decision already went out) bumps it to an update.
+    prior = any(c.get("kind") == "decision" for c in get_contact_log(poll_id))
+    seq = bump_slot_sequence(slot["id"]) if prior else get_slot_sequence(slot["id"])
     poll_url = _share_url(request, poll)
-    subject = f"Invitation: {poll['title']} — {format_slot(slot, poll['mode'])}"
+    label = format_slot(slot, poll["mode"])
+    subject = f"Invitation: {poll['title']} — {label}"
+    base = get_base_url(request)
+    invites = {i["email"]: i for i in get_invites(poll_id)}
     sent = []
     for email in recipient_emails(poll_id):
+        inv = invites.get(email)
+        # Per-invitee one-click RSVP links in the DESCRIPTION: Gmail renders these
+        # (clickable) in its event card even when it suppresses native RSVP for a
+        # Gmail-organized invite, so every client gets a working Accept/Maybe/Decline.
+        if inv and settings.FEED_ENABLED:
+            sid, tok = slot["id"], inv["token"]
+
+            def short(av, sid=sid, tok=tok):  # our own tiny-url; capability kept private
+                code = make_short_link(f"{P}/p/i/{tok}/s/{sid}/{av}")
+                return f"{base}{P}/v/{code}"
+            desc = (f"{poll['title']} — {label}\n\nRSVP (one click):\n"
+                    f"Accept: {short('yes')}\nMaybe: {short('maybe')}\nDecline: {short('no')}\n\nPoll: {poll_url}")
+        else:
+            desc = f"{poll['title']} — {label}\nPoll: {poll_url}"
         ics = build_request_ics(poll, slot, email,
                                 organizer_email=settings.IMIP_ORGANIZER,
                                 organizer_name=settings.IMIP_ORGANIZER_NAME,
-                                sequence=seq, url=poll_url)
-        if send_imip(email, subject, f"{poll['title']} — {format_slot(slot, poll['mode'])}\n{poll_url}",
-                     ics, "REQUEST", settings.IMIP_ORGANIZER, settings.IMIP_ORGANIZER_NAME):
+                                sequence=seq, url=poll_url, description=desc)
+        if send_imip(email, subject, desc, ics, "REQUEST",
+                     settings.IMIP_ORGANIZER, settings.IMIP_ORGANIZER_NAME):
             log_contact(poll_id, email, "decision")
             sent.append(email)
     return {"sent": len(sent), "recipients": sent}
