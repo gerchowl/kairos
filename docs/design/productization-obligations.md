@@ -23,7 +23,7 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 | S1 | Owner identity comes only from a **trusted** proxy; header-auth must not trust arbitrary upstreams | ADR-0002 | CONFIG + RUNTIME (trusted-proxy allowlist) | PARTIAL — allowlist PLANNED |
 | S2 | `SESSION_SECRET` required outside demo; refuse to boot without it | ADR-0003 | RUNTIME (fail-closed) | MET |
 | S3 | Capability tokens are unguessable (`token_urlsafe(32)`) and never logged | ADR-0001 | RUNTIME + no-secret-in-logs | MET (entropy); PARTIAL (log audit) |
-| S4 | No secrets committed to git | — | GATE (gitleaks) | PLANNED |
+| S4 | No secrets committed to git | — | GATE (gitleaks, pre-commit + CI full-history) | MET |
 | S5 | TLS everywhere; no plaintext transport | — | CHECKLIST + CONFIG | CHECKLIST |
 | S6 | Every mutating route authorizes via one predicate (`require_manage`) | ADR-0001, #29 | RUNTIME | PLANNED (#29) |
 | S7 | No PII/secrets splatted into logs/traces | guardrails trace spine | GATE (no-raw-trace-fields, if traced) + review | N/A (no tracing yet) |
@@ -95,9 +95,22 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 
 ---
 
+## Domain (product identity)
+
+Availability pass (RDAP, 2026-07-01) — bare `kairos.{app,dev,com,tools,day}` are
+all **taken** (common Greek word). Available & brandable:
+
+- `kairos.sh` — short, dev/self-host flavor (recommended for the OSS/self-host angle)
+- `kairosscheduler.com`, `kairospoll.com` — descriptive, SEO-friendly
+- `trykairos.io`, `kairosapp.io`, `kairoshq.io`, `whenkairos.com` — product/landing
+- `kairos.rsvp` — on-theme (Google TLD) if the niche read is wanted
+
+Mail (M1) needs DKIM/DMARC on whichever is chosen; a non-Gmail organizer here is
+also what unblocks native Gmail RSVP (ADR-0006 / M5).
+
 ## Rollup
 
-- **MET now:** S2, M2, M5, P1, P2, D1, D2, T1, G1–G6 (+ token entropy).
+- **MET now:** S2, S4, M2, M5, P1, P2, D1, D2, T1, G1–G6 (+ token entropy).
 - **The gating theme:** most *unmet* obligations are **RUNTIME** (require the tenancy/mail/abuse code — issues #29–#37), not lint gates. Only S4 (gitleaks) is a new *GATE* worth adding now.
 - **Before any public exposure**, the hard gate is the abuse trio **A1–A3** + **S1/S6** + **M1** — without those, a public Kairos is an open email relay.
 - **Self-host** needs **D3/D4** + the **S5/S1** hardening checklist to be a credible, secure default.
