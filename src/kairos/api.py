@@ -32,6 +32,7 @@ from kairos.db import (
     get_slot_sequence,
     list_polls,
     log_contact,
+    make_short_link,
     update_poll,
     update_response,
 )
@@ -431,9 +432,13 @@ def imip_decision_endpoint(poll_id: str, request: Request,
         # (clickable) in its event card even when it suppresses native RSVP for a
         # Gmail-organized invite, so every client gets a working Accept/Maybe/Decline.
         if inv and settings.FEED_ENABLED:
-            vb = f"{base}{P}/p/i/{inv['token']}/s/{slot['id']}"
+            sid, tok = slot["id"], inv["token"]
+
+            def short(av, sid=sid, tok=tok):  # our own tiny-url; capability kept private
+                code = make_short_link(f"{P}/p/i/{tok}/s/{sid}/{av}")
+                return f"{base}{P}/v/{code}"
             desc = (f"{poll['title']} — {label}\n\nRSVP (one click):\n"
-                    f"Accept: {vb}/yes\nMaybe: {vb}/maybe\nDecline: {vb}/no\n\nPoll: {poll_url}")
+                    f"Accept: {short('yes')}\nMaybe: {short('maybe')}\nDecline: {short('no')}\n\nPoll: {poll_url}")
         else:
             desc = f"{poll['title']} — {label}\nPoll: {poll_url}"
         ics = build_request_ics(poll, slot, email,

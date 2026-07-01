@@ -293,8 +293,15 @@ def test_imip_decision_sends_request_to_participants(tmp_path, monkeypatch):
         assert r.status_code == 200 and r.json()["sent"] == 1
         assert calls[0]["to"] == "bob@x.ch" and calls[0]["method"] == "REQUEST"
         assert "METHOD:REQUEST" in calls[0]["ics"] and calls[0]["org"] == "replies@kairos.ch"
-        # Per-invitee one-click RSVP deep link embedded in the DESCRIPTION.
-        assert f"/p/i/{tok}/s/{s1}/yes" in calls[0]["ics"].replace("\r\n ", "")
+        # DESCRIPTION carries our own short links (/v/<code>) that resolve to the
+        # per-invitee vote path (capability kept private — no external shortener).
+        import re
+
+        from kairos.db import resolve_short_link
+        ics0 = calls[0]["ics"].replace("\r\n ", "")
+        m = re.search(r"/scheduler/v/([\w-]+)", ics0)  # first /v/ = Accept
+        assert m, ics0
+        assert resolve_short_link(m.group(1)) == f"/scheduler/p/i/{tok}/s/{s1}/yes"
         # First send stays at SEQUENCE:0 (a re-send would bump it).
         assert "SEQUENCE:0" in calls[0]["ics"]
         assert get_slot_sequence(s1) == 0
@@ -317,6 +324,23 @@ def test_imip_decision_requires_config(tmp_path, monkeypatch):
             "title": "x", "mode": "full_day", "creator": "alice",
             "slots": [{"date": "2026-07-06"}]}).json()
         assert c.post(f"/scheduler/api/polls/{poll['id']}/imip-decision", headers=h).status_code == 400
+
+
+def test_short_links_redirect_and_dedup(tmp_path, monkeypatch):
+    """Self-hosted tiny-url: /v/<code> redirects to its target; same target reuses code."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    from kairos.main import create_app
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        from kairos.db import make_short_link, resolve_short_link
+        target = "/scheduler/p/i/tok123/s/slot456/yes"
+        code = make_short_link(target)
+        assert 0 < len(code) <= 16
+        assert make_short_link(target) == code          # dedup: same target -> same code
+        assert resolve_short_link(code) == target
+        r = c.get(f"/scheduler/v/{code}", follow_redirects=False)
+        assert r.status_code == 307 and r.headers["location"] == target
+        assert c.get("/scheduler/v/nope", follow_redirects=False).status_code == 404
 
 
 def test_slot_sequence_migration_and_bump(tmp_path, monkeypatch):

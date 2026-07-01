@@ -23,6 +23,7 @@ from kairos.db import (
     mark_invite_notified,
     mark_notification_read,
     mark_response_notified,
+    resolve_short_link,
     update_invite,
     update_poll,
     update_response_contact,
@@ -162,6 +163,16 @@ def _error_page(user: dict, heading: str, detail: str, back: str, status_code: i
 
 
 # -- Routes --
+
+@router.get("/v/{code}")
+def short_link(code: str):
+    """Self-hosted tiny-url: resolve a short code to its target and redirect.
+    Keeps capability vote URLs short in plain-text calendar DESCRIPTIONs."""
+    target = resolve_short_link(code)
+    if not target:
+        raise HTTPException(404)
+    return RedirectResponse(target, status_code=307)
+
 
 @router.get("/")
 def dashboard(request: Request):

@@ -77,6 +77,13 @@ SCHEMA = [
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (poll_id) REFERENCES sched_polls(id) ON DELETE CASCADE
     )""",
+    # Self-hosted short links (our own tiny-url) so capability vote URLs stay
+    # short in plain-text calendar DESCRIPTIONs — and never leak to a 3rd party.
+    """CREATE TABLE IF NOT EXISTS sched_short_links (
+        code VARCHAR(16) PRIMARY KEY,
+        target VARCHAR(512) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""",
 ]
 
 
@@ -86,6 +93,38 @@ def new_id() -> str:
 
 def new_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def new_short_code() -> str:
+    """~10 url-safe chars — unguessable (the code IS the capability), still tiny."""
+    return secrets.token_urlsafe(8)[:10]
+
+
+def make_short_link(target: str) -> str:
+    """Return a stable short code for a target path (dedup so re-sends reuse it)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT code FROM sched_short_links WHERE target = %s", (target,))
+    row = cursor.fetchone()
+    if row:
+        code = row[0]
+    else:
+        code = new_short_code()
+        cursor.execute("INSERT INTO sched_short_links (code, target) VALUES (%s, %s)", (code, target))
+        conn.commit()
+    cursor.close()
+    conn.close()
+    return code
+
+
+def resolve_short_link(code: str) -> str | None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT target FROM sched_short_links WHERE code = %s", (code,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row[0] if row else None
 
 
 if IS_SQLITE:
