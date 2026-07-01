@@ -11,7 +11,8 @@
 {% if subscribe_url %}
 <p style="margin: 0 0 8px;">&hellip;or add it to your own calendar and vote from there:</p>
 <p style="margin: 0 0 8px;"><a href="{{ subscribe_url }}" style="border: 1px solid #3060c8; color: #3060c8; padding: 10px 22px; border-radius: 4px; text-decoration: none; display: inline-block;">&#128197; Subscribe in my calendar</a></p>
-<p style="color: #70707a; font-size: 12px; margin: 0 0 18px;">Every candidate time appears in your calendar with one-click <em>Accept / Maybe / Decline</em>. Heads-up: a subscribed calendar refreshes on <em>your</em> app&rsquo;s own schedule &mdash; minutes to a day (Google can be ~daily). Your vote saves instantly on the website; the calendar copy catches up later.</p>
+<p style="color: #70707a; font-size: 12px; margin: 0 0 12px;">Every candidate time appears in your calendar with one-click <em>Accept / Maybe / Decline</em>. Heads-up: a subscribed calendar refreshes on <em>your</em> app&rsquo;s own schedule &mdash; minutes to a day (Google can be ~daily). Your vote saves instantly on the website; the calendar copy catches up later.</p>
+<p style="color: #70707a; font-size: 12px; margin: 0 0 18px;">&#129302; <strong>Have an assistant?</strong> This invite link is agent-native &amp; self-describing (<a href="{{ invite_url }}/agent.json" style="color: #3060c8;">agent.json</a>) &mdash; hand it the link and your AI reads the options and RSVPs for you. You already gave it your calendar; let it do the scheduling. <em>(Keep the link private &mdash; it votes as you.)</em></p>
 {% endif %}
 
 <p style="color: #70707a; font-size: 13px;"><strong>No account. No calendar access.</strong> Every other scheduler wants to read your whole calendar to guess when you&rsquo;re free &mdash; {{ BRAND }} just asks <em>you</em>. (You&rsquo;re the only one who knows what&rsquo;s <em>actually</em> movable.)</p>

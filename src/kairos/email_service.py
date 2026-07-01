@@ -125,7 +125,11 @@ Or add it to your own calendar and vote from there:
 Every candidate time appears in your calendar with one-click Accept / Maybe / Decline.
 Note: a subscribed calendar refreshes on your app's own schedule — minutes to a day
 (Google can be ~daily). Your vote saves instantly on the website; the calendar copy
-catches up later."""
+catches up later.
+
+🤖 Have an assistant? This invite link is agent-native & self-describing
+({invite_url}/agent.json) — hand it the link and your AI reads the options and RSVPs
+for you. (Keep the link private — it votes as you.)"""
     text = f"""{hi}{sender_name} — {lead}: {poll_title}
 
 Two ways to respond:

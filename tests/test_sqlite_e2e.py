@@ -365,6 +365,34 @@ def test_slot_sequence_migration_and_bump(tmp_path, monkeypatch):
         assert get_slot_sequence(sid) == 2
 
 
+def test_invite_agent_json(tmp_path, monkeypatch):
+    """Agent-native invitee surface: the invite link self-describes (no API key)."""
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
+    from kairos.main import create_app
+    h = {"Authorization": "Bearer k"}
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        poll = c.post("/scheduler/api/polls", headers=h, json={
+            "title": "Agent poll", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        from kairos.db import create_invite
+        itok = create_invite(poll["id"], "bob@x.ch", required=True, name="Bob")["token"]
+        d = c.get(f"/scheduler/p/i/{itok}/agent.json").json()
+        assert d["you"]["email"] == "bob@x.ch" and d["poll"]["title"] == "Agent poll"
+        assert d["docs"].endswith("/scheduler/llms.txt")
+        s = d["slots"][0]
+        assert s["your_vote"] is None
+        assert s["vote"]["maybe"].endswith(f"/p/i/{itok}/s/{s['id']}/maybe")
+        # an agent votes by GETting the URL -> reflected on re-read
+        c.get(f"/scheduler/p/i/{itok}/s/{s['id']}/maybe")
+        d2 = c.get(f"/scheduler/p/i/{itok}/agent.json").json()
+        assert d2["slots"][0]["your_vote"] == "maybe"
+        monkeypatch.setattr(settings, "FEED_ENABLED", False)
+        assert c.get(f"/scheduler/p/i/{itok}/agent.json").status_code == 404
+
+
 def test_feed_disabled_by_default(tmp_path, monkeypatch):
     """With KAIROS_FEED off, open-poll feeds + deep links don't exist (404)."""
     from kairos import settings
