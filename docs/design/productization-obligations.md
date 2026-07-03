@@ -95,11 +95,41 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 
 ---
 
-## Domain (product identity)
+## Domain & brand (product identity) — DECIDED
 
-**Namecheap-verified, 2026-07-01** (RDAP alone was unreliable for `.io`/`.sh` —
-several "available" RDAP hits were actually taken; a real registrar check is
-required before buying).
+**Decision (ADR-0011):** ship Kairos **as a nerdmachines tool** at
+**`kairos.nerdmachines.com`** — a subdomain of the house brand we already own.
+Keep the product name *Kairos*; give it a **bee or goose mascot** for
+personality. No standalone domain purchase. This dissolves the domain problem
+(a DNS record, not a naming project) and — via a non-Gmail organizer
+`kairos@nerdmachines.com` — also unblocks native Gmail RSVP (M1 + M5).
+**Open dependency:** confirm `nerdmachines.com` registration is under our control.
+
+### Naming discussion (for the record — why we landed here)
+
+- **"Kairos" is saturated** (Kairos AI / Power / Ventures / Aerospace…); every
+  good TLD is taken or premium. That crowding is the real issue; domain scarcity
+  is the symptom.
+- **Compound/`get-`/`try-`/`-app` domains are stopgaps**, never the brand. What
+  works: short distinctive/coined words (Spotify, Stripe, Figma) or, in-space,
+  Calendly / Doodle / when2meet. `kairosscheduler.com` = fine address, not a brand.
+- **Adjective+animal** explored: pick an animal whose behavior *is* coordination
+  so the metaphor earns its keep — **bee** (waggle dance = "when & where" to the
+  hive), **goose** (V-formation, honk-to-coordinate, migrates on schedule),
+  crane, meerkat, penguin, owl (early-bird/night-owl). Verified-available
+  standalones if ever needed: `gathergoose.com`, `rallyrook.com`.
+- **Heuristic (Namecheap-verified):** short/real-word `.com`s are extinct
+  (`beeup.com` taken since 2006); **alliterative adjective+animal compounds** are
+  almost always free (~$12/yr). Bare `kairos.*`, `trykairos.io`, `kairosapp.io`,
+  `kairoshq.*`, `nerdmachines.com` (ours) all registered.
+- **Resolution:** for an OSS/agent-native tool the brand lives in the org +
+  package, not a domain (ADR-0008, ADR-0010) → the house-brand subdomain wins;
+  the animal becomes the **mascot**, not the brand.
+
+### Availability pass — Namecheap-verified, 2026-07-01
+
+(RDAP alone was unreliable for `.io`/`.sh` — several "available" RDAP hits were
+actually taken; a real registrar check is required before buying.)
 
 **Available (verified):**
 | Domain | Price | Note |
