@@ -5,11 +5,11 @@
     "build": "tailwindcss -i input.css -o ../src/kairos/static/kairos.css --minify"
   },
   "devDependencies": {
-    "@tailwindcss/cli": "^4.1.0",
-    "daisyui": "^5.0.0",
+    "@tailwindcss/cli": "^4.3.2",
+    "daisyui": "^5.6.16",
     "tailwindcss": "^4.1.0"
   },
   "dependencies": {
-    "tabulator-tables": "^6.4.0"
+    "tabulator-tables": "^6.5.2"
   }
 }
