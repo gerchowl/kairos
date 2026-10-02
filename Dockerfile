@@ -17,14 +17,22 @@
 #      allowlist (S1) would be checked against a caller-supplied address.
 #      If you override the CMD and invoke uvicorn directly, you must add
 #      --no-proxy-headers yourself.
-#   4. The runtime layer has no build toolchain, no compiler, no package
-#      manager and no curl — Python + the venv, nothing else, running as uid
-#      10001.
+#   4. The runtime layer carries no build toolchain: no compiler (gcc/cc/make are
+#      all absent), no `curl`/`wget`, no `git`, and no `pip` anywhere — uv does
+#      not install one into the venv and the Debian base's `/usr/local/bin/pip*`
+#      is deleted. `apt`/`apt-get` DO remain: they are part of the Debian base
+#      rather than something this file added, and they are how you would patch
+#      an OS CVE in a derived image. Removing them too is a trade-off, not a free
+#      win — see docs/design/self-host-hardening.md §9.
+#      Python + the venv, running as uid 10001.
 
-# Base-image family is an operator-level choice (slim vs alpine vs distroless);
-# the default here is Debian slim because it is what `uvx kairos` semantics imply
-# (CPython, glibc, a shell for `podman run --rm -it <img> sh` debugging) and it
-# keeps the vulnerable-CVE surface of an unknown-from-source base at zero.
+# Base-image family is an operator-level choice (slim vs alpine vs distroless).
+# The default here is Debian slim, for the reasons that are actually about this
+# project: it is the same CPython/glibc/`uvx kairos` semantics, and it keeps a
+# shell for `podman run --rm -it <img> sh` debugging. It is NOT a security claim:
+# the CI `audit` job runs `pip-audit` over `uv.lock` only, so Debian's own OS
+# CVEs are unaudited here either way. Track those with Trivy/Grype against the
+# image, or take the distroless option and accept no shell.
 # See docs/design/self-host-hardening.md — flagged, not decided.
 ARG PYTHON_VERSION=3.12
 
@@ -79,7 +87,12 @@ ENV PATH="/opt/venv/bin:$PATH" \
 RUN groupadd --system --gid 10001 kairos \
  && useradd --uid 10001 --gid kairos --no-log-init --home-dir /data --shell /usr/sbin/nologin kairos \
  && mkdir -p /data \
- && chown kairos:kairos /data
+ && chown kairos:kairos /data \
+ # No pip anywhere in the runtime image: uv does not install one into the venv,
+ # and the Debian base's /usr/local/bin/pip* is removed here. Nothing in the
+ # image needs it, and pip is a convenient way to turn a read-only container
+ # into a writable one. `apt` stays on purpose — see the header, rule 4.
+ && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.12
 
 COPY --from=build /opt/venv /opt/venv
 

@@ -75,9 +75,22 @@ including ownership of any poll. Two controls, both required:
       console script, which sets it. If you replace the command with `uvicorn`
       directly, you must pass `--no-proxy-headers` yourself, or uvicorn rewrites
       the client address from `X-Forwarded-For` *before* Kairos sees it and the
-      allowlist is checked against attacker input. Verified in-image: with
-      uvicorn's default, a forged `X-Forwarded-For` inside the allowlist yields
-      HTTP 200 on `POST /api/polls`; with the image's `CMD` it yields 403.
+      allowlist is checked against attacker input.
+
+      Measured in-image, from inside the container (uvicorn only rewrites the peer
+      for local peers, so a request over a published port cannot show the
+      difference at all). `tests/probe_s1_bypass.py` runs this; CI runs both
+      arms, so the check cannot pass vacuously:
+
+      | command | `GET /new` + `X-Forwarded-For: 192.0.2.7` + `X-User: attacker` |
+      |---|---|
+      | `uvicorn … kairos.main:app` (uvicorn's default) | **200** — page renders as `attacker`; `POST /new` with the CSRF token from that page then **creates a poll owned by `attacker`** |
+      | `uvicorn --no-proxy-headers …` | 403 |
+      | the image's `CMD` (`kairos --host 0.0.0.0 …`) | 403 |
+
+      It is `POST /new` and not `POST /api/polls`: the API surface is Bearer-key
+      gated and its creator is the literal `"api"`, so it never reads an identity
+      header and says nothing about header trust.
 - [ ] Set `KAIROS_ALLOW` as a second, independent owner gate if your IdP is
       broader than your user list. Empty means any identity the IdP vouches for
       may own polls.
@@ -102,6 +115,23 @@ including ownership of any poll. Two controls, both required:
       image**, so no chown step is needed. A **bind** mount is different: chown
       the host directory to 10001:10001, or run with
       `--user $(id -u):$(id -g)`, and on SELinux hosts add `:Z`.
+- [ ] **That inheritance only happens for a volume that does not exist yet.** An
+      *existing* volume with the wrong ownership is **not** re-chowned, and there
+      is no entrypoint running as root to fix it, so the container crash-loops
+      with `sqlite3.OperationalError: unable to open database file` in the log
+      and `podman compose ps` shows `restarting`. Reproduced, and it is the
+      first thing to check for any "the container will not stay up" report:
+
+      ```sh
+      podman run --rm -v <volume>:/data alpine ls -ldn /data   # expect 10001:10001
+      # fix, if the contents are disposable:
+      podman volume rm <volume>            # recreated with correct ownership
+      # fix, if they are not:
+      podman run --rm -u 0 -v <volume>:/data alpine chown -R 10001:10001 /data
+      ```
+
+      A volume created by an older run of a different uid, or by `docker` on the
+      same host, is the usual way to land here.
 - [ ] Back up by copying the volume, not by copying a live file:
       `podman run --rm -v kairos_kairos-data:/data -v "$PWD":/backup alpine \
        tar czf /backup/kairos.tgz -C /data .`
@@ -163,10 +193,14 @@ Flagged, not chosen. All four are reversible without touching the app.
 Two smaller ones, same category:
 
 - **No digest pinning** on the base or on `ghcr.io/astral-sh/uv`. Both move.
-- **`apt` remains in the runtime layer.** There is no compiler, no `make` and no
-  `curl`/`wget`/`git`, but the Debian base ships a package manager, which is how
-  you would patch a CVE in a derived image. A distroless swap removes it and also
-  removes the ability to patch in place.
+- **`apt` remains in the runtime layer.** There is no compiler, no `make`, no
+  `pip` anywhere, and no `curl`/`wget`/`git` — but the Debian base ships a package
+  manager, which is how you would patch an OS CVE in a derived image. A distroless
+  swap removes it and also removes the ability to patch in place.
+- **Base-image OS CVEs are not audited by this repo.** The `audit` CI job is
+  `pip-audit` over `uv.lock` — the Python dependency tree and nothing else. It
+  says nothing about Debian's own packages. If that matters to you, scan the
+  image (Trivy/Grype) in your own pipeline, or take the distroless option.
 
 ## 10. Verification you can repeat
 

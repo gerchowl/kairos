@@ -119,31 +119,59 @@ jobs:
           # An ephemeral filesystem would 404 this: the poll is only in the volume.
           curl -sf "http://127.0.0.1:8003/api/polls/$POLL_ID" -H 'Authorization: Bearer ci' | grep decided
       - name: A forged X-Forwarded-For cannot defeat the trusted-proxy allowlist
-        # The security property the image's CMD exists to preserve: uvicorn's
-        # default proxy_headers=True would rewrite the peer from XFF *before*
-        # Kairos sees it, so this would return 200 instead of 403.
+        # The security property the image's CMD exists to preserve. TWO arms,
+        # because one alone proves nothing: if the probe cannot detect a bypass,
+        # a 403 from the shipped CMD is just an endpoint refusing everyone. The
+        # positive control is what makes the negative mean anything.
+        #
+        # Both arms run from *inside* the container: uvicorn's
+        # ProxyHeadersMiddleware only rewrites the peer for local peers, so a
+        # request over a published port cannot exhibit the difference at all.
+        #
+        # The route is POST /new. The API surface is Bearer-key gated and its
+        # creator is the literal "api", so it never reads an identity header and
+        # cannot demonstrate anything about header trust — a probe built on it
+        # passes for the wrong reason (an earlier version of this job did).
         run: |
           set -ex
-          podman rm -f kairos-s1
-          podman run -d --name kairos-s1 -e KAIROS_AUTH=header \
-            -e SESSION_SECRET=ci -e KAIROS_TRUSTED_PROXY_CIDRS=192.0.2.0/24 kairos:ci
+          podman run -d --name s1-control -e KAIROS_AUTH=header -e SESSION_SECRET=ci \
+            -e KAIROS_TRUSTED_PROXY_CIDRS=192.0.2.0/24 \
+            kairos:ci uvicorn --host 0.0.0.0 --port 8003 kairos.main:app
+          podman cp tests/probe_s1_bypass.py s1-control:/probe.py
           sleep 5
-          # /health is exempt from the allowlist, so probes still work
-          podman exec kairos-s1 python -c "
+          # Bare uvicorn (proxy_headers defaults to True) MUST bypass — that is
+          # the documented hazard. If it stopped, the check below is vacuous.
+          ! podman exec s1-control python /probe.py http://127.0.0.1:8003
+          podman rm -f s1-control
+
+          # The shipped CMD must hold the line.
+          podman run -d --name s1-image -e KAIROS_AUTH=header -e SESSION_SECRET=ci \
+            -e KAIROS_TRUSTED_PROXY_CIDRS=192.0.2.0/24 kairos:ci
+          podman cp tests/probe_s1_bypass.py s1-image:/probe.py
+          sleep 5
+          podman exec s1-image python /probe.py http://127.0.0.1:8003
+          # /health is exempt from the allowlist, so container probes still work.
+          podman exec s1-image python -c "
           import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8003/health').status == 200"
-          # everything else is refused, including with a forged XFF inside the
-          # allowlist and an asserted identity
-          test "$(podman exec kairos-s1 python -c "
-          import urllib.request, urllib.error
-          r = urllib.request.Request('http://127.0.0.1:8003/api/polls', method='POST',
-            data=b'{\"title\":\"evil\",\"mode\":\"full_day\",\"slots\":[{\"date\":\"2026-12-01\"}]}',
-            headers={'Content-Type': 'application/json', 'X-Forwarded-For': '192.0.2.7',
-                     'X-User': 'attacker'})
-          try:
-              urllib.request.urlopen(r); print('REACHED')
-          except urllib.error.HTTPError as e:
-              print(e.code)")" = "403"
+          podman rm -f s1-image
+      - name: The startup banner never prints the database password
+        # The banner goes to stdout, which is the container log and every log
+        # shipper downstream of it. A MySQL URL carries the credential in its
+        # userinfo, so printing it raw leaks in cleartext, silently.
+        run: |
+          set -ex
+          podman run --rm -e KAIROS_DB_URL=mysql://kairos:SuperSecretPw123@db:3306/kairos \
+            --entrypoint kairos --network none kairos:ci --port 9999 > /tmp/banner.txt 2>&1 || true
+          cat /tmp/banner.txt
+          ! grep -q SuperSecretPw123 /tmp/banner.txt
+          grep -q 'mysql://kairos:\*\*\*@db:3306/kairos' /tmp/banner.txt
       - name: Compose files are valid
+        # `docker compose` rather than `podman compose`: the hosted runner ships
+        # the v2 plugin and no podman compose provider. The two are NOT
+        # interchangeable — they differ in merge and interpolation behaviour,
+        # which is exactly how an invalid merge passes here and fails for an
+        # operator. Anything provider-sensitive is covered by the podman-tested
+        # checks in tests/test_container_deployment.py instead.
         run: |
           docker compose -f compose.yaml config -q
           KAIROS_DB_PASSWORD=ci KAIROS_DB_ROOT_PASSWORD=ci \
@@ -152,9 +180,19 @@ jobs:
             OIDC_CLIENT_ID=c OIDC_CLIENT_SECRET=s OIDC_REDIRECT_URL=https://x/cb \
             OIDC_ALLOWED_DOMAINS=e.org OAUTH2_PROXY_COOKIE_SECRET=k SESSION_SECRET=s \
             docker compose -f compose.proxy.yaml config -q
-          # A missing operator secret must fail the deploy, not boot with a blank one.
-          # (No .env in a fresh checkout, so this is the unset case.)
+          # A missing operator secret must fail the deploy, not boot with a blank
+          # one. (No .env in a fresh checkout, so this is the unset case.)
           ! docker compose -f compose.proxy.yaml config -q
+          # compose.proxy.yaml must NOT validate as an overlay of compose.yaml.
+          # Compose appends list-valued keys, so the two files' identical
+          # security_opt entries collide. It is standalone for a reason: merging
+          # also resurrects the published app port that defeats the allowlist.
+          # If this ever starts succeeding, someone has "fixed" the collision by
+          # deleting a duplicate — which is the trap, not the fix.
+          ! KAIROS_SITE=x ACME_EMAIL=a@b.c OIDC_ISSUER_URL=https://id.example.org \
+            OIDC_CLIENT_ID=c OIDC_CLIENT_SECRET=s OIDC_REDIRECT_URL=https://x/cb \
+            OIDC_ALLOWED_DOMAINS=e.org OAUTH2_PROXY_COOKIE_SECRET=k SESSION_SECRET=s \
+            docker compose -f compose.yaml -f compose.proxy.yaml config -q
 
   licenses:
     # No copyleft surprises in the dependency tree (we ship MIT)

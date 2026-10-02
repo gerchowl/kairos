@@ -331,3 +331,146 @@ def test_kairos_service_is_on_the_network_the_allowlist_names():
 def test_healthcheck_survives_the_proxy_allowlist(name, text):
     """A 403'd healthcheck is a crashloop; /health must be probed on loopback."""
     assert "127.0.0.1:8003/health" in _commented_out(text), name
+
+
+# -- the loopback bind: the one compose.yaml's whole rationale rests on -----
+#
+# compose.yaml runs in demo auth, which has no identity check at all — every
+# visitor is the same owner. The only thing standing between that and an open
+# poll forge on the internet is that the port is published on loopback. Nothing
+# else in the file depends on it, and nothing about it is enforced by the app,
+# so a one-character edit here is a silent exposure.
+
+
+def test_default_topology_is_published_on_loopback_only():
+    """`${KAIROS_BIND:-127.0.0.1}` — and the default must be the loopback one.
+
+    The override stays available (an operator with their own proxy in front of
+    the host may want it), but an empty or 0.0.0.0 default would publish an
+    unauthenticated poll forge to every network the host is attached to.
+    """
+    mapping = re.search(
+        r'-\s*"\$\{KAIROS_BIND:([^}]*)\}[^"]*"\s*$', _commented_out(COMPOSE), re.M
+    )
+    assert mapping, "compose.yaml must publish via ${KAIROS_BIND:-127.0.0.1}"
+    assert mapping.group(1).lstrip("-") == "127.0.0.1", (
+        f"the default bind address must stay loopback, got {mapping.group(1)!r}"
+    )
+
+
+def test_default_topology_is_not_published_on_a_wildcard_address():
+    """Belt and braces: no bare `0.0.0.0:` / `::` publish may appear at all."""
+    live = _commented_out(COMPOSE)
+    for wildcard in ("0.0.0.0:", "- \"::", ":::8003"):
+        assert wildcard not in live, f"wildcard publish in compose.yaml: {wildcard}"
+
+
+def test_proxy_topology_does_not_offer_a_bind_override():
+    """No KAIROS_BIND escape hatch in the proxy topology, where ports are absent."""
+    assert "KAIROS_BIND" not in _commented_out(PROXY_COMPOSE)
+
+
+# -- container hardening flags the base file sets ----------------------------
+
+
+def test_default_topology_is_read_only():
+    """`read_only: true` + a tmpfs /tmp.
+
+    Nothing in the app writes outside /data, so a writable layer buys nothing
+    except somewhere for a stray file to survive a restart. /tmp still needs to
+    exist and be writable because it is not read-only by default.
+    """
+    live = _commented_out(COMPOSE)
+    assert "read_only: true" in live
+    assert re.search(r"tmpfs:\s*\n\s*-\s*/tmp", live), "/tmp must be a tmpfs under read_only"
+
+
+@pytest.mark.parametrize(
+    "name,text",
+    [pytest.param("compose.yaml", COMPOSE, id="compose.yaml"),
+     pytest.param("compose.proxy.yaml", PROXY_COMPOSE, id="compose.proxy.yaml")],
+)
+def test_no_service_asks_for_privileged(name, text):
+    """`privileged: true` would hand back everything read_only and cap_drop take.
+
+    Checked as an outright ban rather than "not present today": it is the single
+    key that makes every other hardening line decorative.
+    """
+    live = _commented_out(text)
+    assert not re.search(r"^\s*privileged:\s*(true|yes)\s*$", live, re.M), name
+    for escape in ("pid: host", "ipc: host", "network_mode: host", "userns_mode"):
+        assert escape not in live, f"{name}: {escape} weakens the sandbox"
+
+
+def test_mysql_overlay_waits_for_a_healthy_database():
+    """`depends_on: service_healthy`, not merely `service_started`.
+
+    Kairos opens its connection at first request, not at boot, so with only
+    `service_started` the container comes up healthy and every request fails
+    until MariaDB happens to finish initialising — which reads as a broken app
+    rather than a startup ordering problem.
+    """
+    db_service = _service(MYSQL_COMPOSE, "db")
+    assert "healthcheck:" in db_service, "the db service needs a healthcheck to wait on"
+    kairos_service = _service(MYSQL_COMPOSE, "kairos")
+    assert "service_healthy" in kairos_service, "kairos must wait for service_healthy"
+
+
+# -- documentation must not ship a command that fails ------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["README.md", ".env.example", "compose.yaml", "compose.mysql.yaml", "compose.proxy.yaml",
+     "deploy/Caddyfile", "docs/design/self-host-hardening.md"],
+)
+def test_no_doc_ships_the_invalid_overlay_merge(path):
+    """compose.proxy.yaml must never be layered onto compose.yaml.
+
+    Compose appends list-valued keys, so that merge fails on the duplicate
+    `security_opt` entries. The tempting fix — deleting one — also resurrects
+    compose.yaml's published app port, which defeats the allowlist, so the error
+    is the thing protecting the reader. CI asserts the merge fails; this
+    asserts no documentation tells anyone to run it.
+    """
+    text = (ROOT / path).read_text()
+    # Naming the command in order to warn against it is the point; printing it as
+    # something to run is the bug. So the bar is per line: it may appear only
+    # where a negation sits next to it.
+    negated = ("NOT", "Do not", "do not", "never", "instead", "Do NOT", "NOT be")
+    for line in text.splitlines():
+        if "-f compose.yaml -f compose.proxy.yaml" not in line:
+            continue
+        assert any(marker in line for marker in negated), (
+            f"{path} tells the operator to run `-f compose.yaml -f compose.proxy.yaml`, "
+            f"which does not validate; use `-f compose.proxy.yaml` alone. Line: {line.strip()!r}"
+        )
+
+
+def test_env_example_points_at_the_standalone_proxy_command():
+    """The section header in .env.example is what an operator copies."""
+    live = (ROOT / ".env.example").read_text()
+    assert "-f compose.proxy.yaml up -d" in live
+
+
+def test_domain_list_is_not_given_a_secret_generator():
+    """`OIDC_ALLOWED_DOMAINS` feeds oauth2-proxy's --email-domain.
+
+    A copy-pasted random 32-character string there matches no address, so every
+    sign-in is refused at the proxy gate with nothing useful in the logs. The
+    generator belongs to the values above it, not this one.
+    """
+    lines = (ROOT / ".env.example").read_text().splitlines()
+    var_index = next(i for i, line in enumerate(lines) if line.startswith("OIDC_ALLOWED_DOMAINS="))
+    # Walk back over this variable's own comment block only.
+    block = []
+    for line in reversed(lines[:var_index]):
+        if not line.lstrip().startswith("#"):
+            break
+        block.append(line)
+    block = "\n".join(reversed(block))
+    assert "secrets.choice" not in block and "token_urlsafe" not in block, (
+        "OIDC_ALLOWED_DOMAINS is a domain list; do not document a secret generator "
+        f"for it:\n{block}"
+    )
+    assert "example.org" in block, "the comment should show the expected shape"

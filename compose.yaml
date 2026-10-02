@@ -8,11 +8,20 @@
 #
 # What this file is NOT: it is not a production topology. It is the smallest
 # thing that boots and persists, so that "does it work" is one command. For
-# anything reachable from a network you do not own, add the reverse-proxy
-# topology:
+# anything reachable from a network you do not own, use the reverse-proxy
+# topology INSTEAD of this file:
 #
-#   podman compose -f compose.yaml -f compose.proxy.yaml up -d
+#   podman compose -f compose.proxy.yaml up -d
 #
+# Do NOT layer the two: `-f compose.yaml -f compose.proxy.yaml` is an error,
+# because compose appends list-valued keys, so the two files' identical
+# `security_opt: [no-new-privileges:true]` entries collide and the deployment
+# aborts. The tempting fix — deleting one of the duplicates — is worse than the
+# error: the base file's `ports: 127.0.0.1:8003:8003` mapping would survive the
+# merge too, and a published app port is the one thing that reliably defeats the
+# trusted-proxy allowlist (see compose.proxy.yaml). compose.proxy.yaml is
+# standalone for exactly that reason — use it alone, or with compose.mysql.yaml.
+
 # Operator-level choices this file deliberately does NOT make for you (base
 # image family, registry/publication, retention, TLS termination) are listed in
 # docs/design/self-host-hardening.md.
@@ -48,6 +57,13 @@ services:
       # The whole point of the file: the SQLite file lives here, not in the
       # container layer. A fresh named volume inherits /data's ownership
       # (10001:10001) from the image, so this works without a chown step.
+      #
+      # No `:Z`/`:z` relabel here. Verified working on this box, which has
+      # SELinux *disabled*, so it is untested on an enforcing host: podman
+      # relabels named volumes it creates, but if you hit
+      # `unable to open database file` on Fedora/RHEL, add `:Z` to the mount
+      # below (and to caddy's volumes in compose.proxy.yaml, which has the same
+      # exposure on the certificate directory).
       - kairos-data:/data
     healthcheck:
       # Repeated from the Dockerfile on purpose: podman's default image format
