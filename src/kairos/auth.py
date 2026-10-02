@@ -40,33 +40,61 @@ def peer_address(request: Request) -> str | None:
     return client[0] if client else None
 
 
-def peer_is_trusted(request: Request) -> bool:
-    """May this request's peer assert identity headers?
+def parse_address(value: str):
+    """`value` as an ip_address, with IPv4-mapped IPv6 folded down to IPv4.
 
-    Fails closed: with an allowlist configured, anything outside it is
-    untrusted. With none configured, everything is trusted — the pre-existing
-    behaviour, safe only while the app port is not publicly reachable.
+    None when it is not an IP at all (a unix socket path, say).
+
+    The fold matters because a dual-stack listener ("kairos --host ::", the
+    container/K8s default) sees IPv4 clients as IPv4-mapped IPv6
+    ("::ffff:127.0.0.1"). Without this, an operator following the README's own
+    example allowlist gets a silently dead app: every peer fails to match an
+    IPv4 network. It still fails closed, so there is no exposure — it just fails
+    closed *everywhere*. Only IPv6Address has .ipv4_mapped, hence the getattr.
+
+    Folding also gives one host exactly one spelling, which is what lets a rate
+    limiter charge ::ffff:203.0.113.7 and 203.0.113.7 to a single budget.
+    """
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return getattr(address, "ipv4_mapped", None) or address
+
+
+def canonical_address(value: str) -> str:
+    """`value` in the one spelling that identifies the host, or itself when it is
+    not an IP. Used as a map key, so it must be total."""
+    address = parse_address(value)
+    return str(address) if address is not None else value
+
+
+def address_is_trusted(address: str | None) -> bool:
+    """Is this address inside `KAIROS_TRUSTED_PROXY_CIDRS`?
+
+    Fails closed: with an allowlist configured, anything unparseable or outside
+    it is untrusted. With none configured, everything is trusted — the
+    pre-existing behaviour, safe only while the app port is not publicly
+    reachable.
+
+    Takes an address rather than a request so the rate limiter can ask the same
+    question about every hop in a forwarded chain, instead of re-implementing
+    the CIDR matching (and the IPv4-mapped fold) a second time.
     """
     networks = settings.TRUSTED_PROXY_NETWORKS
     if not networks:
         return True
-    peer = peer_address(request)
-    if not peer:
+    if not address:
         return False
-    try:
-        address = ipaddress.ip_address(peer)
-    except ValueError:
-        # Not an IP (a unix socket path, say) — cannot be matched against a CIDR
-        # list, so treat as untrusted rather than waving it through.
-        return False
-    # A dual-stack listener ("kairos --host ::", the container/K8s default) sees
-    # IPv4 clients as IPv4-mapped IPv6 ("::ffff:127.0.0.1"). Without this, an
-    # operator following the README's own example allowlist gets a silently dead
-    # app: every peer fails to match an IPv4 network. It still fails closed, so
-    # there is no exposure — it just fails closed *everywhere*. Only IPv6Address
-    # has .ipv4_mapped, hence the getattr.
-    address = getattr(address, "ipv4_mapped", None) or address
-    return any(address in net for net in networks)
+    parsed = parse_address(address)
+    # Not an IP (a unix socket path, say) — cannot be matched against a CIDR
+    # list, so treat as untrusted rather than waving it through.
+    return parsed is not None and any(parsed in net for net in networks)
+
+
+def peer_is_trusted(request: Request) -> bool:
+    """May this request's peer assert identity headers?"""
+    return address_is_trusted(peer_address(request))
 
 
 def _serializer(salt: str = "session") -> URLSafeTimedSerializer:

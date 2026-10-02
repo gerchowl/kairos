@@ -53,7 +53,7 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 |---|---|---|---|---|
 | A1 | Poll creation gated by a human check (Turnstile) | #31 | RUNTIME + EXTERNAL | PLANNED (#31) |
 | A2 | No email sent to a **third party** until the creator's own email is verified (magic link opened) | ADR-0009, #31 | RUNTIME (`manage_verified_at`) | PLANNED (#31) |
-| A3 | Rate limits on public/email-sending endpoints (respond, invite, deep-link vote) | #37 | RUNTIME | PLANNED (#37) |
+| A3 | Rate limits on public/email-sending endpoints (respond, invite, deep-link vote) | #37 | RUNTIME | **PARTIAL** (#37) — six named budgets (`read`, `respond`, `deeplink_vote`, `create`, `invite`, `send`) as a reusable `rate_limit` dependency. Charged to the real transport peer, or — behind a proxy with `KAIROS_TRUSTED_PROXY_CIDRS` set — to the nearest **untrusted** hop of the forwarded chain, walked right-to-left so a caller's own prepended claim is never reached. **Not MET**, on three counts: (1) opt-in — `KAIROS_RATE_LIMIT` defaults off so header-mode/self-host are unchanged (ADR-0001/0002), so a public deployment must switch it on; (2) the counters are per-process, so N instances give N× the budget; (3) a budget keyed on an address is evaded by address rotation, so this caps one source, not a motivated attacker |
 
 ## 5. Privacy & legal
 

@@ -26,6 +26,7 @@ def create_app() -> FastAPI:
     from kairos.api import router as api_router
     from kairos.auth import peer_address, peer_is_trusted
     from kairos.public import router as public_router
+    from kairos.ratelimit import install as install_ratelimit
     from kairos.web import router as web_router
 
     app = FastAPI(
@@ -102,6 +103,12 @@ def create_app() -> FastAPI:
     app.include_router(api_router)
     app.include_router(web_router, include_in_schema=False)
     app.include_router(public_router, include_in_schema=False)
+
+    # Obligation A3 (#37): register the rejection handler for exhausted budgets.
+    # Registered unconditionally and inert while KAIROS_RATE_LIMIT is unset, so
+    # an unconfigured deployment behaves exactly as before.
+    install_ratelimit(app)
+
     app.mount(f"{P}/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 
     def _openapi_with_bearer():
