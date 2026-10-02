@@ -15,6 +15,17 @@ The seam is `RateLimiter.check`, which takes the limit and window as arguments
 and holds no settings of its own — swapping the dict for Redis or a SQL table
 is a change inside this file, not at the call sites.
 
+**What this does not stop: source-address rotation.** A budget keyed on an
+address is evaded by never reusing one. An attacker with an IPv6 /64 has ~2^64
+addresses and defeats every budget here trivially, which is why production
+limiters bind something the client cannot vary — a cookie, or an API key. The
+mitigation in scope is the *ceiling*, not the identity: the keyspace is bounded
+at `MAX_BUCKETS` so rotation cannot be turned into unbounded memory or CPU, and
+the budgets still cap how much a caller can do from **one** address, which is
+the polite-abuse and single-source-flood case this actually targets. Anything
+that needs to survive deliberate rotation is #51's problem to solve with the
+bearer key it already introduces — see the PR for the interaction.
+
 **Fail-open vs fail-closed.** Split by what can actually fail, because they are
 not the same failure:
 
@@ -41,7 +52,7 @@ import time
 from fastapi import Request
 
 from kairos import settings
-from kairos.auth import peer_address
+from kairos.auth import address_is_trusted, canonical_address, peer_address, peer_is_trusted
 
 log = logging.getLogger("kairos.ratelimit")
 
@@ -50,7 +61,10 @@ log = logging.getLogger("kairos.ratelimit")
 # unbounded-growth target unless it is trimmed.
 MAX_BUCKETS = 50_000
 
-_warned_no_peer = False
+# Unattributed requests (no peer in scope) cannot be charged to anyone. Counted,
+# not warned-once: a control that is silently inert is worse than one that is off.
+_no_peer_events = 0
+_NO_PEER_REWARN_EVERY = 1000
 
 
 class RateLimiter:
@@ -70,6 +84,15 @@ class RateLimiter:
     def __init__(self, max_buckets: int = MAX_BUCKETS):
         self._buckets: dict = {}  # (rule, key) -> (window_start, count, window)
         self._max_buckets = max_buckets
+        # Bounding memory must be amortised over the traffic that caused it.
+        # Sweeping whenever the table is full makes the cost per request
+        # O(len(table)) forever, once an attacker has filled it -- measured at
+        # ~4ms per request at 50k buckets, paid by *every* user behind the
+        # attacker. Once per `sweep_every` charges instead, it is ~8 element
+        # visits per request amortised regardless of table size.
+        self._sweep_every = max(1, max_buckets // 8)
+        self._charges_since_sweep = 0
+        self.sweeps = 0  # test-visible: how often the bound actually ran
         self._lock = threading.Lock()
 
     def check(
@@ -84,32 +107,45 @@ class RateLimiter:
             return True, 0
         now = time.monotonic() if now is None else now
         with self._lock:
-            if len(self._buckets) > self._max_buckets:
-                self._trim(now)
             bucket = (rule, key)
             start, count, width = self._buckets.get(bucket, (now, 0, window))
             if now - start >= width:
                 start, count = now, 0
             if count >= limit:
                 return False, max(1, math.ceil(width - (now - start)))
+            # pop-then-set so dict order is least-recently-charged first, which
+            # is the order both eviction paths below walk.
+            self._buckets.pop(bucket, None)
             self._buckets[bucket] = (start, count + 1, width)
+            if len(self._buckets) > self._max_buckets:
+                # Hard ceiling. O(1) amortised: evict exactly as many entries as
+                # this insert added, never a scan and never a sort. This is the
+                # path that runs on *every* request once an attacker has filled
+                # the table, so it has to be O(1) -- it is not, an earlier version
+                # swept the whole 50k-entry table here and cost ~4ms per request
+                # that every user behind the attacker then paid.
+                while len(self._buckets) > self._max_buckets:
+                    del self._buckets[next(iter(self._buckets))]
+                # Reclaiming the expired ones in bulk is quality-of-eviction, not
+                # a memory requirement, so it is amortised over traffic instead.
+                self._charges_since_sweep += 1
+                if self._charges_since_sweep >= self._sweep_every:
+                    self._charges_since_sweep = 0
+                    self.sweeps += 1
+                    self._sweep_expired(now)
         return True, 0
 
-    def _trim(self, now: float) -> None:
-        """Drop expired buckets; if still over cap, drop the oldest.
+    def _sweep_expired(self, now: float) -> None:
+        """Drop every window that has already turned over. Caller holds the lock.
 
-        Caller holds the lock. Dropping the oldest first is safe because those
-        windows are closest to resetting anyway — a trimmed caller gets one more
-        request, not unlimited ones, and only above 50k distinct keys.
+        O(len(table)), which is why it is amortised rather than run per request.
+        It exists so the O(1) eviction in `check` usually sheds an expired window
+        instead of a live one: a table only overflows in the first place if the
+        caller is churning through distinct addresses, and those windows are
+        mostly stale by the time the cap is reached.
         """
         stale = [k for k, (start, _, width) in self._buckets.items() if now - start >= width]
         for bucket in stale:
-            del self._buckets[bucket]
-        if len(self._buckets) <= self._max_buckets:
-            return
-        overflow = len(self._buckets) - self._max_buckets
-        oldest = sorted(self._buckets, key=lambda k: self._buckets[k][0])[:overflow]
-        for bucket in oldest:
             del self._buckets[bucket]
 
     def reset(self) -> None:
@@ -130,31 +166,85 @@ class RateLimited(Exception):
         self.retry_after = retry_after
 
 
+def forwarded_client(request: Request) -> str | None:
+    """The nearest hop in the forwarded chain that one of *our* proxies did not assert.
+
+    Only consulted when the transport peer is trusted **and** an allowlist is
+    configured. Without an allowlist there is nothing that says which hop to
+    believe, so the header stays caller-supplied and is ignored entirely.
+
+    Why right-to-left, and why that is not rotation-attackable: XFF is built by
+    *appending*, so a request that reached us through two of our proxies reads
+    `<client-claim>, <ip-proxy-a-saw>, <ip-proxy-b-saw>`, and the right-hand
+    entries are the ones written by the hops closest to us. An attacker's own
+    contribution can only be at the **left** end -- they send a header, our proxy
+    appends the address it actually saw. So walking from the right and skipping
+    addresses inside our allowlist always lands on a value asserted by our own
+    nearest proxy about a socket it directly held; the attacker's value is never
+    reached. It could only be reached if a proxy *replaced* the header instead of
+    appending, which is a proxy misconfiguration rather than caller input, and is
+    the same class of hazard the `proxy_headers` warning already names.
+
+    Walking from the left instead would hand back the attacker's own claim --
+    precisely the rotation this control exists to stop.
+    """
+    if not settings.TRUSTED_PROXY_NETWORKS or not peer_is_trusted(request):
+        return None
+    for hop in reversed(request.headers.get("x-forwarded-for", "").split(",")):
+        hop = hop.strip()
+        if hop and not address_is_trusted(hop):
+            return hop
+    # Every hop is inside the allowlist (or the header is absent): there is no
+    # untrusted hop to name, so the caller falls back to the peer.
+    return None
+
+
 def caller_key(request: Request) -> str | None:
     """The identity the budget is charged to, or None if there is not one.
 
-    Always the real transport peer, never X-Forwarded-For: that header is
-    attacker-controlled, so keying on it would make the budget one the caller
-    sets themselves. Same rule, same reason as `peer_is_trusted`.
+    The real transport peer -- never a bare `X-Forwarded-For`, because that header
+    is attacker-controlled and keying on it would make the budget one the caller
+    sets for themselves.
 
-    Returns None when the ASGI scope carries no client address — a unix-socket
-    listener, or a TestClient. Such a caller is not attributable, and folding
-    every local request into one shared bucket would break the operator's own
-    deployment, which is the regression ADR-0001/0002 forbid. Unattributable
-    means unlimited here, loudly.
+    Behind a reverse proxy the peer is the *proxy's* socket address for every
+    single request, so keying on it alone would hand the whole deployment one
+    shared budget: every user behind that proxy would spend the same `create`
+    10/min and the same `send` 10/hour. Not hypothetical -- TLS termination in
+    front is universal, and the README tells operators Kairos sits behind
+    "whatever reverse proxy you already run". So when the peer is trusted and an
+    allowlist is configured, the nearest untrusted forwarded hop identifies the
+    caller instead. See `forwarded_client`.
+
+    Returns None when the ASGI scope carries no client address (a unix-socket
+    listener). Such a caller is not attributable, and folding every local request
+    into one shared bucket would break the operator's own deployment, which is the
+    regression ADR-0001/0002 forbid. Unattributable means unlimited here, loudly
+    and repeatedly -- see `_note_unattributable`.
     """
-    global _warned_no_peer
     peer = peer_address(request)
     if peer is None:
-        if not _warned_no_peer:
-            _warned_no_peer = True
-            log.warning(
-                "cannot rate limit: this request carries no transport peer "
-                "(unix-socket listener?). It is allowed through; a public TCP "
-                "deployment always has a peer address."
-            )
+        _note_unattributable()
         return None
-    return peer
+    return canonical_address(forwarded_client(request) or peer)
+
+
+def _note_unattributable() -> None:
+    """Warn about traffic that cannot be charged to anyone, and keep a count.
+
+    Warn-once was too quiet: the condition is nearly always a deployment mistake
+    (a unix-socket listener where a TCP one was expected) that nobody notices for
+    weeks, and a control that is silently inert is worse than one that is switched
+    off. Re-warn periodically so a long-lived process still says something.
+    """
+    global _no_peer_events
+    _no_peer_events += 1
+    if _no_peer_events <= 3 or _no_peer_events % _NO_PEER_REWARN_EVERY == 0:
+        log.warning(
+            "cannot rate limit: request #%d carries no transport peer "
+            "(unix-socket listener?). Allowed through unattributed; a public TCP "
+            "deployment always has a peer address.",
+            _no_peer_events,
+        )
 
 
 class rate_limit:  # lower-case so call sites read `Depends(rate_limit("..."))`

@@ -28,7 +28,7 @@ import pytest
 from fastapi.responses import HTMLResponse
 from fastapi.testclient import TestClient
 
-from kairos import main, ratelimit, settings
+from kairos import main, ratelimit, settings, templating
 from kairos.ratelimit import MAX_BUCKETS, RateLimiter, caller_key, rate_limit
 
 REPO = Path(__file__).resolve().parents[1]
@@ -39,19 +39,22 @@ REPO = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(autouse=True)
 def _clean_limiter(monkeypatch):
-    """Every test starts with an empty counter table and the warning latch down."""
+    """Every test starts with an empty counter table and a fresh unattributed count."""
     ratelimit.limiter.reset()
-    monkeypatch.setattr(ratelimit, "_warned_no_peer", False)
+    monkeypatch.setattr(ratelimit, "_no_peer_events", 0)
+    monkeypatch.setattr(ratelimit.limiter, "sweeps", 0)
     yield
     ratelimit.limiter.reset()
 
 
 @pytest.fixture
 def on(monkeypatch):
-    """Limits enabled with small, test-sized budgets.
+    """Limits enabled with budgets small enough to exhaust inside a test.
 
-    Deliberately not "one rule, tiny count": the shipped defaults must be
-    exercised too, or a test that passes at 3/minute says nothing about 120.
+    These are NOT the shipped numbers, and a test that passes at 3/minute says
+    nothing about whether 300/minute is right. The shipped values are checked
+    separately, against the thing they are sized for: `shipped` below, and
+    `test_a_full_week_agent_sweep_fits_in_one_budget`.
     """
     monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
     monkeypatch.setattr(
@@ -86,15 +89,35 @@ def no_db(monkeypatch):
                         lambda *a, **k: HTMLResponse("MISSING", status_code=404))
 
 
+@pytest.fixture
+def shipped(monkeypatch):
+    """Limits enabled at the SHIPPED numbers, untouched.
+
+    The `on` fixture shrinks every budget so a test can exhaust one in a few
+    requests. That makes those tests blind to whether the shipped numbers are
+    right, so anything that is *about* a shipped number uses this instead.
+    """
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    assert settings.RATE_LIMITS == settings.DEFAULT_RATE_LIMITS
+
+
 def client_from(peer: str | None) -> TestClient:
     """A TestClient whose ASGI scope reports `peer` as the transport address."""
     return TestClient(main.app, base_url="https://testserver", client=(peer, 51000) if peer else None)
 
 
 def request_from(peer: str | None, headers: dict | None = None):
+    """A minimal Request carrying a chosen ASGI scope and headers.
+
+    Keys are lower-cased on the way in: Starlette's `Headers(raw=...)` compares
+    the *raw* bytes against `key.lower()`, so a mixed-case key silently never
+    matches. Without this, a header written "X-Forwarded-For" looks absent here
+    while being present on a real request -- which is how the first version of
+    the two-proxy chain test "passed" against a header the code never saw.
+    """
     from starlette.datastructures import Headers
 
-    raw = [(k.encode(), v.encode()) for k, v in (headers or {}).items()]
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     scope = {
         "type": "http",
         "method": "GET",
@@ -287,22 +310,39 @@ PROTECTED = {
 # `/v/<code>` is a single indexed SELECT. The `/api/*` surface is #51's.
 UNLIMITED = {
     ("GET", "/scheduler/p/"): "prefix of the token routes above",
-    ("GET", "/scheduler/health"): "SELECT 1, exempt from the proxy allowlist too",
+    ("GET", "/scheduler/health"): "SELECT 1; exempt from the proxy allowlist too",
     ("GET", "/scheduler/llms.txt"): "static text",
     ("GET", "/scheduler/robots.txt"): "static text",
-    ("GET", "/scheduler/v/{code}"): "one indexed SELECT, no render",
-    ("GET", "/scheduler/"): "owner dashboard, auth-gated",
-    ("GET", "/scheduler/new"): "owner page, auth-gated",
-    ("GET", "/scheduler/polls/{poll_id}"): "owner page, auth-gated",
-    ("GET", "/scheduler/polls/{poll_id}/edit"): "owner page, auth-gated",
-    ("POST", "/scheduler/polls/{poll_id}/edit"): "edits existing rows, auth-gated",
-    ("POST", "/scheduler/polls/{poll_id}/close"): "auth-gated",
-    ("POST", "/scheduler/polls/{poll_id}/reopen"): "auth-gated",
-    ("POST", "/scheduler/polls/{poll_id}/decide"): "auth-gated",
-    ("POST", "/scheduler/polls/{poll_id}/participants/update"): "edits existing rows, auth-gated",
-    ("POST", "/scheduler/polls/{poll_id}/participants/remove"): "auth-gated",
-    ("POST", "/scheduler/notifications/read-all"): "own notifications, auth-gated",
-    ("GET", "/scheduler/polls/{poll_id}/event.ics"): "owner page, auth-gated",
+    ("GET", "/scheduler/v/{code}"): "one indexed SELECT and a redirect; no render, no send",
+
+    # Everything below is an *owner* route. Deliberately not limited, and the
+    # defensible reason is NOT "it is auth-gated" -- `AUTH_MODE` defaults to
+    # `demo`, where get_user() returns DEMO_USER for everyone and the CSRF token
+    # is worthless, so in the shipped default these are exactly as open as the
+    # public ones. The real argument:
+    #
+    #   * The owner surface does not touch a third party. `create`, `invite` and
+    #     `send` are limited because they grow the participants table and open an
+    #     SMTP connection; these only read rows or rewrite rows an owner already
+    #     owns, so the abuse ceiling they add is the DB, not anyone's inbox.
+    #   * They are keyed by owner identity, not by address. An IP budget on them
+    #     would spend one shared bucket on everyone behind a NAT -- an office, a
+    #     campus, ETH -- and lock out a legitimate organizer mid-poll. That is a
+    #     self-inflicted outage bought against no attacker.
+    #   * The hosted answer for owner routes is capability auth (#30) and A1/A2,
+    #     not IP limiting. #51 adds the per-key tiering for the API surface.
+    ("GET", "/scheduler/"): "owner dashboard; reads rows",
+    ("GET", "/scheduler/new"): "owner form; renders the picker",
+    ("GET", "/scheduler/polls/{poll_id}"): "owner view; reads rows",
+    ("GET", "/scheduler/polls/{poll_id}/edit"): "owner form; reads rows",
+    ("POST", "/scheduler/polls/{poll_id}/edit"): "edits slots on a poll the caller owns",
+    ("POST", "/scheduler/polls/{poll_id}/close"): "state change on a poll the caller owns",
+    ("POST", "/scheduler/polls/{poll_id}/reopen"): "state change on a poll the caller owns",
+    ("POST", "/scheduler/polls/{poll_id}/decide"): "state change on a poll the caller owns",
+    ("POST", "/scheduler/polls/{poll_id}/participants/update"): "edits rows the caller owns",
+    ("POST", "/scheduler/polls/{poll_id}/participants/remove"): "deletes rows the caller owns",
+    ("POST", "/scheduler/notifications/read-all"): "the caller's own notifications",
+    ("GET", "/scheduler/polls/{poll_id}/event.ics"): "owner download of a poll's own .ics",
 }
 
 
@@ -388,16 +428,27 @@ def test_a_zero_count_disables_that_rule():
     assert all(lim.check("r", 0, 60, f"k{i}")[0] for i in range(1000))
 
 
-def test_the_bucket_table_stays_bounded_under_key_rotation():
+def test_the_bucket_table_stays_bounded_when_every_bucket_is_live():
     """Source addresses are caller-chosen, so the table is a memory-growth target.
 
-    Without a trim, a rotation of source addresses grows a dict until the
-    process dies — which is the limiter becoming the outage.
+    `now` is held CONSTANT, which is the realistic burst: a rotation of source
+    addresses arriving inside a single window. An earlier version of this test
+    advanced `now` by 1.0 per request against a 60s window, so every bucket was
+    already stale by the time the cap was reached and only the cheap stale-sweep
+    branch ever ran — it passed without ever exercising the live-window path.
     """
     lim = RateLimiter(max_buckets=100)
     for i in range(5000):
-        lim.check("read", 10, 60, f"10.0.{i // 256}.{i % 256}", now=float(i))
+        lim.check("read", 10, 60, f"10.0.{i // 256}.{i % 256}", now=0.0)
     assert len(lim._buckets) <= 100
+
+
+def test_the_table_stays_bounded_when_no_window_ever_expires():
+    """The adversarial shape: a full table of live buckets that never age out."""
+    lim = RateLimiter(max_buckets=50)
+    for i in range(2000):
+        lim.check("read", 10, 3600, f"10.0.{i // 256}.{i % 256}", now=0.0)
+    assert len(lim._buckets) <= 50
 
 
 def test_trimming_prefers_the_windows_that_are_about_to_reset():
@@ -410,6 +461,37 @@ def test_trimming_prefers_the_windows_that_are_about_to_reset():
     lim.check("r", 5, 60, "newest", now=58.0)  # table is now over cap -> trims
     assert "old" not in lim._buckets
     assert {"mid", "fresh"} <= {key for _, key in lim._buckets}
+
+
+def test_trimming_evicts_the_least_recently_charged_without_sorting():
+    """Eviction must not order the whole table.
+
+    The sweep dropped a 50k-element `sorted` on the request path: an attacker
+    triggers it once by filling the table, and then every user behind them pays
+    for it forever. Eviction is now `islice` over least-recently-charged order —
+    O(overflow), no sort.
+    """
+    lim = RateLimiter(max_buckets=4)
+    for i in range(8):
+        lim.check("r", 5, 3600, f"k{i}", now=0.0)
+    assert "k0" not in lim._buckets  # least recently charged, evicted first
+    assert {"k6", "k7"} <= {key for _, key in lim._buckets}
+
+
+def test_trimming_is_amortized_not_paid_per_request():
+    """Once the table is full, sweeping on every request is a CPU amplifier:
+    measured at ~4ms per request at 50k buckets, paid by every user behind
+    whoever filled it. It must run at most once per `sweep_every` charges.
+    """
+    lim = RateLimiter(max_buckets=1000)  # sweep_every == 125
+    for i in range(1000):
+        lim.check("read", 10, 3600, f"seed{i}", now=0.0)
+    before = lim.sweeps
+    for i in range(5000):
+        lim.check("read", 10, 3600, f"k{i % 900}", now=0.0)
+    # 5000 charges at one sweep per 125 is ~40 sweeps, not 5000.
+    assert lim.sweeps - before <= 5000 // lim._sweep_every + 1
+    assert lim._sweep_every == 125
 
 
 def test_trimming_clears_expired_windows_before_live_ones():
@@ -458,19 +540,31 @@ def test_an_internal_fault_fails_open_and_says_so(on, monkeypatch, caplog, no_db
     assert "rate limiter failed" in caplog.text
 
 
-def test_an_unattributable_caller_is_admitted_and_warns_once(on, monkeypatch, caplog):
+def test_an_unattributable_caller_is_admitted_and_says_so(on, monkeypatch, caplog):
     """A scope with no client address (unix-socket listener) cannot be attributed.
 
     Folding every local request into one shared bucket would break the
     operator's own deployment — the exact regression ADR-0001/0002 forbid — so
-    such a caller is unlimited, and says so once rather than on every request.
+    such a caller is unlimited.
     """
     monkeypatch.setattr(ratelimit.limiter, "check", lambda *_a, **_k: (False, 42))
     assert caller_key(request_from(None)) is None
     with caplog.at_level("WARNING", logger="kairos.ratelimit"):
         for _ in range(3):
             assert rate_limit("read")(request_from(None)) is None
-    assert caplog.text.count("no transport peer") == 1
+    assert caplog.text.count("no transport peer") == 3
+
+
+def test_the_unattributable_warning_does_not_go_silent_forever(on, caplog):
+    """Warn-once was the wrong shape: the cause is a deployment mistake nobody
+    notices for weeks, and a control that is silently inert is worse than one
+    that is switched off. A long-lived process must keep saying something."""
+    with caplog.at_level("WARNING", logger="kairos.ratelimit"):
+        for _ in range(ratelimit._NO_PEER_REWARN_EVERY + 5):
+            caller_key(request_from(None))
+    # The first few, then the periodic re-warn — not 1000 identical lines.
+    assert caplog.text.count("no transport peer") == 3 + 1
+    assert "#1000" in caplog.text
 
 
 def test_an_empty_budget_never_rejects(on, monkeypatch):
@@ -658,11 +752,16 @@ def test_the_dependency_raises_a_transport_agnostic_signal(on):
     assert caught.value.retry_after == 60
 
 
-def test_the_default_bucket_cap_is_finite_and_sane():
-    """An unbounded keyspace is a memory-exhaustion vector: source addresses are
-    caller-chosen, so every request can arrive under a new one."""
-    assert RateLimiter()._max_buckets == MAX_BUCKETS
-    assert 0 < MAX_BUCKETS <= 100_000
+def test_the_default_bucket_cap_is_a_real_ceiling_not_a_slack_estimate():
+    """The shipped limiter must hold its own table to MAX_BUCKETS, on the live
+    path, with `now` pinned so nothing expires. (An earlier version asserted
+    `0 < MAX_BUCKETS <= 100_000` — a range the test itself chose, which can only
+    ever fail if someone edits the test.)
+    """
+    lim = RateLimiter()
+    for i in range(MAX_BUCKETS + 500):
+        lim.check("read", 10, 3600, f"10.0.{i // 256}.{i % 256}", now=0.0)
+    assert len(lim._buckets) <= MAX_BUCKETS
 
 
 # -- the load-bearing uvicorn setting, measured over a real socket ----------
@@ -744,3 +843,232 @@ def test_enabling_limits_warns_about_the_proxy_headers_dependency(on, caplog):
     with caplog.at_level("WARNING", logger="kairos.ratelimit"):
         create_app()
     assert "proxy_headers=False" in caplog.text
+
+
+# -- behind a reverse proxy: one shared bucket is NOT a rate limit ------------
+
+
+@pytest.fixture
+def proxying(monkeypatch):
+    """A deployment behind a trusted reverse proxy (the README's own topology).
+
+    TLS termination in front is universal, so this is the normal hosted shape,
+    not an edge case: `scope["client"]` is the *proxy's* address on every request.
+    """
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS", dict.fromkeys(settings.DEFAULT_RATE_LIMITS, (3, 60)))
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_CIDRS", "127.0.0.0/8")
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", settings._parse_networks("127.0.0.0/8", "T"))
+
+
+def test_a_trusted_proxy_does_not_collapse_every_user_into_one_budget(proxying, no_db):
+    """The bug this fixes, stated as a test.
+
+    Eight genuinely distinct client addresses, all forwarded by one trusted
+    proxy. Keyed on the peer, clients 4..8 would all be refused -- different
+    humans sharing one budget, and at shipped defaults `create` 10/min and `send`
+    10/hour would be the whole instance's allowance.
+    """
+    c = client_from("127.0.0.1")  # the proxy's socket, identical every request
+    statuses = []
+    for host in ("203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"):
+        statuses.append(c.get("/scheduler/p/tok", headers={"X-Forwarded-For": host}).status_code)
+    assert statuses == [404, 404, 404, 404], "each distinct client gets its own budget"
+
+
+def test_a_repeated_client_behind_a_trusted_proxy_is_still_limited(proxying, no_db):
+    """Separating users must not make each one unlimited."""
+    c = client_from("127.0.0.1")
+    headers = {"X-Forwarded-For": "203.0.113.7"}
+    assert [c.get("/scheduler/p/tok", headers=headers).status_code for _ in range(5)] == [
+        404, 404, 404, 429, 429,
+    ]
+
+
+def test_the_chain_is_walked_right_to_left_so_a_prepended_claim_is_ignored(proxying, no_db):
+    """THE property. This is why the implementation is not rotation-attackable.
+
+    XFF is built by appending, so anything a caller sends sits at the LEFT end
+    and our own proxy's observation of the real socket is appended to its right.
+    Walking from the right and skipping allowlisted hops therefore always lands
+    on what our nearest proxy actually saw, and never on the caller's claim.
+
+    Walking from the left -- the intuitive direction -- would return the caller's
+    claim and hand back exactly the rotation this control exists to stop.
+    """
+    c = client_from("127.0.0.1")
+    statuses = [
+        c.get("/scheduler/p/tok",
+              headers={"X-Forwarded-For": f"10.9.9.{i}, 203.0.113.7"}).status_code
+        for i in range(5)
+    ]
+    # The rotating left-hand values are ignored; all five are the same client.
+    assert statuses == [404, 404, 404, 429, 429]
+
+
+def test_a_chain_through_two_of_our_proxies_resolves_to_the_real_caller(proxying, no_db):
+    """`claim, ip-proxy-a-saw, ip-proxy-b-saw`.
+
+    Right-to-left: 127.0.0.5 is inside the allowlist so it is one of ours and is
+    skipped; 198.51.100.4 is the address proxy-b actually saw proxy-a's socket as,
+    and it is not ours, so that is the caller. The left-hand `10.9.9.9` claim is
+    never consulted.
+    """
+    headers = {"X-Forwarded-For": "10.9.9.9, 198.51.100.4, 127.0.0.5"}
+    assert caller_key(request_from("127.0.0.1", headers)) == "198.51.100.4"
+
+    # And it is one budget, not three: four requests on the same chain exhaust it.
+    c = client_from("127.0.0.1")
+    assert [c.get("/scheduler/p/tok", headers=headers).status_code for _ in range(4)] == [
+        404, 404, 404, 429,
+    ]
+
+
+def test_an_untrusted_peer_cannot_choose_its_own_key_via_the_chain(proxying):
+    """A caller who reaches the app directly supplies the whole header.
+
+    The chain is only consulted when the transport peer is trusted, so an
+    untrusted caller is keyed on its real peer and rotating the header buys it
+    nothing -- the property the previous implementation had, preserved.
+    """
+    for i in range(5):
+        req = request_from("203.0.113.7", {"x-forwarded-for": f"198.51.100.{i}"})
+        assert caller_key(req) == "203.0.113.7"
+
+
+def test_an_untrusted_peer_is_refused_outright_before_the_limiter_runs(proxying, no_db):
+    """And in a configured deployment such a request never reaches the limiter
+    at all -- S1's middleware 403s it at the edge (#47). So the keying rule
+    above is defence in depth, not the only thing standing there."""
+    c = client_from("203.0.113.7")
+    assert c.get("/scheduler/p/tok", headers={"X-Forwarded-For": "198.51.100.1"}).status_code == 403
+
+
+def test_no_allowlist_means_the_header_is_ignored_entirely(monkeypatch, no_db):
+    """With nothing configured there is no way to know which hop to believe, so
+    the header stays caller-supplied and is not used. This is the ETH/unconfigured
+    invariant: key on the peer, exactly as before."""
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS", dict.fromkeys(settings.DEFAULT_RATE_LIMITS, (3, 60)))
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", ())
+    c = client_from("203.0.113.7")
+    statuses = [
+        c.get("/scheduler/p/tok", headers={"X-Forwarded-For": f"198.51.100.{i}"}).status_code
+        for i in range(5)
+    ]
+    assert statuses == [404, 404, 404, 429, 429]
+
+
+def test_a_wholly_trusted_chain_falls_back_to_the_peer(proxying):
+    """Every hop is one of ours, so there is no untrusted hop to name."""
+    req = request_from("127.0.0.1", {"x-forwarded-for": "127.0.0.1, 127.0.0.2"})
+    assert caller_key(req) == "127.0.0.1"
+
+
+def test_an_empty_or_absent_chain_falls_back_to_the_peer(proxying):
+    for headers in ({}, {"x-forwarded-for": ""}, {"x-forwarded-for": " , "}):
+        assert caller_key(request_from("127.0.0.1", headers)) == "127.0.0.1"
+
+
+def test_one_host_cannot_hold_two_budgets_by_spelling_its_address_two_ways(proxying):
+    """`::ffff:203.0.113.7` and `203.0.113.7` are the same host.
+
+    A dual-stack listener reports IPv4 clients in the mapped form, so without the
+    fold a single caller would hold two budgets purely by which spelling the
+    socket happened to produce -- the same reason auth.py folds it for the
+    allowlist.
+    """
+    assert caller_key(request_from("::ffff:203.0.113.7")) == "203.0.113.7"
+    assert caller_key(request_from("203.0.113.7")) == caller_key(request_from("::ffff:203.0.113.7"))
+
+
+def test_a_unix_socket_path_is_kept_verbatim_as_a_key(monkeypatch):
+    """Not an IP, so there is nothing to fold -- but it must still be a usable
+    key rather than None (which would mean unlimited)."""
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", ())
+    assert caller_key(request_from("/tmp/kairos.sock")) == "/tmp/kairos.sock"
+
+
+# -- the shipped deeplink_vote number, against what it is sized for ----------
+
+
+def test_the_smallest_offered_increment_is_15_minutes():
+    """Guards the input to the arithmetic below. If someone adds a 5-minute
+    option, SLOTS_PER_DAY_AT_FINEST_OFFERED_INCREMENT is wrong and the sweep
+    test below would be checking the wrong number."""
+    import re
+
+    source = (Path(templating.TEMPLATES) / "new_poll.html").read_text()
+    increments = [int(v) for v in re.findall(r'<option value="(\d+)">', source)]
+    assert increments, "could not read the increment options out of new_poll.html"
+    assert min(increments) == 15
+    # 09:00 -> 17:00 in 15-minute steps.
+    assert settings.SLOTS_PER_DAY_AT_FINEST_OFFERED_INCREMENT == (17 - 9) * 60 // 15
+    assert settings.FULL_WEEK_SWEEP_VOTES == 224
+
+
+@pytest.fixture
+def big_poll(tmp_path, monkeypatch):
+    """A real full-week poll at the finest offered granularity: 32 x 7 = 224 slots.
+
+    This is the thing `deeplink_vote` is sized for, so the sweep has to be run
+    against an actual poll of that size, not a 2-slot fixture.
+    """
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/big.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
+
+    minute = 9 * 60
+    slots = []
+    for day in range(7):  # a week
+        for _ in range((17 - 9) * 60 // 15):  # 32 slots of 15 minutes
+            slots.append({"date": f"2026-07-{6 + day:02d}",
+                          "start_time": f"{minute // 60:02d}:{minute % 60:02d}",
+                          "end_time": f"{(minute + 15) // 60:02d}:{(minute + 15) % 60:02d}"})
+            minute += 15
+        minute = 9 * 60
+
+    from kairos.main import create_app
+    with TestClient(create_app(), base_url="https://testserver") as c:
+        c.headers["Authorization"] = "Bearer k"
+        poll = c.post("/scheduler/api/polls", json={
+            "title": "Big week", "mode": "time_slot", "creator": "alice", "slots": slots}).json()
+        assert len(poll["slots"]) == settings.FULL_WEEK_SWEEP_VOTES, len(poll["slots"])
+        from kairos.db import create_invite
+        itok = create_invite(poll["id"], "bob@x.ch", required=True, name="Bob")["token"]
+        yield SimplePoll(c, poll, {"token": itok})
+
+
+def test_a_full_week_agent_sweep_fits_in_one_budget_window(big_poll, shipped):
+    """The behavioural version of the arithmetic, and the test that matters.
+
+    `agent.json` hands an agent one vote URL per slot, so sweeping a poll costs
+    one request per slot. A week of 15-minute slots across the default 09:00-17:00
+    window is 32 x 7 = 224 slots. At the previously shipped 120/min that sweep was
+    impossible inside any single window -- and the old justification cited ADR-0010
+    for "~100 votes", a number ADR-0010 does not contain.
+
+    If this fails, either `deeplink_vote` was lowered below a realistic poll, or
+    the poll got bigger and the limit needs to follow.
+    """
+    limit, _window = settings.RATE_LIMITS["deeplink_vote"]
+    assert limit >= settings.FULL_WEEK_SWEEP_VOTES
+
+    c = client_from("203.0.113.7")
+    slots = big_poll.poll["slots"]
+    statuses = [c.get(f"/scheduler/p/i/{big_poll.itok}/s/{s['id']}/yes").status_code
+                for s in slots]
+    assert 429 not in statuses, f"sweep refused at request {statuses.index(429)}"
+    assert statuses == [200] * len(slots)
+    assert limit > len(slots), "the limit should still leave headroom over a full week"
+
+
+def test_the_budget_is_still_finite_after_a_full_sweep(big_poll, shipped):
+    """A sweep that fits must not mean an unlimited rule."""
+    c = client_from("203.0.113.7")
+    slot = big_poll.poll["slots"][0]["id"]
+    limit, _ = settings.RATE_LIMITS["deeplink_vote"]
+    for _ in range(limit + 5):
+        c.get(f"/scheduler/p/i/{big_poll.itok}/s/{slot}/yes")
+    assert c.get(f"/scheduler/p/i/{big_poll.itok}/s/{slot}/yes").status_code == 429

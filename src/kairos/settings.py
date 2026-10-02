@@ -114,14 +114,32 @@ IMAP_MAILBOX = os.environ.get("KAIROS_IMAP_MAILBOX", "INBOX")
 # is an operator decision (see README); this only makes the knob exist.
 RATE_LIMIT_ENABLED = os.environ.get("KAIROS_RATE_LIMIT", "off").strip().lower() in ("1", "on", "true", "yes")
 
-# Shipped defaults, per rule: (count, window seconds). Deliberately generous on
-# the respondent-facing rules — a legitimate agent sweep of a 15-minute-slot
-# week is ~100 votes (ADR-0010) — and tight on the ones that write rows or send
-# mail. Every value is overridable; none of them apply unless enabled.
+# The largest sweep `deeplink_vote` is sized for, derived from what the UI
+# offers rather than asserted:
+#   * 15 minutes is the SMALLEST increment in new_poll.html's slot-length select
+#   * the default window is 09:00-17:00 (web.py create_poll_submit) = 8 hours
+#   * 8h / 15min = 32 slots per day
+#   * a full week of days = 224 slots, and agent.json hands an agent one vote URL
+#     per slot, so a full-week sweep is 224 requests
+# This is a realistic worst case, NOT a maximum: the date picker is an
+# infinite-scroll calendar with no span cap, and `increment` is not validated on
+# POST, so a poll can be arbitrarily larger. No per-source budget can be derived
+# from a maximum that does not exist. A poll bigger than the budget needs either a
+# raised KAIROS_RATE_LIMIT_DEEPLINK_VOTE or a sweep spread over more than one
+# window; both are documented in the README.
+SLOTS_PER_DAY_AT_FINEST_OFFERED_INCREMENT = 32  # (17:00 - 09:00) / 15min
+FULL_WEEK_SWEEP_VOTES = SLOTS_PER_DAY_AT_FINEST_OFFERED_INCREMENT * 7
+
+# Shipped defaults, per rule: (count, window seconds). Generous on the
+# respondent-facing rules, tight on the ones that write rows or open an SMTP
+# connection. Every value is overridable; none apply unless enabled.
 DEFAULT_RATE_LIMITS = {
     "read": (120, 60),  # token pages: poll, invite, agent.json, feeds, .ics
     "respond": (20, 60),  # POST /p/<token>, POST /p/i/<token>
-    "deeplink_vote": (120, 60),  # GET .../s/<slot>/<yes|maybe|no> — one per slot
+    # One vote URL per slot, so an agent sweep of a poll costs len(slots)
+    # requests. Sized to clear FULL_WEEK_SWEEP_VOTES inside a single window;
+    # asserted against it in tests/test_ratelimit.py.
+    "deeplink_vote": (300, 60),
     "create": (10, 60),  # POST /new
     "invite": (30, 60),  # POST /polls/<id>/invite — grows the recipient list
     "send": (10, 3600),  # remind / remind-selected / email-decision — actual SMTP
