@@ -29,7 +29,13 @@ from kairos.db import (
     update_response_contact,
 )
 from kairos.dbconn import db_now
-from kairos.email_service import send_decision_email, send_invite_email, send_update_emails, webcal_from
+from kairos.email_service import (
+    send_decision_email,
+    send_invite_email,
+    send_update_emails,
+    sender_refusal,
+    webcal_from,
+)
 from kairos.helpers import (
     TIMEZONES,
     convergence,
@@ -44,6 +50,7 @@ from kairos.helpers import (
 )
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
+from kairos.ratelimit import rate_limit
 from kairos.templating import render
 
 P = settings.PREFIX
@@ -68,7 +75,26 @@ _MSG_TEXT = {
     "saved": "Poll updated.",
     "reopened": "Poll reopened — it accepts responses again.",
     "mailfail": "Email not sent — SMTP is not configured or no recipient has an email address.",
+    # Obligation M1: a refused sender is a different problem from an unconfigured
+    # one, and telling an operator their SMTP is missing when it is set correctly
+    # sends them to the wrong knob. Deliberately carries no addresses: in a hosted
+    # deployment the person reading this is a poll owner, not the operator. The
+    # specific reason is already in the server log at ERROR.
+    "mailblocked": "Email not sent — this deployment’s outbound mail is blocked by "
+                    "its mail-identity policy (the sending address is not authorised for "
+                    "this domain). See the server log for the reason.",
 }
+
+
+def _mail_failure_msg() -> str:
+    """Which flash key explains a send that produced nothing.
+
+    A refusal takes precedence over mailfail: if the M1 gate is blocking, then SMTP being
+    configured or not is beside the point, and mailfail would name the wrong cause. The
+    refusal is a process-wide condition, so consulting it here cannot mislead when the
+    real reason was an empty recipient list.
+    """
+    return "mailblocked" if sender_refusal() else "mailfail"
 
 
 def _msg_text(query_params) -> str | None:
@@ -182,9 +208,20 @@ def dashboard(request: Request):
 
     polls = list_polls(user["uid"])
     for poll_row in polls:
-        poll_row["conv"] = convergence(poll_row, get_responses(poll_row["id"]),
-                                       get_invites(poll_row["id"]))
-        poll_row["invite_count"] = len(get_invites(poll_row["id"]))
+        # Fetch invites once and reuse. This called get_invites() twice per poll
+        # with identical arguments -- once for convergence, once for invite_count.
+        # Measured against real SQLite: the dashboard costs 3N+2 SQL statements
+        # for N polls (was 4N+2), see tests/test_dashboard_queries.py.
+        #
+        # That is a real saving and NOT the fix for hosted. 3N+2 still exhausts
+        # the Cloudflare free tier's 50 D1 subrequests per invocation at 16 polls
+        # with no responses, and at 8 polls once each poll has any responses,
+        # because list_polls() also runs a COUNT(*) per poll. Hosted needs
+        # convergence denormalised onto sched_polls (making this 1 query) or the
+        # grid loaded per poll as a JS island. Tracked in PLAN.md.
+        invites = get_invites(poll_row["id"])
+        poll_row["conv"] = convergence(poll_row, get_responses(poll_row["id"]), invites)
+        poll_row["invite_count"] = len(invites)
 
     return render(env, "dashboard.html", user=user, title="Kairos",
                   polls=polls, **_nav_ctx(user))
@@ -200,7 +237,8 @@ def new_poll_page(request: Request):
 
 
 @router.post("/new")
-def create_poll_submit(request: Request, form=Depends(form_data)):
+def create_poll_submit(request: Request, form=Depends(form_data),
+                       _=Depends(rate_limit("create"))):
     user = get_user(request)
     if not user:
         return _login_or_401(f"{P}/new")
@@ -528,7 +566,8 @@ def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 �
 
 
 @router.post("/polls/{poll_id}/remind-selected")
-def remind_selected(poll_id: str, request: Request, form=Depends(form_data)):
+def remind_selected(poll_id: str, request: Request, form=Depends(form_data),
+                    _=Depends(rate_limit("send"))):
     """Operator-picked addresses: bypasses idempotency gating (still logged)."""
     user, poll = _owner_action(request, form, poll_id)
     if poll["status"] != "open":
@@ -538,14 +577,16 @@ def remind_selected(poll_id: str, request: Request, form=Depends(form_data)):
         return RedirectResponse(f"{P}/polls/{poll_id}?msg=nonudge", status_code=302)
     counts = nudge_participants(request, poll, user, only_emails=emails, force=True)
     if not (counts["invited"] or counts["updated"]):
-        return RedirectResponse(f"{P}/polls/{poll_id}?msg=mailfail", status_code=302)
+        return RedirectResponse(f"{P}/polls/{poll_id}?msg={_mail_failure_msg()}",
+                                status_code=302)
     return RedirectResponse(
         f"{P}/polls/{poll_id}?msg=nudged&inv={counts['invited']}&upd={counts['updated']}",
         status_code=302)
 
 
 @router.post("/polls/{poll_id}/remind")
-def remind_participants(poll_id: str, request: Request, form=Depends(form_data)):
+def remind_participants(poll_id: str, request: Request, form=Depends(form_data),
+                        _=Depends(rate_limit("send"))):
     user, poll = _owner_action(request, form, poll_id)
     if poll["status"] != "open":
         raise HTTPException(400, "Poll is not open")
@@ -569,7 +610,8 @@ def poll_ics(poll_id: str, request: Request):
 
 
 @router.post("/polls/{poll_id}/email-decision")
-def email_decision(poll_id: str, request: Request, form=Depends(form_data)):
+def email_decision(poll_id: str, request: Request, form=Depends(form_data),
+                   _=Depends(rate_limit("send"))):
     user, poll = _owner_action(request, form, poll_id)
     slot = decided_slot_of(poll)
     if not slot:
@@ -589,12 +631,14 @@ def email_decision(poll_id: str, request: Request, form=Depends(form_data)):
     for email in sent:
         log_contact(poll_id, email, "decision")
     if not sent:
-        return RedirectResponse(f"{P}/polls/{poll_id}?msg=mailfail", status_code=302)
+        return RedirectResponse(f"{P}/polls/{poll_id}?msg={_mail_failure_msg()}",
+                                status_code=302)
     return RedirectResponse(f"{P}/polls/{poll_id}?msg=emailed&n={len(sent)}", status_code=302)
 
 
 @router.post("/polls/{poll_id}/invite")
-def invite_submit(poll_id: str, request: Request, form=Depends(form_data)):
+def invite_submit(poll_id: str, request: Request, form=Depends(form_data),
+                  _=Depends(rate_limit("invite"))):
     user, poll = _owner_action(request, form, poll_id)
     email = valid_email(form.get("email", ""))
     if not email:

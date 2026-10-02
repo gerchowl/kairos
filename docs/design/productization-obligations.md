@@ -20,7 +20,7 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 
 | # | Obligation | Source | Enforce | Status |
 |---|---|---|---|---|
-| S1 | Owner identity comes only from a **trusted** proxy; header-auth must not trust arbitrary upstreams | ADR-0002 | CONFIG + RUNTIME (trusted-proxy allowlist) | PARTIAL — allowlist PLANNED |
+| S1 | Owner identity comes only from a **trusted** proxy; header-auth must not trust arbitrary upstreams | ADR-0002 | CONFIG + RUNTIME (trusted-proxy allowlist) | **PARTIAL** (#47) — `KAIROS_TRUSTED_PROXY_CIDRS` enforces at the edge (403 + log), and `proxy_headers=False` stops uvicorn rewriting the peer from a caller-supplied header. **Not MET**: the control is opt-in, so the default is fail-open (trust every peer), and `KAIROS_AUTH` still defaults to `demo`. Making it default-on under header mode is the remaining step — blocked on the duplet adapter (a different repo) which may launch uvicorn itself |
 | S2 | `SESSION_SECRET` required outside demo; refuse to boot without it | ADR-0003 | RUNTIME (fail-closed) | MET |
 | S3 | Capability tokens are unguessable (`token_urlsafe(32)`) and never logged | ADR-0001 | RUNTIME + no-secret-in-logs | MET (entropy); PARTIAL (log audit) |
 | S4 | No secrets committed to git | — | GATE (gitleaks, pre-commit + CI full-history) | MET |
@@ -41,7 +41,7 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 
 | # | Obligation | Source | Enforce | Status |
 |---|---|---|---|---|
-| M1 | Outbound is authenticated from our domain (SPF/DKIM/DMARC), never a personal Gmail | — | EXTERNAL + CONFIG | PLANNED |
+| M1 | Outbound is authenticated from our domain (SPF/DKIM/DMARC), never a personal Gmail | ADR-0011 | EXTERNAL + CONFIG + RUNTIME | **PARTIAL** (#48) — `KAIROS_HOSTED` + `KAIROS_FROM_DOMAIN` make a hosted deployment **refuse to send** (one logged refusal per process, enforced in the single `is_configured()` predicate every send path already consults) unless `SMTP_FROM` and `KAIROS_IMIP_ORGANIZER` are mailboxes on the declared domain — never a consumer provider. Each boot logs the identity it will send as. **Not MET**: the DNS half is entirely the operator's and unstarted — SPF/DKIM/DMARC are unpublished, no provider chosen. Kairos cannot read DNS, so it verifies that the identity *could* be authenticated, never that it *is*. **The sharpest residual risk, and the most likely state:** `KAIROS_HOSTED=1` + a correct `KAIROS_FROM_DOMAIN` + an on-domain `SMTP_FROM` + **zero DNS records published** passes every check and sends on-domain mail that is entirely unauthenticated and looks legitimate — so a green boot line is not evidence the records exist. M1 also does not protect reputation by itself: the phishing threat needs recipients to *receive* the mail (A2/#51), and what actually destroys a domain is the spam-complaint rate (A3), both volume properties. Operator-side runbook, records and staged DMARC plan: `docs/design/mail-auth.md` |
 | M2 | Inbound iMIP replies parsed **fail-closed** (known UID + known invite + fresh SEQUENCE) | ADR-0005 | RUNTIME + CI (fixtures) | MET |
 | M3 | Inbound transport pluggable (IMAP poll **or** webhook) | #34 | CONFIG | PARTIAL (IMAP MET; webhook PLANNED #34) |
 | M4 | Bounces/complaints suppress the address (no repeat-send to dead inboxes) | — | RUNTIME + EXTERNAL | PLANNED |
@@ -53,7 +53,7 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 |---|---|---|---|---|
 | A1 | Poll creation gated by a human check (Turnstile) | #31 | RUNTIME + EXTERNAL | PLANNED (#31) |
 | A2 | No email sent to a **third party** until the creator's own email is verified (magic link opened) | ADR-0009, #31 | RUNTIME (`manage_verified_at`) | PLANNED (#31) |
-| A3 | Rate limits on public/email-sending endpoints (respond, invite, deep-link vote) | #37 | RUNTIME | PLANNED (#37) |
+| A3 | Rate limits on public/email-sending endpoints (respond, invite, deep-link vote) | #37 | RUNTIME | **PARTIAL** (#37) — six named budgets (`read`, `respond`, `deeplink_vote`, `create`, `invite`, `send`) as a reusable `rate_limit` dependency. Charged to the real transport peer, or — behind a proxy with `KAIROS_TRUSTED_PROXY_CIDRS` set — to the nearest **untrusted** hop of the forwarded chain, walked right-to-left so a caller's own prepended claim is never reached. **Not MET**, on three counts: (1) opt-in — `KAIROS_RATE_LIMIT` defaults off so header-mode/self-host are unchanged (ADR-0001/0002), so a public deployment must switch it on; (2) the counters are per-process, so N instances give N× the budget; (3) a budget keyed on an address is evaded by address rotation, so this caps one source, not a motivated attacker |
 
 ## 5. Privacy & legal
 
@@ -144,8 +144,10 @@ actually taken; a real registrar check is required before buying.)
 `kairos.*` is effectively gone (common Greek word); premium asks are steep
 (`kairos.xyz` $399k, `kairos.tech` $12k, `kairos.so` $3.9k).
 
-Mail (M1) needs DKIM/DMARC on whichever is chosen; a non-Gmail organizer here is
-also what unblocks native Gmail RSVP (ADR-0006 / M5).
+Mail (M1) needs DKIM/DMARC published on the sending domain — the records, the staged
+DMARC plan and the verification steps are in
+[`mail-auth.md`](mail-auth.md). A non-Gmail organizer here is also what unblocks
+native Gmail RSVP (ADR-0006 / M5).
 
 ## Rollup
 
