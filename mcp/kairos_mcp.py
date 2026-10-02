@@ -32,10 +32,13 @@ KEY = os.environ.get("KAIROS_API_KEY", "")
 mcp = FastMCP("kairos")
 
 
+def api_url(path: str) -> str:
+    """Absolute URL for an API path, honouring the deployment's URL prefix."""
+    return f"{BASE}{PREFIX}/api{path}"
+
+
 def _req(method: str, path: str, **kwargs):
-    r = httpx.request(method, f"{BASE}{PREFIX}/api{path}",
-                      headers={"Authorization": f"Bearer {KEY}"},
-                      timeout=30, **kwargs)
+    r = httpx.request(method, api_url(path), headers={"Authorization": f"Bearer {KEY}"}, timeout=30, **kwargs)
     if r.status_code >= 400:
         return {"error": r.status_code, "detail": r.text[:500]}
     if r.headers.get("content-type", "").startswith("text/calendar"):
@@ -57,23 +60,42 @@ def get_poll(poll_id: str) -> dict:
 
 
 @mcp.tool()
-def create_poll(title: str, mode: str, slots: list[dict], description: str = "",
-                timezone: str = "Europe/Zurich", creator: str | None = None) -> dict:
+def create_poll(
+    title: str,
+    mode: str,
+    slots: list[dict],
+    description: str = "",
+    timezone: str = "Europe/Zurich",
+    creator: str | None = None,
+) -> dict:
     """Create a poll. mode: 'full_day' (slots: [{date}]) or 'time_slot'
     (slots: [{date, start_time, end_time}], HH:MM). Pass creator (account uid)
     so the poll appears on that user's dashboard. Returns share_url."""
-    return _req("POST", "/polls", json={
-        "title": title, "mode": mode, "slots": slots,
-        "description": description or None, "timezone": timezone, "creator": creator})
+    return _req(
+        "POST",
+        "/polls",
+        json={
+            "title": title,
+            "mode": mode,
+            "slots": slots,
+            "description": description or None,
+            "timezone": timezone,
+            "creator": creator,
+        },
+    )
 
 
 @mcp.tool()
-def update_poll(poll_id: str, title: str | None = None, description: str | None = None,
-                timezone: str | None = None, status: str | None = None) -> dict:
+def update_poll(
+    poll_id: str,
+    title: str | None = None,
+    description: str | None = None,
+    timezone: str | None = None,
+    status: str | None = None,
+) -> dict:
     """Edit title/description/timezone, or status 'closed' / 'open' (reopen
     clears a previous decision)."""
-    fields = {"title": title, "description": description,
-              "timezone": timezone, "status": status}
+    fields = {"title": title, "description": description, "timezone": timezone, "status": status}
     return _req("PATCH", f"/polls/{poll_id}", json={k: v for k, v in fields.items() if v is not None})
 
 
@@ -86,20 +108,21 @@ def add_dates(poll_id: str, dates: list[str], notify: bool = False) -> dict:
 
 
 @mcp.tool()
-def respond(poll_id: str, name: str, availabilities: dict[str, str],
-            email: str | None = None) -> dict:
+def respond(poll_id: str, name: str, availabilities: dict[str, str], email: str | None = None) -> dict:
     """Submit availability ({slot_id: yes|maybe|no}). With an email it upserts:
     re-submitting edits the same response."""
-    return _req("POST", f"/polls/{poll_id}/respond",
-                json={"name": name, "email": email, "availabilities": availabilities})
+    return _req(
+        "POST",
+        f"/polls/{poll_id}/respond",
+        json={"name": name, "email": email, "availabilities": availabilities},
+    )
 
 
 @mcp.tool()
 def invite(poll_id: str, emails: list[str], required: bool = True) -> dict:
     """Email personal invite links. required=False marks optional invitees —
     only required ones gate the convergence light."""
-    return _req("POST", f"/polls/{poll_id}/invite",
-                json={"emails": emails, "required": required})
+    return _req("POST", f"/polls/{poll_id}/invite", json={"emails": emails, "required": required})
 
 
 @mcp.tool()
@@ -107,8 +130,7 @@ def nudge(poll_id: str, emails: list[str] | None = None, force: bool = False) ->
     """Smart reminders, idempotent and safe to repeat: pending invitees (max
     once/day) and people who haven't seen newly added dates. Restrict with
     emails=[...]; force=True mails exactly those now (bypasses gating)."""
-    return _req("POST", f"/polls/{poll_id}/nudge",
-                json={"emails": emails, "force": force})
+    return _req("POST", f"/polls/{poll_id}/nudge", json={"emails": emails, "force": force})
 
 
 @mcp.tool()

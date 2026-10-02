@@ -10,4 +10,4 @@ site/playground/wheels/
 site/playground/wheels.json
 
 # Local agent tooling config (machine-specific Nix store paths) — not portable
-opencode.json
+/opencode.json
