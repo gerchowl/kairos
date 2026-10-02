@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.0](https://github.com/gerchowl/kairos/compare/v0.9.1...v0.10.0) (2026-10-02)
+
+
+### Features
+
+* **abuse:** rate limits on the public/email surface (obligation A3, [#37](https://github.com/gerchowl/kairos/issues/37)) ([#57](https://github.com/gerchowl/kairos/issues/57)) ([d650a79](https://github.com/gerchowl/kairos/commit/d650a79ed0e8f465ab3885f58d1d211b6f87cdc3))
+* **auth:** trusted-proxy allowlist (S1) + dashboard query budget + hosting decisions ([#55](https://github.com/gerchowl/kairos/issues/55)) ([c80e9b6](https://github.com/gerchowl/kairos/commit/c80e9b672310b521e2e833ca6b6a2361febb211c))
+* **deploy:** OCI image + compose topologies for self-hosting (D3/D4, [#35](https://github.com/gerchowl/kairos/issues/35)) ([#56](https://github.com/gerchowl/kairos/issues/56)) ([074c176](https://github.com/gerchowl/kairos/commit/074c176862bc130d414219c55159b249513ad586))
+* **mail:** fail-closed outbound identity gate + SPF/DKIM/DMARC runbook (M1, [#48](https://github.com/gerchowl/kairos/issues/48)) ([#58](https://github.com/gerchowl/kairos/issues/58)) ([dddedb0](https://github.com/gerchowl/kairos/commit/dddedb008fe2d6cd14f8432da0e984edfdba61b7))
+
+
+### Documentation
+
+* record SQLite decision, file [#51](https://github.com/gerchowl/kairos/issues/51) (API/MCP scoping), answer ADR-0012 Qs ([0d7a96a](https://github.com/gerchowl/kairos/commit/0d7a96abce8c4c3a3dcedcb4883ec2a18f069634))
+
 ## [0.9.1](https://github.com/gerchowl/kairos/compare/v0.9.0...v0.9.1) (2026-10-02)
 
 
