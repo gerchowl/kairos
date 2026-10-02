@@ -51,10 +51,30 @@ def create_app() -> FastAPI:
     # /health is exempt: container HEALTHCHECKs, k8s liveness/readiness probes and
     # load-balancer health checks all originate from loopback or pod-internal
     # addresses, so gating it turns a probe into a crashloop. It runs SELECT 1 and
-    # returns only {"status","app"} — nothing worth protecting.
+    # returns {"status","app"}.
+    #
+    # Matched exactly, not by substring. `endswith("/health")" would also exempt
+    # /api/polls/health and /static/health; nothing reachable does today, but that
+    # safety came from Starlette routing rather than from this check, so it is not
+    # a property worth leaving to chance.
+    health_path = f"{P}/health"
+
+    if settings.TRUSTED_PROXY_NETWORKS:
+        # The allowlist reads the ASGI scope's peer. If a server rewrote that from
+        # X-Forwarded-For first, the allowlist would be checked against a value the
+        # caller supplied. The app cannot detect this from inside -- uvicorn's
+        # ProxyHeadersMiddleware mutates the scope with no marker -- so say so loudly
+        # rather than fail silently and look like the control is working.
+        log.warning(
+            "KAIROS_TRUSTED_PROXY_CIDRS is set, so peer identity matters: the ASGI "
+            "server MUST NOT rewrite the client address from X-Forwarded-For. The "
+            "`kairos` entrypoint passes proxy_headers=False; if you launch uvicorn "
+            "yourself, do the same (uvicorn --no-proxy-headers)."
+        )
+
     @app.middleware("http")
     async def trusted_proxy_only(request, call_next):
-        if not request.url.path.endswith("/health") and not peer_is_trusted(request):
+        if request.url.path != health_path and not peer_is_trusted(request):
             peer = peer_address(request)
             log.warning(
                 "rejected untrusted peer %s (allowed: %s)",
@@ -168,7 +188,11 @@ never reads your calendar — you (or your agent) tell it what works.
             conn.close()
             return {"status": "ok", "app": "kairos"}
         except Exception as e:
-            return JSONResponse(content={"status": "degraded", "error": str(e)}, status_code=503)
+            # Log the detail; do not return it. str(e) on a sqlite failure carries
+            # absolute paths and driver text, and this endpoint is deliberately
+            # reachable without passing the trusted-proxy allowlist.
+            log.error("health check failed: %s", e, exc_info=True)
+            return JSONResponse(content={"status": "degraded"}, status_code=503)
 
     return app
 

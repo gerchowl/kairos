@@ -49,8 +49,7 @@ def test_unconfigured_allowlist_admits_every_peer():
         assert auth.peer_is_trusted(_request_from(peer)) is True
 
 
-def test_unconfigured_allowlist_leaves_requests_working(monkeypatch):
-    monkeypatch.setenv("KAIROS_API_KEY", "k")
+def test_unconfigured_allowlist_leaves_requests_working():
     c = client_from("203.0.113.7")  # an arbitrary public peer
     assert c.get("/scheduler/health").status_code == 200
 
@@ -389,3 +388,40 @@ def _get(port: int, path: str, xff: str | None):
     resp.read()
     conn.close()
     return resp
+
+
+# -- the /health exemption must be exact, not a substring -------------------
+
+def test_health_is_exempt_but_lookalike_paths_are_not(allowlist, monkeypatch):
+    """`endswith("/health")` would also exempt /api/polls/health and /static/health.
+
+    Nothing reachable lives at those paths today, but the exemption's safety came
+    from Starlette routing rather than from the check itself. Pin the exact match.
+    """
+    c = client_from("203.0.113.7")
+    assert c.get("/scheduler/health").status_code == 200
+
+    # Same suffix, different route: must be treated as any other request.
+    for lookalike in ("/scheduler/api/polls/health", "/scheduler/llms.txt",
+                      "/scheduler/static/health"):
+        assert c.get(lookalike).status_code == 403, lookalike
+
+
+def test_health_degraded_response_does_not_leak_driver_detail(allowlist, monkeypatch):
+    """/health is deliberately reachable without passing the allowlist, so its
+    error body must not carry str(e) -- sqlite errors leak absolute paths."""
+    import sqlite3
+
+    def boom(*_a, **_k):
+        raise sqlite3.OperationalError(
+            "unable to open database file: /srv/kairos/prod.db (attempt to write)")
+
+    # main.py imports get_connection into its own namespace, so patch there.
+    monkeypatch.setattr(main, "get_connection", boom)
+    c = client_from("203.0.113.7")
+    r = c.get("/scheduler/health")
+    assert r.status_code == 503
+    body = r.text
+    assert "/srv/kairos/prod.db" not in body
+    assert "sqlite3" not in body.lower()
+    assert r.json() == {"status": "degraded"}
