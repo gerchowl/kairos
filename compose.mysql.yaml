@@ -1,0 +1,66 @@
+# Kairos — MariaDB overlay (the `kairos[mysql]` path, #36's "or MySQL/MariaDB").
+#
+#   cp .env.example .env      # then set KAIROS_DB_PASSWORD
+#   podman compose -f compose.yaml -f compose.mysql.yaml up -d
+#
+# Same image, same app, one env var changed. This is obligation D1 in practice:
+# no MariaDB fork of anything, no adapter — `kairos/dbconn.py` already branches
+# on the URL scheme.
+#
+# Default remains SQLite (compose.yaml alone). Use this when you want a second
+# writer, backups on a schedule, or a DB you can inspect with existing tooling.
+services:
+  db:
+    image: docker.io/library/mariadb:11.4
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${KAIROS_DB_NAME:-kairos}
+      MARIADB_USER: ${KAIROS_DB_USER:-kairos}
+      MARIADB_PASSWORD: "${KAIROS_DB_PASSWORD:?set KAIROS_DB_PASSWORD in .env — never commit it}"
+      MARIADB_ROOT_PASSWORD: "${KAIROS_DB_ROOT_PASSWORD:?set KAIROS_DB_ROOT_PASSWORD in .env}"
+      # utf8mb4 so poll titles with emoji do not hit an encoding error at 3am.
+      MARIADB_CHARACTER_SET_SERVER: utf8mb4
+      MARIADB_COLLATION_SERVER: utf8mb4_unicode_ci
+    volumes:
+      - kairos-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # No published port: nothing outside this compose network needs the DB.
+    # Uncomment only for `mariadb` from your workstation, and only on loopback.
+    # ports:
+    #   - "127.0.0.1:3306:3306"
+    security_opt:
+      - no-new-privileges:true
+
+  kairos:
+    environment:
+      # NOTE: the password goes into a URL, so it must be percent-encoded —
+      # `@ : / ? # % &` all have to be %XX. A literal `@` silently truncates
+      # the username and the app connects as somebody else (or fails).
+      # Generate a safe one with:
+      #   python3 -c "import secrets,string;print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))"
+      KAIROS_DB_URL: mysql://${KAIROS_DB_USER:-kairos}:${KAIROS_DB_PASSWORD:?set KAIROS_DB_PASSWORD in .env}@db:3306/${KAIROS_DB_NAME:-kairos}
+      # SQLite is no longer used; the /data volume stays mounted because the
+      # image's working directory is /data and the app opens no file, so it is
+      # simply an empty, harmless directory. Drop the mount with:
+      #   podman compose -f compose.yaml -f compose.mysql.yaml \
+      #     run --rm --no-deps -v kairos-data:/data kairos ...
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      # Same /health endpoint — it SELECT 1s through whichever dialect is
+      # configured, so an unreachable DB surfaces as degraded/unhealthy rather
+      # than as a mysteriously failing app.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  kairos-db:
