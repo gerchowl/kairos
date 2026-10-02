@@ -207,14 +207,60 @@ Sequencing note: this is a **bigger** change than anything in Phase 1, and it is
 the one item that would change the shape of the project. Do it after #47/#51/#48,
 not before.
 
+### #54 settled: D1, not Hyperdrive — settled on the numbers
+
+Spiked rather than argued (limits verified 2026-10-02). First, a correction to
+the obvious assumption: **storage is a tie, not a D1 win.**
+
+| | storage | compute ceiling | egress | cold start | extra dependency |
+|---|---|---|---|---|---|
+| **D1 Free** | **500 MB/db**, 1 db/account, 5M rows read/day, 100k rows written/day | none — not billed for idle | none (inside Workers) | none | **no** |
+| **Neon Free** | **0.5 GB/project** | **100 CU-hours/month**, scale-to-zero fixed at 5 min and *cannot be disabled* | 5 GB/month | resumes in a few hundred ms | yes (Neon + Hyperdrive) |
+
+500 MB vs 0.5 GB is the same 500 MB. Measured against the real schema — a
+time_slot poll over one week, 5 slots/day, 10 respondents is ~17,800 rows and
+**~24 KiB with indexes** (a date poll is ~7 KiB) — both tiers hold roughly
+**21,000 polls**. So the user's size argument does not separate them.
+
+**D1 wins on everything else, and two of those are structural:**
+
+1. **No CU-hours ceiling.** Neon Free suspends compute when the 100 CU-hours run
+   out, and scale-to-zero cannot be turned off, so a database that is busy 24/7
+   gets no benefit. D1 is not a running compute and is not billed while idle.
+2. **One provider, one hop.** Hyperdrive adds a network round trip and an external
+   service to a product whose whole thesis is being small and self-hostable.
+
+**The binding constraint is neither — it is Workers Free at 100,000 requests/day.**
+At ~62 requests per poll lifecycle that is ~1,600 polls/day. So:
+
+- **Retention is not a nicety, it is what makes the free tier work.** A 14-day
+  window at full request utilisation needs ~22,500 polls and *overflows* 500 MB.
+  **A 7–10 day window fits.** That is also the honest product answer: a scheduling
+  poll is dead weight once the meeting happened, and a short retention window is a
+  *privacy improvement* that suits Kairos's existing strictly-necessary-data-only
+  posture (obligation P1).
+- **Free tier cannot host a staging environment.** One database per account, so
+  `[env.staging]` with its own D1 binding needs **Workers Paid (~$5/mo)**, which
+  also raises the per-database cap to 10 GB. Cheap, but not free — worth knowing
+  before planning the two-environment setup on free.
+- Free Workers also allows only **50 read subrequests per invocation** (1000 paid),
+  which is a real constraint for the poll dashboard's fan-out queries.
+
+**Decision: D1.** Revisit only if D1's write path forces an architectural change
+the SQLite dialect cannot absorb, or if request volume passes ~1,600 polls/day.
+
 ### ETH dogfooding: worth it, but it tests a *different* dialect
 
-ETH runs **MariaDB**; Cloudflare would run **D1/SQLite**. So dogfooding at ETH
-genuinely exercises the self-host path — which is the product — but it exercises
-the SQL dialect that hosted will *not* use. The CI matrix already covers sqlite
-e2e (`test_sqlite_e2e.py`), which is the closer proxy. ETH's unique value is
-proving "one Python process behind nginx on a VM, wired to an external IdP" keeps
-working across upgrades — keep it for that, not as dialect coverage.
+**Now that ETH moves to SQLite too (1 GB VM disk is ample for a ~21k-poll DB),
+the dialect mismatch is closed** — ETH and Cloudflare would run the same dialect,
+so dogfooding covers the hosted path as well as the self-host path. That also makes
+the MariaDB adapter unnecessary for ETH.
+
+Two caveats to carry: SQLite on a 1 GB volume needs `journal_mode=WAL` plus a
+`journal_size_limit` and periodic checkpointing, or the WAL grows unbounded —
+there is no WAL tuning in `dbconn.py` today, only `PRAGMA foreign_keys = ON`. And
+retention (above) is what keeps a 1 GB volume safe as well as keeping D1 under
+500 MB.
 
 ## Phase 1 — independent enablers (parallel, unblock hosting)
 
