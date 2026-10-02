@@ -10,6 +10,7 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Owner management (create/decide/invite) | `web.py`, `api.py` | ADR-0002 |
 | Env-only configuration | `settings.py` | ADR-0003 |
 | Trusted-proxy allowlist (`KAIROS_TRUSTED_PROXY_CIDRS`, obligation S1) | `auth.py`, `main.py`, `cli.py` | ADR-0002 |
+| Abuse limits on the public/email surface (`KAIROS_RATE_LIMIT`, obligation A3) | `ratelimit.py`, `public.py`, `web.py` | ADR-0001, ADR-0002, ADR-0003 |
 | iCalendar generation + parsing | `ics.py`, `imip_inbound.py` | ADR-0004 |
 | Reverse-calendar: candidate feed + deep-link voting | `ics.py` (`build_feed_ics`), `public.py` | ADR-0005, ADR-0006 |
 | Native iMIP invites (REQUEST/CANCEL) + IMAP-poll ingest | `ics.py`, `email_service.py`, `imip_inbound.py`, `api.py` | ADR-0005, ADR-0006 |

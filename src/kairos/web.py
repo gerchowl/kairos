@@ -44,6 +44,7 @@ from kairos.helpers import (
 )
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
+from kairos.ratelimit import rate_limit
 from kairos.templating import render
 
 P = settings.PREFIX
@@ -211,7 +212,8 @@ def new_poll_page(request: Request):
 
 
 @router.post("/new")
-def create_poll_submit(request: Request, form=Depends(form_data)):
+def create_poll_submit(request: Request, form=Depends(form_data),
+                       _=Depends(rate_limit("create"))):
     user = get_user(request)
     if not user:
         return _login_or_401(f"{P}/new")
@@ -539,7 +541,8 @@ def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 â
 
 
 @router.post("/polls/{poll_id}/remind-selected")
-def remind_selected(poll_id: str, request: Request, form=Depends(form_data)):
+def remind_selected(poll_id: str, request: Request, form=Depends(form_data),
+                    _=Depends(rate_limit("send"))):
     """Operator-picked addresses: bypasses idempotency gating (still logged)."""
     user, poll = _owner_action(request, form, poll_id)
     if poll["status"] != "open":
@@ -556,7 +559,8 @@ def remind_selected(poll_id: str, request: Request, form=Depends(form_data)):
 
 
 @router.post("/polls/{poll_id}/remind")
-def remind_participants(poll_id: str, request: Request, form=Depends(form_data)):
+def remind_participants(poll_id: str, request: Request, form=Depends(form_data),
+                        _=Depends(rate_limit("send"))):
     user, poll = _owner_action(request, form, poll_id)
     if poll["status"] != "open":
         raise HTTPException(400, "Poll is not open")
@@ -580,7 +584,8 @@ def poll_ics(poll_id: str, request: Request):
 
 
 @router.post("/polls/{poll_id}/email-decision")
-def email_decision(poll_id: str, request: Request, form=Depends(form_data)):
+def email_decision(poll_id: str, request: Request, form=Depends(form_data),
+                   _=Depends(rate_limit("send"))):
     user, poll = _owner_action(request, form, poll_id)
     slot = decided_slot_of(poll)
     if not slot:
@@ -605,7 +610,8 @@ def email_decision(poll_id: str, request: Request, form=Depends(form_data)):
 
 
 @router.post("/polls/{poll_id}/invite")
-def invite_submit(poll_id: str, request: Request, form=Depends(form_data)):
+def invite_submit(poll_id: str, request: Request, form=Depends(form_data),
+                  _=Depends(rate_limit("invite"))):
     user, poll = _owner_action(request, form, poll_id)
     email = valid_email(form.get("email", ""))
     if not email:

@@ -27,5 +27,7 @@ def create_env(extra_dir: Path | str | None = None) -> Environment:
     return env
 
 
-def render(env: Environment, template: str, status_code: int = 200, **context) -> HTMLResponse:
-    return HTMLResponse(env.get_template(template).render(**context), status_code=status_code)
+def render(env: Environment, template: str, status_code: int = 200,
+           headers: dict | None = None, **context) -> HTMLResponse:
+    return HTMLResponse(env.get_template(template).render(**context),
+                        status_code=status_code, headers=headers)

@@ -83,4 +83,45 @@ tokens are self-contained. See `kairos/settings.py` for all env knobs.
 > run uvicorn yourself rather than via the `kairos` entrypoint, pass
 > `proxy_headers=False` so it does not rewrite that address before Kairos sees it.
 
+> **Before exposing a hosted instance, set `KAIROS_RATE_LIMIT=on`.** See
+> [Rate limiting](#rate-limiting-optional) below — the public token routes let
+> anyone with a link create rows, and the owner routes can fan out mail to every
+> address on a poll's participants table.
+
 > **Cookie note for operators:** Kairos sets only strictly-necessary cookies (session, signed response-edit token, theme preference) — disclosed on `/privacy`, no consent banner required (ePrivacy Art. 5(3) / Swiss TCA 45c exemptions). If you add analytics or any third-party embeds to your deployment, that changes — you'll need consent management.
+
+## Rate limiting (optional)
+
+Off unless you switch it on, so self-host and the ETH/duplet deployment behave
+exactly as before. `KAIROS_RATE_LIMIT=on` puts a budget on the abuse-sensitive
+surface:
+
+| Rule | Applies to | Ships at |
+|---|---|---|
+| `read` | token pages, `agent.json`, feeds, `.ics` | 120/min |
+| `respond` | `POST /p/<token>`, `POST /p/i/<token>` | 20/min |
+| `deeplink_vote` | `GET …/s/<slot>/<yes\|maybe\|no>` — one per poll slot | 120/min |
+| `create` | `POST /new` | 10/min |
+| `invite` | `POST /polls/<id>/invite` | 30/min |
+| `send` | `remind`, `remind-selected`, `email-decision` — actual SMTP | 10/hour |
+
+Override any of them with `KAIROS_RATE_LIMIT_<RULE>="<count>/<window>"`
+(`second`/`minute`/`hour`/`day`), e.g. `KAIROS_RATE_LIMIT_SEND="30/hour"`. `0`
+switches that one rule off. An unparseable value — or a rule name that does not
+exist — **refuses to boot** rather than silently running unlimited.
+
+Requests are counted against the **real transport peer**, never
+`X-Forwarded-For`: that header is caller-supplied, so a budget keyed on it
+would be a budget the caller sets for themselves. That makes `proxy_headers=False`
+load-bearing here too — if you launch uvicorn yourself instead of via the
+`kairos` entrypoint, pass it, or a rotating `X-Forwarded-For` evades the budget
+entirely. Kairos logs a warning at startup when limits are on.
+
+Over-budget requests get a `429` with a `Retry-After`, as an HTML page in a
+browser and as JSON otherwise.
+
+> **One instance, one counter set.** The counters live in the serving process,
+> so **N app instances means an attacker gets N × the budget.** That is the one
+> limit to know about before scaling out; #36 chose SQLite on the same
+> reasoning (its operational ceiling is a single writer). Move the counters to a
+> shared store before running more than one instance.

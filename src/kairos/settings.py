@@ -22,6 +22,10 @@ KAIROS_IMIP        native iMIP invitations (Accept/Maybe/Decline): off (default)
 KAIROS_IMIP_ORGANIZER       reply mailbox = ORGANIZER mailto (must equal IMAP mailbox)
 KAIROS_IMIP_ORGANIZER_NAME  ORGANIZER display name (default KAIROS_BRAND)
 KAIROS_IMAP_HOST/PORT/USER/PASSWORD/MAILBOX   inbound iMIP reply polling (P2)
+KAIROS_RATE_LIMIT      abuse limits on the public/email surface: off (default) | on
+KAIROS_RATE_LIMIT_<RULE>   per-rule override, "<count>/<window>", e.g. "20/minute"
+                   (window = second|minute|hour|day; count 0 disables that one
+                   rule). Rules: READ RESPOND DEEPLINK_VOTE CREATE INVITE SEND.
 """
 
 import ipaddress
@@ -100,6 +104,78 @@ IMAP_PORT = int(os.environ.get("KAIROS_IMAP_PORT", "993"))
 IMAP_USER = os.environ.get("KAIROS_IMAP_USER", "")
 IMAP_PASSWORD = os.environ.get("KAIROS_IMAP_PASSWORD", "")
 IMAP_MAILBOX = os.environ.get("KAIROS_IMAP_MAILBOX", "INBOX")
+
+
+# Abuse limits on the public/email surface — obligation A3, issue #37.
+#
+# OFF unless KAIROS_RATE_LIMIT is set, and that is the whole point: ADR-0001/0002
+# require header-mode and self-host deployments to behave identically after this
+# work, and the ETH/duplet adapter sets no rate-limit env at all. Turning it on
+# is an operator decision (see README); this only makes the knob exist.
+RATE_LIMIT_ENABLED = os.environ.get("KAIROS_RATE_LIMIT", "off").strip().lower() in ("1", "on", "true", "yes")
+
+# Shipped defaults, per rule: (count, window seconds). Deliberately generous on
+# the respondent-facing rules — a legitimate agent sweep of a 15-minute-slot
+# week is ~100 votes (ADR-0010) — and tight on the ones that write rows or send
+# mail. Every value is overridable; none of them apply unless enabled.
+DEFAULT_RATE_LIMITS = {
+    "read": (120, 60),  # token pages: poll, invite, agent.json, feeds, .ics
+    "respond": (20, 60),  # POST /p/<token>, POST /p/i/<token>
+    "deeplink_vote": (120, 60),  # GET .../s/<slot>/<yes|maybe|no> — one per slot
+    "create": (10, 60),  # POST /new
+    "invite": (30, 60),  # POST /polls/<id>/invite — grows the recipient list
+    "send": (10, 3600),  # remind / remind-selected / email-decision — actual SMTP
+}
+
+_WINDOW_SECONDS = {
+    "second": 1,
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+}
+
+
+def _parse_rate_limit(raw: str, var: str) -> tuple[int, int]:
+    """Parse "<count>/<window>" into (count, window_seconds). Fails loudly.
+
+    Same reasoning as _parse_networks: an unparseable limit is not a skipped
+    line, it is an abuse control the operator believes is in force and is not.
+    Refuse the boot instead. "0" is accepted and means "this rule is off".
+    """
+    count_raw, sep, window = raw.strip().partition("/")
+    if not sep:
+        raise RuntimeError(f"{var}: {raw!r} must look like '20/minute' (count/window)")
+    try:
+        count = int(count_raw)
+    except ValueError:
+        raise RuntimeError(f"{var}: {count_raw!r} is not an integer count") from None
+    if count < 0:
+        raise RuntimeError(f"{var}: {raw!r} must be 0 (unlimited) or a positive count")
+    seconds = _WINDOW_SECONDS.get(window.strip().lower())
+    if seconds is None:
+        raise RuntimeError(f"{var}: {window!r} is not a known window ({', '.join(_WINDOW_SECONDS)})")
+    return count, seconds
+
+
+def _parse_rate_limits(env: dict) -> dict:
+    """Defaults overlaid with KAIROS_RATE_LIMIT_<RULE>, rejecting unknown names."""
+    limits = dict(DEFAULT_RATE_LIMITS)
+    for name in DEFAULT_RATE_LIMITS:
+        var = f"KAIROS_RATE_LIMIT_{name.upper()}"
+        raw = env.get(var)
+        if raw is not None and raw.strip():
+            limits[name] = _parse_rate_limit(raw, var)
+    known = {f"KAIROS_RATE_LIMIT_{name.upper()}" for name in DEFAULT_RATE_LIMITS}
+    for var in env:
+        if var.startswith("KAIROS_RATE_LIMIT_") and var not in known:
+            raise RuntimeError(
+                f"{var} is not a rate-limit rule — known rules: "
+                f"{', '.join(sorted(n.upper() for n in DEFAULT_RATE_LIMITS))}"
+            )
+    return limits
+
+
+RATE_LIMITS = _parse_rate_limits(os.environ)
 
 
 def session_secret() -> str:

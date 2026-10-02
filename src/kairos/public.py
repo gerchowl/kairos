@@ -29,6 +29,7 @@ from kairos.helpers import (
 from kairos.http import form_data, valid_email
 from kairos.ics import build_feed_ics
 from kairos.notifications import notify_all_responded, notify_new_response
+from kairos.ratelimit import rate_limit
 from kairos.templating import render
 from kairos.web import get_base_url, ics_response
 
@@ -212,7 +213,7 @@ def _record_single_vote(request: Request, poll: dict, invite: dict, slot_id: str
 # -- Public poll routes --
 
 @router.get("/{token}/event.ics")
-def public_poll_ics(token: str, request: Request):
+def public_poll_ics(token: str, request: Request, _=Depends(rate_limit("read"))):
     poll = get_poll_by_token(token)
     if not poll:
         raise HTTPException(404)
@@ -224,7 +225,7 @@ def public_poll_ics(token: str, request: Request):
 
 
 @router.get("/{token}")
-def view_public_poll(token: str, request: Request):
+def view_public_poll(token: str, request: Request, _=Depends(rate_limit("read"))):
     poll = get_poll_by_token(token)
     if not poll:
         return _not_found("Poll not found", "This link may be invalid or expired.")
@@ -232,7 +233,8 @@ def view_public_poll(token: str, request: Request):
 
 
 @router.post("/{token}")
-def submit_public_response(token: str, request: Request, form=Depends(form_data)):
+def submit_public_response(token: str, request: Request, form=Depends(form_data),
+                           _=Depends(rate_limit("respond"))):
     poll = get_poll_by_token(token)
     if not poll:
         return _not_found("Poll not found")
@@ -242,7 +244,7 @@ def submit_public_response(token: str, request: Request, form=Depends(form_data)
 # -- Invite-based routes --
 
 @router.get("/i/{invite_token}")
-def view_invite_poll(invite_token: str, request: Request):
+def view_invite_poll(invite_token: str, request: Request, _=Depends(rate_limit("read"))):
     invite = get_invite_by_token(invite_token)
     if not invite:
         return _not_found("Invalid invite link", "This invite may be invalid or expired.")
@@ -255,7 +257,8 @@ def view_invite_poll(invite_token: str, request: Request):
 
 
 @router.post("/i/{invite_token}")
-def submit_invite_response(invite_token: str, request: Request, form=Depends(form_data)):
+def submit_invite_response(invite_token: str, request: Request, form=Depends(form_data),
+                           _=Depends(rate_limit("respond"))):
     invite = get_invite_by_token(invite_token)
     if not invite:
         return _not_found("Invalid invite link")
@@ -270,7 +273,7 @@ def submit_invite_response(invite_token: str, request: Request, form=Depends(for
 # -- Reverse-calendar feed + deep-link voting (gated on KAIROS_FEED) --
 
 @router.get("/i/{invite_token}/feed.ics")
-def invite_feed_ics(invite_token: str, request: Request):
+def invite_feed_ics(invite_token: str, request: Request, _=Depends(rate_limit("read"))):
     """Per-invitee candidate feed: every slot carries deep-link vote URLs."""
     if not settings.FEED_ENABLED:
         raise HTTPException(404)
@@ -284,7 +287,7 @@ def invite_feed_ics(invite_token: str, request: Request):
 
 
 @router.get("/i/{invite_token}/agent.json")
-def invite_agent_json(invite_token: str, request: Request):
+def invite_agent_json(invite_token: str, request: Request, _=Depends(rate_limit("read"))):
     """Agent-native invitee surface: the invite link IS the identity (no API key).
     Returns the options, your current vote, and the one-click vote URLs — so you
     can hand your assistant the invite link and it can RSVP for you."""
@@ -323,7 +326,8 @@ def invite_agent_json(invite_token: str, request: Request):
 
 
 @router.get("/i/{invite_token}/s/{slot_id}/{availability}")
-def deep_link_vote(invite_token: str, slot_id: str, availability: str, request: Request):
+def deep_link_vote(invite_token: str, slot_id: str, availability: str, request: Request,
+                   _=Depends(rate_limit("deeplink_vote"))):
     """Tapped from a calendar event body: record one slot's answer, then land
     on the poll page — the instant-feedback surface (the feed itself lags)."""
     if not settings.FEED_ENABLED:
