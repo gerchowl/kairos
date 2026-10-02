@@ -73,11 +73,30 @@ gates everything downstream.
 
 | # | Issue | Why now |
 |---|---|---|
-| **#47** | Trusted-proxy allowlist (register obligation **S1**) | **Security, and the true first thing to fix before any public deploy.** See the exposure-gates section above. Small, additive, no dependency on anything else. |
-| **#48** | SPF/DKIM/DMARC for our sending domain (obligation **M1**) | Must land before the hosted product sends real mail from our domain; everything else about mail reputation assumes it. |
-| **#37** | Rate limiting + abuse protection | **Security** (obligation **A3**). Public endpoints send email → spam vector. Independent of the account chain. |
+| **#47** | Trusted-proxy allowlist (obligation **S1**) | **Security, and the true first thing to fix before any public deploy.** See the exposure-gates section above. Small, additive, no dependency on anything else. |
+| **#51** | Scope / tier / rate-limit the API + MCP surface | **Security, and the worst hole in the repo today.** A single bearer key with no scopes, no tiers and **no rate limit anywhere** reaches all polls; MCP's `invite` / `nudge(force=True)` / `email_decision` send to **arbitrary third parties at unbounded rate**. With #48 landed that mail is DKIM-valid from our domain. Turnstile does not help — the API never touches `/new`. **Do the scoping and send budgets before any public launch; Stripe can wait.** |
+| **#48** | SPF/DKIM/DMARC for our sending domain (obligation **M1**) | Must land before the hosted product sends real mail from our domain. |
+| **#37** | Rate limiting + abuse protection (obligation **A3**) | The *public* endpoints (respond, invite, deep-link vote). Distinct from #51, which is the API/MCP surface — do not let one gate stand in for the other. |
 | **#35** | Dockerfile + compose.yaml | Mechanical, self-contained, unblocks every deploy story. Podman-tested per house convention. |
-| **#36** | Postgres dialect | ⚠ **Push back / evaluate first.** A third SQL dialect is a large surface. SQLite-on-volume may well be the right answer for the free tier. **Recommend deciding this before writing a line of dialect code.** |
+| ~~#36~~ | ~~Postgres dialect~~ | ✅ **Decided 2026-10-02: SQLite, not Postgres.** See below. |
+
+### #36 — decided: SQLite
+
+No third SQL dialect. SQLite is already a first-class dialect (the whole suite
+is SQLite e2e, the quickstart ships it), so a persistent volume buys the same
+thing for far less surface than a new dialect + CI job.
+
+What that commits us to, so it is a decision and not a dodge:
+
+- **The deployment needs a persistent volume** for `kairos.db` — an ephemeral
+  filesystem loses every poll on redeploy. That is the entire cost.
+- **Tension with #34 (scale-to-zero).** A webhook mail adapter lets the *process*
+  scale to zero; a SQLite file means the *volume* cannot. Fine for one
+  always-warm instance, wrong for N instances sharing a DB.
+- **Operational ceiling: one writer.** Fine at hobby / Pro-single-tenant scale.
+
+**Revisit trigger:** more than one app instance, or write contention on the
+volume.
 
 ## Phase 2 — the accountless chain (strictly serial)
 
@@ -147,9 +166,54 @@ reviewer is the gate, not GitHub.** Never let an agent merge its own PR.
 
 ## Open decisions for the operator (not mine to make)
 
-1. **#36 Postgres vs SQLite-on-volume** — recommend deciding before coding.
-2. **ADR-0012 open questions** — booking in v1? v1 block list? image policy?
-   Surface layer (Bun/TS) before or after P4?
+1. ~~#36 Postgres vs SQLite-on-volume~~ — ✅ **decided: SQLite.** Revisit trigger
+   is >1 app instance.
+2. **ADR-0012 open questions** — the four are listed under "ADR-0012 decisions"
+   below, with recommendations.
 3. **P4 live iMIP verification** — needs your real mailbox and clients.
-4. **#31 consent shape** — click-to-load facade, or accept the banner and update
-   `/privacy`?
+4. ~~#31 consent shape~~ — folded into ADR-0012 Q4 below.
+
+## ADR-0012 decisions — the four open questions
+
+Straight from `docs/adr/0012-scheduling-primitive-surface-tiers.md` §Open
+questions, with a recommendation on each.
+
+**Q1 — Is Booking in or out of v1?**
+It is the only one of the four shapes that needs genuinely new machinery:
+exclusive first-come claims (so real transactions), recurrence expansion, and a
+documented carve-out from ADR-0001 (an anonymous booking page lists free
+intervals with no authenticated owner, which ADR-0001 forbids). The other three
+shapes are the existing tables plus one orthogonal axis.
+**Recommend: defer booking out of v1.** Deferring costs nothing structurally,
+because choices are an orthogonal axis — #29's `sched_poll_questions` work is not
+wasted either way. Booking is then additive instead of load-bearing.
+
+**Q2 — What is the v1 block list?**
+The ADR proposes `heading`, `prose`, `bullets`, `agenda`, `people`, `location`,
+`callout`, `link_buttons`, `poll_grid`, `diagram` (~10 types).
+**Recommend: accept the proposed list as v1.** The ADR's own reasoning caps
+ambition here — blocks serve surface tiers 1–2 only, and anything more expressive
+drops to the headless tier, so ~8 opinionated types is the ceiling by design.
+Widening it later is additive.
+
+**Q3 — Images: self-hosted upload, URL allowlist, or neither in v1?**
+This is a security question, not a feature question. Inline SVG is executable
+markup, and an LLM author turns prompt injection into stored XSS on the very
+origin that serves capability tokens. The ADR permits author artwork **only** as
+a separate `<img>` with `Content-Security-Policy: sandbox`.
+**Recommend: neither in v1** — no upload, no URL allowlist. Generated
+`diagram` blocks (which Kairos renders from structured data) carry the visual
+weight. Revisit only with upload behind a real scanning/quota story, because
+"an image host on your capability-token origin" is its own abuse surface.
+
+**Q4 — Surface layer (Bun/TS) before or after P4?**
+And the related consent question: if a third-party embed is ever offered,
+click-to-load facade + per-deployment flag + a `/privacy` change.
+**Recommend: after P4.** P4 (live cross-client iMIP verification) is described in
+ADR-0012 as the *porting oracle* — a working end-to-end implementation to port
+*from*. Building a TS surface layer before P4 means porting blind. Note the
+global CLAUDE.md rule "don't guess API shapes — write a debug probe first", and
+the ADR's own advice not to make this a rewrite decision before P4 exists.
+On consent: ADR-0012's P1 break applies to **any** third-party embed, which
+includes Turnstile in #31 — so that decision is needed *in* #31, not deferred to
+a surface layer that may never arrive.

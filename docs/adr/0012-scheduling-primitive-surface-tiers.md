@@ -120,6 +120,29 @@ contract is on by default and exists at poll level too.
 
 ## Open questions
 
+> **Answered 2026-10-02** — the four questions below were put to the operator and
+> resolved. Recorded here so the ADR matches reality; rationale and revisit
+> triggers live in `PLAN.md` § "ADR-0012 decisions".
+>
+> 1. **Booking in v1?** → **Out.** It is the only shape needing new concurrency
+>    primitives (exclusive first-come claims, recurrence, an ADR-0001 carve-out).
+>    Deferring is structurally free: the choices axis is orthogonal, so the
+>    #29 work is not wasted and booking lands additively.
+> 2. **v1 block list?** → **The proposed ten**, unchanged. The block schema serves
+>    surface tiers 1–2 only; anything more expressive drops to headless, so ~8–10
+>    opinionated types is the ceiling by design.
+> 3. **Images in v1?** → **Neither upload nor URL allowlist.** Inline SVG is
+>    executable markup and an LLM author turns prompt injection into stored XSS
+>    on the origin that serves capability tokens. Generated `diagram` blocks
+>    carry the visual weight. Revisit only behind a real scanning/quota story.
+> 4. **Surface layer before or after P4?** → **After P4.** P4 is the porting
+>    oracle; a TS surface layer built before it exists means porting blind, and a
+>    full rewrite is explicitly not a decision to make before P4. **Consequence
+>    for #31:** the P1 consent break applies to *any* third-party embed,
+>    Turnstile included — so that decision is needed in #31 itself, not deferred
+>    to a surface layer that may never arrive.
+
+
 1. **Booking in or out of v1?** It is the only shape needing new concurrency
    primitives — deferring it costs nothing structurally.
 2. **v1 block list** — proposed: `heading`, `prose`, `bullets`, `agenda`,
