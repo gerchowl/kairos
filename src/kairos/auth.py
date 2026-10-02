@@ -4,7 +4,8 @@ Modes (KAIROS_AUTH):
   demo    everyone is the same demo owner (playgrounds, local trials)
   header  trust identity headers injected by ANY SSO reverse proxy
           (Shibboleth/Apache, oauth2-proxy, Authelia, Cloudflare Access, ...);
-          optionally gate with KAIROS_ALLOW (uids/emails)
+          optionally gate with KAIROS_ALLOW (uids/emails) and with
+          KAIROS_TRUSTED_PROXY_CIDRS (which peers may set those headers at all)
   none    no owner auth — the web management UI is disabled, API + public
           response pages only
 
@@ -14,6 +15,7 @@ integrations (e.g. a session-cookie portal): `kairos.auth.get_user = mine`.
 """
 
 import hmac
+import ipaddress
 import os
 
 from fastapi import HTTPException, Request
@@ -22,6 +24,42 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from kairos import settings
 
 DEMO_USER = {"uid": "demo", "name": "Demo User", "email": "demo@example.org"}
+
+
+def peer_address(request: Request) -> str | None:
+    """The real transport peer, or None if the ASGI scope carries no client.
+
+    Deliberately *not* X-Forwarded-For: that header is attacker-controlled
+    unless the peer is already known to be our proxy, which is the very thing
+    being decided here. Requires uvicorn's `proxy_headers` to be off — otherwise
+    uvicorn rewrites scope["client"] from XFF *before* the app sees it and this
+    would return the spoofed value. See `kairos.cli`, which sets
+    proxy_headers=False for exactly this reason.
+    """
+    client = request.scope.get("client")
+    return client[0] if client else None
+
+
+def peer_is_trusted(request: Request) -> bool:
+    """May this request's peer assert identity headers?
+
+    Fails closed: with an allowlist configured, anything outside it is
+    untrusted. With none configured, everything is trusted — the pre-existing
+    behaviour, safe only while the app port is not publicly reachable.
+    """
+    networks = settings.TRUSTED_PROXY_NETWORKS
+    if not networks:
+        return True
+    peer = peer_address(request)
+    if not peer:
+        return False
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        # Not an IP (a unix socket path, say) — cannot be matched against a CIDR
+        # list, so treat as untrusted rather than waving it through.
+        return False
+    return any(address in net for net in networks)
 
 
 def _serializer(salt: str = "session") -> URLSafeTimedSerializer:

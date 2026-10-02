@@ -7,6 +7,12 @@ KAIROS_AUTH_UID_HEADER    header carrying the user id    (header mode, default X
 KAIROS_AUTH_EMAIL_HEADER  header carrying the email      (default X-Email)
 KAIROS_AUTH_NAME_HEADER   header carrying a display name (default X-Name)
 KAIROS_ALLOW       optional comma list of allowed uids/emails (header mode)
+KAIROS_TRUSTED_PROXY_CIDRS  comma list of CIDRs/IPs allowed to set identity
+                   headers, e.g. 10.0.0.0/8,127.0.0.1. When set, requests
+                   arriving from any other peer are REJECTED (403) — fail
+                   closed. Unset means trust any peer, which is correct only
+                   while the app port is unreachable except through your proxy,
+                   and required before exposing a hosted instance (S1).
 KAIROS_BRAND       display name (default "Kairos")
 KAIROS_HOME_URL    brand-link target in the navbar (default the app itself)
 SESSION_SECRET     signing key for cookies/CSRF (required outside demo mode)
@@ -18,7 +24,26 @@ KAIROS_IMIP_ORGANIZER_NAME  ORGANIZER display name (default KAIROS_BRAND)
 KAIROS_IMAP_HOST/PORT/USER/PASSWORD/MAILBOX   inbound iMIP reply polling (P2)
 """
 
+import ipaddress
 import os
+
+
+def _parse_networks(raw: str, var: str) -> tuple:
+    """Parse a comma list of IPs/CIDRs into networks. Fails loudly.
+
+    A typo here would silently widen or void the allowlist, so an unparseable
+    entry is a startup error rather than a skipped line.
+    """
+    networks = []
+    for item in (s.strip() for s in raw.split(",")):
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError as exc:
+            raise RuntimeError(f"{var}: {item!r} is not a valid IP or CIDR ({exc})") from exc
+    return tuple(networks)
+
 
 DB_URL = os.environ.get("KAIROS_DB_URL", "sqlite:///kairos.db")
 PREFIX = os.environ.get("KAIROS_PREFIX", "").rstrip("/")
@@ -30,17 +55,28 @@ ALLOW = {a.strip().lower() for a in os.environ.get("KAIROS_ALLOW", "").split(","
 BRAND = os.environ.get("KAIROS_BRAND", "Kairos")
 HOME_URL = os.environ.get("KAIROS_HOME_URL", PREFIX + "/")
 LOGIN_URL = os.environ.get("KAIROS_LOGIN_URL", "")  # owner sign-in page; empty -> 401 message
-PUBLIC_URL = os.environ.get("KAIROS_PUBLIC_URL", "")  # SSoT base for share links; empty -> derive from request headers
+PUBLIC_URL = os.environ.get(
+    "KAIROS_PUBLIC_URL", ""
+)  # SSoT base for share links; empty -> derive from request headers
 API_KEY = os.environ.get("KAIROS_API_KEY") or os.environ.get("SCHEDULER_API_KEY", "")
+
+# Obligation S1 (issue #47): in header mode the owner identity comes from
+# request headers, so whoever can reach the port can assert any identity —
+# unless we know the request actually came through our proxy. Empty tuple =
+# unset = trust every peer (the pre-existing behaviour, so the ETH/duplet and
+# self-host deployments are untouched). Never consult X-Forwarded-For here:
+# that header is exactly the thing an attacker controls.
+TRUSTED_PROXY_CIDRS = os.environ.get("KAIROS_TRUSTED_PROXY_CIDRS", "")
+TRUSTED_PROXY_NETWORKS = _parse_networks(TRUSTED_PROXY_CIDRS, "KAIROS_TRUSTED_PROXY_CIDRS")
 
 # Legal pages (/imprint, /privacy) — rendered when KAIROS_OPERATOR is set.
 # Structured input, no HTML needed; the operator carries the legal duty
 # (CH nDSG / GDPR). Kairos itself sets only strictly-necessary cookies,
 # so no consent banner is required — the privacy page discloses them.
-OPERATOR = os.environ.get("KAIROS_OPERATOR", "")            # name / org
+OPERATOR = os.environ.get("KAIROS_OPERATOR", "")  # name / org
 OPERATOR_ADDRESS = os.environ.get("KAIROS_OPERATOR_ADDRESS", "")  # postal address, comma-separated
 OPERATOR_EMAIL = os.environ.get("KAIROS_OPERATOR_EMAIL", "")
-LEGAL_EXTRA = os.environ.get("KAIROS_LEGAL_EXTRA", "")      # free-form extra paragraph
+LEGAL_EXTRA = os.environ.get("KAIROS_LEGAL_EXTRA", "")  # free-form extra paragraph
 
 # Reverse-calendar feed (issue #23): subscribe-able candidate-slot .ics feeds +
 # deep-link Accept/Maybe/Decline. Off by default — opt in per deployment, since

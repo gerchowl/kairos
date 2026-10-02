@@ -1,5 +1,6 @@
 """Kairos app factory + ASGI entrypoint (kairos.main:app)."""
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from kairos import settings
 from kairos.db import get_connection, init_schema
 
 P = settings.PREFIX
+log = logging.getLogger("kairos.proxy")
 
 
 @asynccontextmanager
@@ -22,6 +24,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     from kairos.api import router as api_router
+    from kairos.auth import peer_address, peer_is_trusted
     from kairos.public import router as public_router
     from kairos.web import router as web_router
 
@@ -41,6 +44,25 @@ def create_app() -> FastAPI:
         redoc_url=None,
     )
 
+    # Obligation S1 (#47): if an allowlist is configured, only requests from a
+    # trusted peer may reach the app at all. Enforced at the edge rather than
+    # inside each route, so a new route cannot forget the check. Unconfigured =>
+    # middleware is a no-op and behaviour is byte-for-byte what it always was.
+    @app.middleware("http")
+    async def trusted_proxy_only(request, call_next):
+        if not peer_is_trusted(request):
+            peer = peer_address(request)
+            log.warning(
+                "rejected untrusted peer %s (allowed: %s)",
+                peer or "<unknown>",
+                settings.TRUSTED_PROXY_CIDRS or "<unset>",
+            )
+            return JSONResponse(
+                content={"detail": "Forbidden: request did not arrive from a trusted proxy"},
+                status_code=403,
+            )
+        return await call_next(request)
+
     app.include_router(api_router)
     app.include_router(web_router, include_in_schema=False)
     app.include_router(public_router, include_in_schema=False)
@@ -49,10 +71,14 @@ def create_app() -> FastAPI:
     def _openapi_with_bearer():
         if app.openapi_schema:
             return app.openapi_schema
-        schema = get_openapi(title=app.title, version=app.version,
-                             description=app.description, routes=app.routes)
+        schema = get_openapi(
+            title=app.title, version=app.version, description=app.description, routes=app.routes
+        )
         schema.setdefault("components", {}).setdefault("securitySchemes", {})["bearerAuth"] = {
-            "type": "http", "scheme": "bearer", "description": "KAIROS_API_KEY"}
+            "type": "http",
+            "scheme": "bearer",
+            "description": "KAIROS_API_KEY",
+        }
         schema["security"] = [{"bearerAuth": []}]
         app.openapi_schema = schema
         return schema
@@ -103,14 +129,19 @@ never reads your calendar — you (or your agent) tell it what works.
     def robots_txt():
         return PlainTextResponse(
             f"# Agent/API discovery: {P}/llms.txt and {P}/api/openapi.json\n"
-            f"User-agent: *\nDisallow: {P}/p/\nDisallow: {P}/api/\n")
+            f"User-agent: *\nDisallow: {P}/p/\nDisallow: {P}/api/\n"
+        )
 
     if settings.OPERATOR:
         from kairos.templating import create_env, render
+
         legal_env = create_env()
-        legal_ctx = {"operator": settings.OPERATOR,
-                     "address": [a.strip() for a in settings.OPERATOR_ADDRESS.split(",") if a.strip()],
-                     "email": settings.OPERATOR_EMAIL, "extra": settings.LEGAL_EXTRA}
+        legal_ctx = {
+            "operator": settings.OPERATOR,
+            "address": [a.strip() for a in settings.OPERATOR_ADDRESS.split(",") if a.strip()],
+            "email": settings.OPERATOR_EMAIL,
+            "extra": settings.LEGAL_EXTRA,
+        }
 
         @app.get(f"{P}/imprint", include_in_schema=False)
         def imprint():
