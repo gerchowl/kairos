@@ -1,0 +1,19 @@
+# gitleaks config for Kairos (obligation S4 — no committed secrets).
+# Extends the default ruleset; allowlists documentation/test placeholders that
+# are illustrative, not real credentials.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Docs/tests use illustrative tokens, not real secrets"
+paths = [
+  '''docs/.*\.md''',
+  '''README\.md''',
+  '''tests/.*''',
+]
+regexes = [
+  # obvious placeholders / demo values used in examples
+  '''kairos-demo-not-secret''',
+  '''Bearer (ci|k|dummy-key|dummy|<[^>]+>)''',
+  '''SESSION_SECRET=\$\(openssl rand''',
+]

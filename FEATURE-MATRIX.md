@@ -17,3 +17,4 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Container / hosted deployment (planned) | — | ADR-0008 |
 | Optional accounts / multi-tenancy (planned) | — | ADR-0009 |
 | Agent surfaces: REST API, `/llms.txt`, OpenAPI, MCP, `agent.json` | `api.py`, `main.py`, `public.py`, `mcp/` | ADR-0010 |
+| Brand & hosting home (nerdmachines house brand, `kairos.nerdmachines.com`) | `docs/design/productization-obligations.md` | ADR-0011 |
