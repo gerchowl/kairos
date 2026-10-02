@@ -59,6 +59,13 @@ def peer_is_trusted(request: Request) -> bool:
         # Not an IP (a unix socket path, say) — cannot be matched against a CIDR
         # list, so treat as untrusted rather than waving it through.
         return False
+    # A dual-stack listener ("kairos --host ::", the container/K8s default) sees
+    # IPv4 clients as IPv4-mapped IPv6 ("::ffff:127.0.0.1"). Without this, an
+    # operator following the README's own example allowlist gets a silently dead
+    # app: every peer fails to match an IPv4 network. It still fails closed, so
+    # there is no exposure — it just fails closed *everywhere*. Only IPv6Address
+    # has .ipv4_mapped, hence the getattr.
+    address = getattr(address, "ipv4_mapped", None) or address
     return any(address in net for net in networks)
 
 

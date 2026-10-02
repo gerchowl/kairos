@@ -48,14 +48,20 @@ def create_app() -> FastAPI:
     # trusted peer may reach the app at all. Enforced at the edge rather than
     # inside each route, so a new route cannot forget the check. Unconfigured =>
     # middleware is a no-op and behaviour is byte-for-byte what it always was.
+    # /health is exempt: container HEALTHCHECKs, k8s liveness/readiness probes and
+    # load-balancer health checks all originate from loopback or pod-internal
+    # addresses, so gating it turns a probe into a crashloop. It runs SELECT 1 and
+    # returns only {"status","app"} — nothing worth protecting.
     @app.middleware("http")
     async def trusted_proxy_only(request, call_next):
-        if not peer_is_trusted(request):
+        if not request.url.path.endswith("/health") and not peer_is_trusted(request):
             peer = peer_address(request)
             log.warning(
                 "rejected untrusted peer %s (allowed: %s)",
                 peer or "<unknown>",
-                settings.TRUSTED_PROXY_CIDRS or "<unset>",
+                # Log the value enforcement actually reads, not the raw string:
+                # they can disagree if the var was set without a re-parse.
+                ",".join(str(n) for n in settings.TRUSTED_PROXY_NETWORKS) or "<unset: trusting every peer>",
             )
             return JSONResponse(
                 content={"detail": "Forbidden: request did not arrive from a trusted proxy"},

@@ -20,7 +20,7 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 
 | # | Obligation | Source | Enforce | Status |
 |---|---|---|---|---|
-| S1 | Owner identity comes only from a **trusted** proxy; header-auth must not trust arbitrary upstreams | ADR-0002 | CONFIG + RUNTIME (trusted-proxy allowlist) | **MET** (#47) — `KAIROS_TRUSTED_PROXY_CIDRS`, enforced at the edge, 403 + log on untrusted peer. Opt-in: unset still trusts every peer, which is why it is a config gate on public deploys, not a default-on lock |
+| S1 | Owner identity comes only from a **trusted** proxy; header-auth must not trust arbitrary upstreams | ADR-0002 | CONFIG + RUNTIME (trusted-proxy allowlist) | **PARTIAL** (#47) — `KAIROS_TRUSTED_PROXY_CIDRS` enforces at the edge (403 + log), and `proxy_headers=False` stops uvicorn rewriting the peer from a caller-supplied header. **Not MET**: the control is opt-in, so the default is fail-open (trust every peer), and `KAIROS_AUTH` still defaults to `demo`. Making it default-on under header mode is the remaining step — blocked on the duplet adapter (a different repo) which may launch uvicorn itself |
 | S2 | `SESSION_SECRET` required outside demo; refuse to boot without it | ADR-0003 | RUNTIME (fail-closed) | MET |
 | S3 | Capability tokens are unguessable (`token_urlsafe(32)`) and never logged | ADR-0001 | RUNTIME + no-secret-in-logs | MET (entropy); PARTIAL (log audit) |
 | S4 | No secrets committed to git | — | GATE (gitleaks, pre-commit + CI full-history) | MET |

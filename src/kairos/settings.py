@@ -39,7 +39,11 @@ def _parse_networks(raw: str, var: str) -> tuple:
         if not item:
             continue
         try:
-            networks.append(ipaddress.ip_network(item, strict=False))
+            # strict=True on purpose: "10.0.0.5/24" is a typo for a 256-address
+            # network and "192.168.1.7/16" would silently trust 65536 hosts. On a
+            # security allowlist, refuse it. A bare "10.0.0.5" still parses (as a
+            # /32), which is the form people actually mean.
+            networks.append(ipaddress.ip_network(item, strict=True))
         except ValueError as exc:
             raise RuntimeError(f"{var}: {item!r} is not a valid IP or CIDR ({exc})") from exc
     return tuple(networks)

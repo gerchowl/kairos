@@ -10,9 +10,13 @@ a caller-supplied header is not an allowlist at all.
 """
 
 import ipaddress
+import os
 import socket
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -124,16 +128,71 @@ def test_middleware_rejects_untrusted_peer_on_public_routes_too(allowlist):
     closes S1.
     """
     c = client_from("203.0.113.7")
-    assert c.get("/scheduler/health").status_code == 403
+    assert c.get("/scheduler/llms.txt").status_code == 403
 
 
-def test_middleware_logs_the_rejected_peer(allowlist, monkeypatch, caplog):
-    monkeypatch.setenv("KAIROS_API_KEY", "k")
+def test_health_stays_reachable_from_an_untrusted_peer(allowlist):
+    """/health is deliberately exempt.
+
+    Container HEALTHCHECKs, k8s probes and LB health checks come from
+    loopback/pod-internal addresses. Gating /health turns a probe into a
+    crashloop, and the endpoint only runs SELECT 1.
+    """
+    c = client_from("203.0.113.7")
+    assert c.get("/scheduler/health").status_code == 200
+
+
+def test_trusted_peer_asserting_identity_is_honoured(allowlist):
+    """The positive security property S1 exists to protect.
+
+    A genuinely trusted proxy's identity header must still work -- otherwise the
+    control has broken header mode rather than securing it.
+    """
+    req = _request_from("10.1.2.3", headers={"x-user": "alice", "x-email": "alice@example.org"})
+    assert auth.peer_is_trusted(req) is True
+    assert auth.get_user(req)["uid"] == "alice"
+
+
+def test_unconfigured_allowlist_still_honours_header_identity():
+    """The ETH/duplet invariant, pinned explicitly (PLAN.md): unset allowlist +
+    header mode + X-User owner => unchanged behaviour, from a peer that would
+    be untrusted if an allowlist existed."""
+    req = _request_from("203.0.113.7", headers={"x-user": "alice"})
+    assert auth.peer_is_trusted(req) is True
+    assert auth.get_user(req)["uid"] == "alice"
+
+
+def test_trusted_proxy_header_identity_works_end_to_end(allowlist, monkeypatch):
+    """The same property through a real request: the owner UI renders."""
+    from kairos import db, web
+
+    monkeypatch.setattr(web, "list_polls", lambda uid: [])
+    monkeypatch.setattr(web, "get_notifications", lambda uid, unread_only=False: [])
+    monkeypatch.setattr(db, "get_notifications", lambda uid, unread_only=False: [])
+    c = client_from("10.1.2.3")
+    c.headers["X-User"] = "alice"
+    assert c.get("/scheduler/", follow_redirects=True).status_code == 200
+
+
+def test_ipv4_mapped_ipv6_peer_matches_an_ipv4_allowlist(monkeypatch):
+    """A dual-stack listener ("--host ::", the container default) reports IPv4
+    clients as ::ffff:a.b.c.d. Without normalisation an operator following the
+    README example gets a silently dead app."""
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", settings._parse_networks("127.0.0.1", "T"))
+    assert auth.peer_is_trusted(_request_from("::ffff:127.0.0.1")) is True
+    assert auth.peer_is_trusted(_request_from("::ffff:203.0.113.7")) is False
+
+
+def test_log_names_the_enforced_allowlist_not_the_raw_var(allowlist, monkeypatch, caplog):
+    """Regression: the log used to print TRUSTED_PROXY_CIDRS while enforcement
+    read TRUSTED_PROXY_NETWORKS, so a disagreement was invisible."""
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_CIDRS", "10.0.0.0/8,127.0.0.1")
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", (ipaddress.ip_network("192.0.2.0/24"),))
     c = client_from("198.51.100.9")
     with caplog.at_level("WARNING", logger="kairos.proxy"):
-        c.get("/scheduler/health")
-    assert "198.51.100.9" in caplog.text
-    assert "10.0.0.0/8" in caplog.text  # names what was allowed, to make misconfig obvious
+        c.get("/scheduler/llms.txt")
+    assert "192.0.2.0/24" in caplog.text
+    assert "10.0.0.0/8" not in caplog.text
 
 
 # -- configuration parsing must not fail quietly ----------------------------
@@ -144,14 +203,21 @@ def test_middleware_logs_the_rejected_peer(allowlist, monkeypatch, caplog):
     [
         ("", ()),
         ("10.0.0.0/8", (ipaddress.ip_network("10.0.0.0/8"),)),
-        ("10.0.0.5", (ipaddress.ip_network("10.0.0.5"),)),  # bare IP
+        ("10.0.0.5", (ipaddress.ip_network("10.0.0.5"),)),  # bare IP -> /32
         (" 10.0.0.0/8 , 127.0.0.1 ", (ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("127.0.0.1"))),
-        ("10.0.0.1/24", (ipaddress.ip_network("10.0.0.0/24"),)),  # host bits ignored
         ("10.0.0.0/8,,", (ipaddress.ip_network("10.0.0.0/8"),)),  # trailing commas
     ],
 )
 def test_parse_networks_accepts(raw, expected):
     assert settings._parse_networks(raw, "T") == expected
+
+
+@pytest.mark.parametrize("raw", ["10.0.0.1/24", "192.168.1.7/16", "2001:db8::5/24"])
+def test_parse_networks_rejects_host_bits_set(raw):
+    """strict=True: "10.0.0.5/24" would silently trust 256 addresses and
+    "192.168.1.7/16" would trust 65 536. Refuse rather than widen an allowlist."""
+    with pytest.raises(RuntimeError, match="T"):
+        settings._parse_networks(raw, "T")
 
 
 @pytest.mark.parametrize("raw", ["not-an-ip", "10.0.0.0/99", "10.0.0.0/8,oops", "example.com"])
@@ -160,6 +226,37 @@ def test_parse_networks_rejects_garbage(raw):
     entry could void an allowlist the operator believes is in force."""
     with pytest.raises(RuntimeError, match="T"):
         settings._parse_networks(raw, "T")
+
+
+def test_env_to_settings_wiring_rejects_a_typo_at_startup():
+    """Every other test monkeypatches the parsed value, so pin the real
+    env -> settings path in a subprocess: a typo must fail the boot."""
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; sys.path.insert(0, 'src'); import kairos.settings"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "KAIROS_TRUSTED_PROXY_CIDRS": "10.0.0.0/8,typo"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "KAIROS_TRUSTED_PROXY_CIDRS" in result.stderr
+
+
+def test_env_to_settings_wiring_accepts_a_good_value():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'src');"
+            " from kairos.settings import TRUSTED_PROXY_NETWORKS as n; print(len(n))",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "KAIROS_TRUSTED_PROXY_CIDRS": "10.0.0.0/8, 127.0.0.1"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "2"
 
 
 # -- the load-bearing uvicorn setting ---------------------------------------
@@ -214,7 +311,7 @@ def test_real_server_xff_spoof_end_to_end(allowlist, monkeypatch, proxy_headers)
         # Allowlist deliberately excludes the real peer (127.0.0.1) and contains
         # only the address the caller is about to claim.
         monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", (ipaddress.ip_network("10.99.0.0/16"),))
-        status = _get(port, "/scheduler/health", xff="10.99.0.1").status
+        status = _get(port, "/scheduler/llms.txt", xff="10.99.0.1").status
         if proxy_headers:
             assert status == 200, "documents the hazard: uvicorn's rewrite defeats the allowlist"
         else:
@@ -235,7 +332,7 @@ def test_real_server_admits_genuinely_allowlisted_peer(allowlist, monkeypatch):
     thread.start()
     _wait_for_port(port)
     try:
-        assert _get(port, "/scheduler/health", xff="203.0.113.99").status == 200
+        assert _get(port, "/scheduler/llms.txt", xff="203.0.113.99").status == 200
     finally:
         server.should_exit = True
         thread.join(timeout=5)
@@ -245,17 +342,23 @@ def test_real_server_admits_genuinely_allowlisted_peer(allowlist, monkeypatch):
 
 
 def _request_from(peer: str | None, headers: dict | None = None):
-    """A minimal Request carrying a chosen ASGI scope."""
+    """A minimal Request carrying a chosen ASGI scope.
+
+    Uses Starlette's real Headers so lookups are case-insensitive as they are on
+    an actual request — a plain dict would silently miss "X-User" when the test
+    wrote "x-user", which is how the header-identity tests first failed.
+    """
+    from starlette.datastructures import Headers
+
+    raw = [(k.encode(), v.encode()) for k, v in (headers or {}).items()]
     scope = {
         "type": "http",
         "method": "GET",
         "path": "/",
-        "headers": [],
+        "headers": raw,
         "client": (peer, 51000) if peer else None,
     }
-    if headers:
-        scope["headers"] = [(k.encode(), v.encode()) for k, v in headers.items()]
-    return type("R", (), {"scope": scope, "headers": {}})()
+    return type("R", (), {"scope": scope, "headers": Headers(raw=raw)})()
 
 
 def _free_port() -> int:

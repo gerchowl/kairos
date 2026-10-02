@@ -28,6 +28,53 @@ mail, rate limits #37) are blocking for hosted custom pages**, not merely "befor
 public launch". A convincing page on our domain, mailed from our DKIM-signed domain,
 is a phishing kit — and it destroys the mail reputation everything else depends on.
 
+## Identity: three families, not one — how Google/GitHub/MS/OpenAthens fit
+
+Asked whether the trust model should be IdPs and tokens rather than proxy
+allowlists. It already is — they are three *different* families, and conflating
+them is what makes the question feel open. Kairos supports all three; the design
+question is which is default and how they compose.
+
+| Family | Mechanism | Where it lives | Who uses it |
+|---|---|---|---|
+| **Proxy-asserted** | a trusted proxy injects `X-User` etc. | `KAIROS_AUTH=header` + #47 allowlist | Shibboleth, **OpenAthens**, oauth2-proxy, Authelia, Cloudflare Access, Tailscale — i.e. *any* SAML/OIDC IdP |
+| **First-party login** | Kairos is the OAuth/OIDC client | planned, #32 (magic-link) and see below | Google, GitHub, Microsoft — federated/social |
+| **Capability** | possession of a token in the URL | `KAIROS_AUTH=capability` (#30), invite tokens today | respondents, share links, agents |
+
+**The key point: every IdP named above already works today without Kairos
+knowing it exists.** Shibboleth and OpenAthens are SAML brokers; oauth2-proxy
+and Authelia terminate OIDC. All of them reduce to the same thing — *something
+verified the user and wrote the result into a request header* — which is exactly
+the header-mode contract, and exactly what #47 makes safe to rely on. Point any
+of them at Kairos, set `KAIROS_TRUSTED_PROXY_CIDRS` to the proxy, and you have
+Google/GitHub/MS/ETH federation with **zero Kairos code**.
+
+So the choice is not "IdPs vs proxy". It is:
+
+- **Federated login *outside* Kairos (proxy) — recommended default.** Kairos
+  stays a small, dependency-light backend with no OAuth surface, no token
+  storage, no session/redirect/PKCE machinery. Every compliance-reviewed IdP
+  stays in front of it. One integration, N IdPs.
+- **Federated login *inside* Kairos — only when we must be the client.** Worth it
+  when there is no proxy to deploy (hosted, single-tenant, no ops staff), or when
+  we want a one-click "sign in with Google" without the operator running
+  anything. Costs: a client per IdP, redirect URIs, `state`/`nonce`/PKCE, a
+  session table, an *IdP-side* subject allowlist (which then replaces the CIDR
+  allowlist as the trust boundary), plus account linking and recovery.
+
+**Recommend: support both, default to the proxy.** #47 makes family 1 safe;
+#32+ adds family 2 for the hosted case where no proxy exists; #30 adds family 3.
+`auth.get_user` is already a documented runtime-seam (`kairos.auth.get_user =
+mine`) for bespoke portals, which is a third escape hatch and should not be
+removed.
+
+**The composition rule to write down:** these are *not* alternatives to be
+picked once — they are layers. Capability tokens stay for respondents whatever
+the owner auth is (they must: respondents never get accounts). Owner auth picks
+family 1 or 2. And #47's allowlist is the trust boundary for family 1 only —
+if Kairos ever terminates OIDC itself, the allowlist stops being the thing that
+matters, which is exactly why defaulting to family 1 is the conservative choice.
+
 ## Exposure gates that have no owner (raised from `docs/design/productization-obligations.md`)
 
 The register names the hard pre-exposure gate as **A1–A3 + S1/S6 + M1**. S6 is
