@@ -172,6 +172,50 @@ small change and it is a precondition for putting this thing online at all.
    Note `#28` and `#46` both touch `pyproject.toml` — land the release first so
    the version bump does not have to rebase through the dependency hunks.
 
+## Deployment targets — Cloudflare (general) + ETH (self-host dogfood)
+
+Operator direction: the general/hosted version runs on **Cloudflare**; **ETH stays
+self-hosted** for academia and doubles as the dogfood test of the self-deployment
+path. That pairing is right, and it lines up with decisions already made:
+
+- **SQLite (#36) is now load-bearing, not just cheap.** Cloudflare D1 *is* SQLite.
+- **The WASM story is already proven here.** `site/playground/` runs this exact
+  server on **Pyodide** in the browser. Cloudflare Python Workers are also Pyodide,
+  so the playground is a working prototype of the hosted runtime — not a
+  from-scratch bet.
+- **Python Workers went GA 2026-09-21** (verified) and run FastAPI/Flask/Django
+  directly; Python 3.14 by default. Hyperdrive now exposes **PostgreSQL and MySQL**
+  to Python Workers through a socket bridge.
+
+### The honest catch: it is a DB-driver port, not a config change
+
+`dbconn.py` is 97 lines and branches on `DB_URL.startswith("sqlite")` into either
+`sqlite3.connect(path)` or `pymysql`. That works because both are *in-process*
+drivers over a real socket or file.
+
+- **D1 is not `sqlite3`.** It is a *binding* (`env.DB.prepare(...).all()`) — async,
+  HTTP-backed. The Workers filesystem is ephemeral, so there is no local
+  `kairos.db` to open. A D1 dialect means rewriting the driver layer and auditing
+  every query for D1's constraints (single-writer, no cross-request transactions).
+- **Hyperdrive keeps `pymysql`-shaped code**, but Hyperdrive is for *connection
+  pooling to an existing DB*, which reintroduces the external-database dependency
+  (Neon/PlanetScale/RDS) that the SQLite decision deliberately avoided.
+- `threading` and `multiprocessing` import but are non-functional in Workers.
+
+So the real work is a third dialect adapter, not deployment config. Filed as #54.
+Sequencing note: this is a **bigger** change than anything in Phase 1, and it is
+the one item that would change the shape of the project. Do it after #47/#51/#48,
+not before.
+
+### ETH dogfooding: worth it, but it tests a *different* dialect
+
+ETH runs **MariaDB**; Cloudflare would run **D1/SQLite**. So dogfooding at ETH
+genuinely exercises the self-host path — which is the product — but it exercises
+the SQL dialect that hosted will *not* use. The CI matrix already covers sqlite
+e2e (`test_sqlite_e2e.py`), which is the closer proxy. ETH's unique value is
+proving "one Python process behind nginx on a VM, wired to an external IdP" keeps
+working across upgrades — keep it for that, not as dialect coverage.
+
 ## Phase 1 — independent enablers (parallel, unblock hosting)
 
 No dependencies. Land in this order — security first, because it is cheap and it
@@ -250,6 +294,47 @@ putting a consent-bannered, mail-capable origin on the public internet.
 - Refresh `README.md` / `FEATURE-MATRIX.md` as ADRs get accepted (the
   `guardrails-adr-matrix` pre-commit gate, run by the CI `gates` job, enforces
   the latter).
+
+## CI — stay on GitHub Actions, and self-host the runners if you want "own infra"
+
+Operator asked about Buildkite vs Tekton/Argo. Deciding against all three, for a
+specific reason rather than inertia: **Argo and Tekton require a Kubernetes
+cluster, and the stated hosting target is Cloudflare, which is not one.** Choosing
+them means adopting a cluster purely to run CI for a scheduling-poll app — a new
+infrastructure burden, in a different paradigm from the target platform, for a
+project whose CI is six jobs that finish in ~45s.
+
+The Buildkite column is worth separating out, because it is the only real
+question: *"can we build on our own infrastructure?"* Yes — and you do not need
+Buildkite for it. **Self-hosted GitHub Actions runners** give you the same
+property (your infra, your agents, no vendor, free for a public repo) inside the
+tooling you already have. Buildkite would add a vendor, a licence, and a plugin
+ecosystem to solve a problem you can solve with a runner label.
+
+```
+runs-on: [self-hosted, linux, x64, eth]   # instead of ubuntu-latest
+```
+
+### The caveat that decides where the runner lives
+
+A self-hosted runner **executes code from pull requests**. Putting one on the same
+box that serves ETH academic traffic means any PR — including a hostile one —gets
+code execution on a production host. That is a real and avoidable risk.
+
+Options, best first:
+
+1. **A separate small VM** (or a local container on a non-production host). Clean.
+2. **Restrict the runner to non-PR events** — run CI on push to `main`, not on
+   `pull_request`. Loses pre-merge signal; pairs with required-checks configured
+   accordingly.
+3. **Do nothing.** Current cost is ~6 jobs × ~45s on GitHub-hosted runners, which
+   for a public repo is free. The honest assessment: the *motivation* for own-infra
+   CI is usually speed, privacy, or cost — and at this size none of the three is
+   binding yet.
+
+Recommendation: **stay on `ubuntu-latest` now**, revisit if CI time or a
+data-residency requirement actually bites. Write the runner label into the workflow
+as a comment so the migration is a one-line change when it does.
 
 ## Per-PR working agreement
 
