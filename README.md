@@ -115,4 +115,17 @@ provider); the ETH/duplet Shibboleth deployment is unchanged.
 > run uvicorn yourself rather than via the `kairos` entrypoint, pass
 > `proxy_headers=False` so it does not rewrite that address before Kairos sees it.
 
+> **Outbound mail (operators):** `SMTP_FROM` is the address every message is sent from,
+> and the poll owner appears only as the display name and in `Reply-To` — a poll owner's
+> own address cannot be authenticated from your domain. **Self-hosting? Stop here:**
+> point `SMTP_FROM` at your own mailbox, leave `KAIROS_HOSTED` unset, and nothing else
+> changes. Set `KAIROS_HOSTED=1` only when *you* send from *your* domain and therefore
+> own its reputation — then `KAIROS_FROM_DOMAIN` is required, and Kairos refuses to send
+> (rather than sending unauthenticated or from a personal mailbox) unless `SMTP_FROM`
+> and `KAIROS_IMIP_ORGANIZER` are mailboxes on it. SPF/DKIM/DMARC are DNS records Kairos
+> cannot publish or read, so it cannot confirm they exist — every boot logs the identity
+> it is about to send as. **[`docs/design/mail-auth.md`](docs/design/mail-auth.md) has the
+> exact records, the staged `p=none` → `quarantine` → `reject` plan, and how to verify
+> them.**
+
 > **Cookie note for operators:** Kairos sets only strictly-necessary cookies (session, signed response-edit token, theme preference) — disclosed on `/privacy`, no consent banner required (ePrivacy Art. 5(3) / Swiss TCA 45c exemptions). If you add analytics or any third-party embeds to your deployment, that changes — you'll need consent management.

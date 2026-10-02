@@ -19,3 +19,4 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Optional accounts / multi-tenancy (planned) | — | ADR-0009 |
 | Agent surfaces: REST API, `/llms.txt`, OpenAPI, MCP, `agent.json` | `api.py`, `main.py`, `public.py`, `mcp/` | ADR-0010 |
 | Brand & hosting home (nerdmachines house brand, `kairos.nerdmachines.com`) | `docs/design/productization-obligations.md` | ADR-0011 |
+| Outbound-mail identity gate (`KAIROS_HOSTED` + `KAIROS_FROM_DOMAIN`, obligation M1) + SPF/DKIM/DMARC runbook | `email_service.py`, `settings.py`, `main.py`, `docs/design/mail-auth.md` | ADR-0011 |
