@@ -182,9 +182,14 @@ def dashboard(request: Request):
 
     polls = list_polls(user["uid"])
     for poll_row in polls:
-        poll_row["conv"] = convergence(poll_row, get_responses(poll_row["id"]),
-                                       get_invites(poll_row["id"]))
-        poll_row["invite_count"] = len(get_invites(poll_row["id"]))
+        # Fetch invites once and reuse. This called get_invites() twice per poll
+        # (once for convergence, once for invite_count), so the dashboard issued
+        # 3 queries per poll instead of 2. At the Cloudflare free tier's 50 D1
+        # subrequests per invocation that is the difference between the dashboard
+        # rendering at 16 polls and at 24 -- see tests/test_dashboard_queries.py.
+        invites = get_invites(poll_row["id"])
+        poll_row["conv"] = convergence(poll_row, get_responses(poll_row["id"]), invites)
+        poll_row["invite_count"] = len(invites)
 
     return render(env, "dashboard.html", user=user, title="Kairos",
                   polls=polls, **_nav_ctx(user))
