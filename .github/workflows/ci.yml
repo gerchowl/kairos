@@ -160,6 +160,10 @@ jobs:
         # userinfo, so printing it raw leaks in cleartext, silently.
         run: |
           set -ex
+          # `--network none` and a db host that does not exist: the app prints
+          # its banner and then exits with "Application startup failed", which is
+          # expected and irrelevant — the banner is emitted before uvicorn serves.
+          # The `|| true` covers that exit; the two greps are the assertion.
           podman run --rm -e KAIROS_DB_URL=mysql://kairos:SuperSecretPw123@db:3306/kairos \
             --entrypoint kairos --network none kairos:ci --port 9999 > /tmp/banner.txt 2>&1 || true
           cat /tmp/banner.txt
