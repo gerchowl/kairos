@@ -10,10 +10,11 @@ Runs locally (stdio) and talks to the Kairos REST API over HTTPS:
 
 Env:
     KAIROS_URL      base URL of your Kairos instance (default http://127.0.0.1:8003)
+    KAIROS_PREFIX   URL prefix the app is mounted under (default "", e.g. "/scheduler")
+                    — must match the server's KAIROS_PREFIX
     KAIROS_API_KEY  bearer key of the instance
 
-Registered in .claude/mcp.json so Claude Code sessions in this repo get
-kairos_* tools automatically.
+Point an MCP client at it with `uv run mcp/kairos_mcp.py` (stdio).
 """
 
 import os
@@ -22,13 +23,17 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 BASE = os.environ.get("KAIROS_URL", "http://127.0.0.1:8003").rstrip("/")
+# Mirrors kairos.settings.PREFIX: the app mounts /api under it, so the default
+# (unprefixed) deployment — including the README quickstart — is /api, not
+# /scheduler/api. Hardcoding the ETH/duplet prefix 404s everywhere else.
+PREFIX = os.environ.get("KAIROS_PREFIX", "").rstrip("/")
 KEY = os.environ.get("KAIROS_API_KEY", "")
 
 mcp = FastMCP("kairos")
 
 
 def _req(method: str, path: str, **kwargs):
-    r = httpx.request(method, f"{BASE}/scheduler/api{path}",
+    r = httpx.request(method, f"{BASE}{PREFIX}/api{path}",
                       headers={"Authorization": f"Bearer {KEY}"},
                       timeout=30, **kwargs)
     if r.status_code >= 400:
