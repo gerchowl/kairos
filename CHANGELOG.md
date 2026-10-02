@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.9.1](https://github.com/gerchowl/kairos/compare/v0.9.0...v0.9.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* **mcp:** honor KAIROS_PREFIX instead of hardcoding the ETH /scheduler path ([cefe201](https://github.com/gerchowl/kairos/commit/cefe201fd85be6cfc84117c6295959676f0cf32c))
+
+
+### Documentation
+
+* **adr:** 0011 — ship Kairos under the nerdmachines house brand ([#45](https://github.com/gerchowl/kairos/issues/45)) ([0ed63da](https://github.com/gerchowl/kairos/commit/0ed63da7253ca8d25f452ecae4c281d0fd628b46))
+* **adr:** deduce Kairos ADRs + wire guardrails adr-matrix gate ([#39](https://github.com/gerchowl/kairos/issues/39)) ([2cceb2d](https://github.com/gerchowl/kairos/commit/2cceb2d50e2eb8faaf51bbbb04c0ae7cb0a713b9))
+* bring-up plan (PLAN.md), ADR-0012 draft, retire stale HANDOFF ([07355d2](https://github.com/gerchowl/kairos/commit/07355d2d9257a2a49813a3086cfd9aebf9bc96b4))
+* multi-tenancy & hosting design sketch ([#27](https://github.com/gerchowl/kairos/issues/27)) ([3d4d208](https://github.com/gerchowl/kairos/commit/3d4d208480e3135b54371fcbf7704007f9153d31))
+* productization obligations register ([#42](https://github.com/gerchowl/kairos/issues/42)) ([067ef09](https://github.com/gerchowl/kairos/commit/067ef09acb1a189c013efb3c549c9521918c899b))
+* real registrar (Namecheap) domain check — corrects RDAP ([#44](https://github.com/gerchowl/kairos/issues/44)) ([066d642](https://github.com/gerchowl/kairos/commit/066d6426449ada0eb298d45cf11f9114c7316cd6))
+
 ## [0.9.0](https://github.com/gerchowl/kairos/compare/v0.8.0...v0.9.0) (2026-07-01)
 
 
