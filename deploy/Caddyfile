@@ -1,0 +1,49 @@
+# Caddy in front of Kairos — automatic HTTPS, reverse-proxy to oauth2-proxy.
+#
+# Mounted read-only by compose.proxy.yaml. Every value is injected from the
+# environment by that compose file (KAIROS_SITE, ACME_EMAIL) so the same file
+# works for staging and production without an edit.
+#
+# Caddy is deliberately the *only* thing published on the host. Kairos and
+# oauth2-proxy are reachable only on the compose networks.
+
+{
+	email {$ACME_EMAIL}
+	# Uncomment to test against the internal CA instead of Let's Encrypt, which
+	# has strict rate limits and will not issue for a non-resolvable hostname:
+	#   tls internal
+}
+
+{$KAIROS_SITE} {
+	encode zstd gzip
+
+	reverse_proxy oauth2-proxy:4180 {
+		# oauth2-proxy needs to build absolute redirect URLs for the sign-in
+		# flow. Caddy sets these from the real request, so nothing is trusted
+		# from the client's own headers.
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+		# Kairos is a single-origin app: no cross-origin XHR, no framing from
+		# elsewhere. `frame-ancestors` covers the CSP equivalent.
+		Content-Security-Policy "frame-ancestors 'self'"
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# ACME HTTP-01 / TLS-ALPN challenges are served by Caddy automatically. Do not
+# put Kairos in front of this port — the proxy chain is
+#   client -> :443 Caddy -> :4180 oauth2-proxy -> :8000 kairos
+# and every hop must preserve the real client address, which Kairos's
+# KAIROS_TRUSTED_PROXY_CIDRS check depends on.

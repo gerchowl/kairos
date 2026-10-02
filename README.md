@@ -21,6 +21,36 @@ KAIROS_AUTH=header SESSION_SECRET=$(openssl rand -hex 32) \
 uvx --from 'kairos-scheduler[mysql]' kairos --host 0.0.0.0
 ```
 
+## Container
+
+`Dockerfile` + `compose.yaml` in this repo — SQLite on a named volume, non-root,
+no build toolchain in the runtime layer.
+
+```sh
+podman compose up -d                  # build, run, http://127.0.0.1:8003/
+podman compose logs -f kairos
+```
+
+The database is on the volume, so `down` and `up` keep every poll (`down -v`
+deletes them). It publishes on **loopback only** and runs in demo auth, which
+means one shared owner and no authentication — fine locally, never on a public
+interface.
+
+Real deployments add a TLS terminator and an OIDC proxy in front:
+
+```sh
+cp .env.example .env && $EDITOR .env   # secrets; compose refuses to start without them
+podman compose -f compose.proxy.yaml up -d
+```
+
+MariaDB instead of SQLite, on the same image:
+`podman compose -f compose.yaml -f compose.mysql.yaml up -d`.
+
+**Read [`docs/design/self-host-hardening.md`](docs/design/self-host-hardening.md)
+before exposing this to anyone** — TLS, the trusted-proxy allowlist, backups,
+and the choices this image deliberately leaves to you (base image, registry,
+retention).
+
 ## Features
 
 - Full-day or time-slot polls, when2meet drag grids, heatmaps
@@ -72,6 +102,8 @@ Kairos trusts identity headers from whatever reverse proxy you already run
 (`KAIROS_AUTH=header`): Shibboleth/Apache, oauth2-proxy, Authelia, Cloudflare
 Access, Tailscale… Respondents never need accounts — share links and invite
 tokens are self-contained. See `kairos/settings.py` for all env knobs.
+`compose.proxy.yaml` wires up the generic case (Caddy + oauth2-proxy + any OIDC
+provider); the ETH/duplet Shibboleth deployment is unchanged.
 
 > **Before exposing a hosted instance, set `KAIROS_TRUSTED_PROXY_CIDRS`.** Header
 > mode trusts whoever sets the identity headers, so anything that can reach the
