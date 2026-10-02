@@ -62,8 +62,67 @@ So the choice is not "IdPs vs proxy". It is:
   session table, an *IdP-side* subject allowlist (which then replaces the CIDR
   allowlist as the trust boundary), plus account linking and recovery.
 
-**Recommend: support both, default to the proxy.** #47 makes family 1 safe;
-#32+ adds family 2 for the hosted case where no proxy exists; #30 adds family 3.
+### Correction: the ETH deployment does not use header-trust at all
+
+Checked rather than assumed (`duplet-webserver/libs/duplet_common/auth.py`, and
+`apps/scheduler/src/main.py`):
+
+- The adapter does **not** go through `kairos.cli` — it calls
+  `create_app()` itself, so `proxy_headers=False` does not apply there. That part
+  of the earlier warning was right.
+- But it also does `kairos_auth.get_user = lambda r: duplet_auth.get_user(r,
+  "scheduler")`, i.e. it **replaces identity resolution entirely**. Kairos's
+  `_header_user` never runs, so `KAIROS_AUTH=header` is vestigial there.
+- ETH's real model is stronger than header trust: SWITCHaai produces headers for
+  *any* Swiss-university account, so `get_user` requires the identity to resolve
+  to a **known user in the directory** (`find_user_by_emails`) with an explicit
+  app grant. Its own comment: "spoofed headers fail the DB check".
+
+So the S1 allowlist is **not** what makes the flagship deployment safe, and
+#47 cannot regress it — the middleware still runs (it is inside `create_app`) but
+is not load-bearing there. Correcting my earlier claim that #47 being inert
+"silently still works": it is inert, but nothing depended on it.
+
+Two things this changes:
+
+1. **Directory-allowlist is the pattern worth copying**, not header trust. Any
+   first-party OIDC work should allowlist by *known subject*, never admit
+   "anyone the IdP vouched for".
+2. **It sets the bar for universal self-hosting.** ETH is a bespoke Shibboleth +
+   directory + per-app-grant adapter. That is a fine flagship and a terrible
+   default — no self-hoster is going to build one. So the *primary* self-host path
+   must be the one requiring least wiring, which is not header mode.
+
+### What "industry standard" actually means here — separating two things
+
+- **TLS termination in front: yes, still universal.** Something has to do TLS,
+   and nginx/Caddy in front of uvicorn is the normal answer. Keep that.
+- **Auth by injected headers: no, this is the legacy pattern.** nginx cannot
+   terminate OIDC, which is precisely why `oauth2-proxy` and `Authelia` exist as
+   separate boxes to bolt on. Every self-hosted app that people actually run
+   (Grafana, Nextcloud, Vault, Gitea, Immich, Jellyfin) terminates OIDC itself,
+   because that is what makes deployment one env var instead of an infrastructure
+   project.
+
+So the duplet/ETH shape is a *legacy-integration* pattern and should be labelled as
+one — good for an institutional deployment that already has Shibboleth, not the
+template for "self-host Kairos".
+
+### The universal ladder, by wiring required
+
+| Effort for the operator | Mode | Notes |
+|---|---|---|
+| **zero** | `demo` (current default) | single owner, no auth. Already universal. |
+| **zero** | capability tokens (#30) | link-based; respondents and sharing never need accounts (ADR-0001) |
+| **~4 env vars** | **first-party OIDC (#53)** | any OIDC provider: Google, GitHub, Microsoft, Authentik, Keycloak, Zitadel, Authelia's own OIDC endpoint |
+| an infrastructure project | proxy + header mode (#47) | correct when you already run Shibboleth/oauth2-proxy/Authelia |
+
+**Revised recommendation: promote #53 to the primary multi-user self-host path.**
+It is the only rung that is both multi-user and cheap, and implementing OIDC
+properly is the same work whether the trigger is "no proxy available" or "this is
+the default". Keep header mode as the adapter/legacy path — it is genuinely the
+right answer inside an institution that already has a broker — and keep
+`auth.get_user` as the runtime seam.
 `auth.get_user` is already a documented runtime-seam (`kairos.auth.get_user =
 mine`) for bespoke portals, which is a third escape hatch and should not be
 removed.
