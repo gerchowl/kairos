@@ -17,3 +17,4 @@ must appear in the repo `FEATURE-MATRIX.md` (enforced by `guardrails-adr-matrix`
 | [0009](0009-optional-owner-multitenancy.md) | Optional-owner multi-tenancy (capability-first) | **Proposed** |
 | [0010](0010-agent-native-by-contract.md) | Agent-native by contract | **Accepted** |
 | [0011](0011-nerdmachines-house-brand.md) | Ship under the nerdmachines house brand (`kairos.nerdmachines.com`) | **Accepted** |
+| [0012](0012-scheduling-primitive-surface-tiers.md) | Scheduling primitive, four shapes, three surface tiers, agent-first | **Proposed** |

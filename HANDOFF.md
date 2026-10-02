@@ -1,15 +1,22 @@
-# Kairos — session state (2026-06-05)
+# Kairos — session state
 
-Everything requested is DONE, released as v0.2.0 (release-please), and
-deployed: duplet ent runs kairos v0.2.0 (health ok, old polls intact).
+**This file is superseded by [`PLAN.md`](PLAN.md).** It previously claimed the
+project was "everything DONE at v0.2.0", which was already stale when written.
 
-Release flow from now on: conventional commits on main -> release-please
-PR -> merge = tag + GH release -> bump pin in duplet
-apps/scheduler/pyproject.toml + uv lock + deploy.sh ent scheduler.
-NOTE: the adapter keeps mysql-connector-python — vendored duplet_common
-needs it (kairos itself uses pymysql since the CI license gate flagged
-the connector as GPL).
+Current state (2026-10-02): `main` at the ADR-0011 house-brand commit, v0.9.0
+released, 107 tests green. The reverse-calendar arc (`goal.md`, issue #23) is
+**shipped** — only P4 live cross-client verification remains, and that needs a
+real mailbox. Work is now the productization arc, issues #29–#38 under Epic #38.
+
+Read `PLAN.md` for the sequenced roadmap and the per-PR working agreement.
+Release flow: conventional commits on main -> release-please PR -> merge = tag
++ GH release -> bump the pin in duplet `apps/scheduler/pyproject.toml` + uv lock
++ `deploy.sh ent scheduler`.
+
+NOTE: the duplet adapter keeps mysql-connector-python — vendored duplet_common
+needs it (kairos itself uses pymysql because the CI license allowlist gate
+flags the connector as GPL).
 
 CI: tests / quickstart / mysql(MariaDB) / licenses(allowlist) /
-audit(pip-audit). Dependabot: uv + npm + actions, weekly, grouped.
-Dev: direnv allow; commit via `nix develop -c git commit`.
+audit(pip-audit) / gitleaks / ADR obligation gates. Dev: direnv allow;
+commit via `nix develop -c git commit`.
