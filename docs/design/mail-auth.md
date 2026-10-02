@@ -104,7 +104,8 @@ mail.nerdmachines.com.  TXT  "v=spf1 include:<your-provider's-spf> -all"
   dashboard; do not guess it, because a wrong `include:` is silently unauthorised.
 - If your provider gives you a **custom MAIL FROM / Return-Path** domain (Cloudflare
   Email Routing, SendGrid, SES all do), also add that to SPF **and** note that its
-  domain must be DMARC-aligned too if you ever set strict alignment (§7).
+  domain must be DMARC-aligned too if you ever set strict alignment (see the DMARC
+  section below).
 
 ### DKIM
 
@@ -112,12 +113,16 @@ mail.nerdmachines.com.  TXT  "v=spf1 include:<your-provider's-spf> -all"
 <selector>._domainkey.mail.nerdmachines.com.  TXT  "<public key>"
 ```
 
-- **4096-bit is the target** (RFC 8301 §3; the ceiling). RSA 2048 is the fallback when
-  the provider caps it — **Google Workspace caps DKIM at 2048-bit** and offers no
-  larger key, and most transactional providers default to 2048. Use 4096 where your
-  provider allows it; where it does not, 2048 is fine. A *key mismatch* is
-  catastrophic, a 2048-bit key is not — do not hand-roll a longer key your provider
-  will not actually sign with.
+- **4096-bit is the target.** RFC 8301 §3.2 sets the floors and ceilings: signers MUST
+  use ≥1024 and SHOULD use ≥2048, while verifiers MUST validate 1024–**4096** and MAY
+  handle larger. So 4096 is the top of the range every verifier is required to support,
+  not a maximum the RFC imposes on you — a larger key is permitted, merely not
+  universally supported. RSA 2048 is the fallback when the provider caps it: **Google
+  Workspace caps DKIM at 2048-bit** and offers no larger key, and most transactional
+  providers default to 2048. Use 4096 where your provider allows it; where it does not,
+  2048 is fine and is what the RFC asks signers to prefer anyway. A *key mismatch* is
+  catastrophic, a 2048-bit key is not — do not hand-roll a longer key your provider will
+  not actually sign with.
 - **The selector is yours to choose** and the provider generates it (`s1`, `s2`, or a
   random token). Two DKIM selectors may coexist — that is how you rotate without an
   outage: publish the new key, switch the provider, wait for the old signature to age
@@ -149,20 +154,45 @@ original message and headers, which for Kairos means respondents' email addresse
 the inbox of whoever you route them to — a privacy problem that contradicts
 obligation P1. Most large receivers ignore `ruf` anyway.
 
-**Why `pct=100`.** `pct` is the percentage of failing mail the policy is *applied* to.
-It defaults to 100, but it is worth pinning explicitly, and it matters most during
-staging: with `pct=10` you are applying the policy to a tenth of your mail and
-looking at reports derived from that tenth. The failures you are hunting for live in
-the other 90%. So the sequence is `p=none pct=100` → `p=quarantine pct=100` →
-`p=reject pct=100`, keeping the whole volume under observation the entire way. If you
-later want to canary `p=reject` in production, use a deliberately small `pct` for that
-one step, with `rua` still on, and raise it only once the reports stay clean.
+**Why `pct=100`.** `pct` throttles **enactment** of the policy, and only enactment. Per
+RFC 7489 §6.6.4 a receiver MUST NOT enact the requested policy on more than that
+percentage of affected messages — but *regardless of whether `pct` is present*, it MUST
+include all relevant message data in any reports produced. Receivers also implement
+`pct` statistically, as a representative sample across a reporting period.
 
-**Relaxed alignment, do not tighten it.** Leave `adkim`/`aspf` unset (both default to
-`relaxed`, where a subdomain of the From domain counts). `strict` also requires the
-**envelope** sender (MAIL FROM / Return-Path) to be aligned, which most providers do
-not do by default and which fails in ways that are hard to diagnose from the sending
-side.
+Two consequences, and the second is the one people get wrong:
+
+1. At `p=none` the policy is **monitor-only** and SHOULD NOT modify mail disposition at
+   all (RFC 7489 §6.7). So `pct` has no observable effect during stage 1 — it is not
+   thinning your reports, and a quiet inbox at `p=none` means *no failures*, never
+   "only 10% of failures were reported". Do not read a partial `pct` as a sample of
+   your own failures.
+2. From `p=quarantine` onwards, `pct` really does dilute enforcement — and note that a
+   message not selected for `reject` is treated as though `quarantine` applies
+   (RFC 7489 §6.6.4), not as though nothing applied.
+
+So the sequence is `p=none pct=100` → `p=quarantine pct=100` → `p=reject pct=100`: the
+whole volume is observable at every stage, and enforcement is never partially on while
+you are still learning what your reports say. If you later want to canary `p=reject` in
+production, use a deliberately small `pct` for that one step, with `rua` still on, and
+raise it only once the reports stay clean.
+
+**Relaxed alignment, do not tighten it.** Leave `adkim`/`aspf` unset — both default to
+`relaxed`, which requires the **Organizational Domains** of the DKIM `d=` domain and the
+RFC5322.From domain to be *equal* (RFC 7489 §3.1.1), so a subdomain of the From domain
+counts because it shares its organisational domain. `strict` instead requires an exact
+FQDN match, and additionally requires the **envelope** sender (MAIL FROM / Return-Path)
+to be aligned, which most providers do not do by default and which fails in ways that
+are hard to diagnose from the sending side.
+
+⚠ **Organizational Domain is not "whatever suffix you share."** It is derived from the
+Public Suffix List, and Kairos does not implement that (it would be a new dependency).
+For the ordinary case — `mail.nerdmachines.com` under `nerdmachines.com` — the two
+coincide. They do **not** coincide under a multi-label public suffix: in
+`nerdmachines.co.uk`, `co.uk` is the public suffix, so `attacker.nerdmachines.co.uk` is
+a different registrable domain and would *not* be aligned. If your sending domain sits
+under such a suffix, set `KAIROS_FROM_DOMAIN` to the registrable parent
+(`nerdmachines.co.uk`), not the subdomain.
 
 ### The DMARC staging plan, and why it takes weeks
 
@@ -196,9 +226,11 @@ operator-run check, on a schedule ([§8](#8-did-it-rot)).
 
 ```bash
 D=mail.nerdmachines.com
+SELECTOR=s1   # from your provider's DKIM settings; it is not always "s1"
 
 dig +short TXT "$D"                      # SPF: exactly one v=spf1
-dig +short TXT "s1._domainkey.$D"        # DKIM: one or more 255-char chunks
+dig +short TXT "$SELECTOR._domainkey.$D" # DKIM: one or more 255-char chunks
+                                      # SELECTOR is your provider's; it is not always "s1"
 dig +short TXT "_dmarc.$D"               # DMARC: v=DMARC1, pct=100
 
 # Mail-path checks (send a real message to a mailbox you control, then inspect it):
@@ -284,9 +316,18 @@ Two things the code checks that are easy to get wrong:
   deployment will refuse.
 - **`KAIROS_IMIP_ORGANIZER` must be on it too**, because Kairos sends iMIP invites
   *from* the organizer address and writes the same address into `ORGANIZER:`.
-- **The envelope sender matters for future strict alignment.** Kairos does not set
-  `MAIL FROM` — the relay does. Check that the provider's bounce domain is aligned, or
-  note it as a known limitation while you stay on relaxed alignment.
+- **The envelope sender does follow `SMTP_FROM`, which matters for strict alignment.**
+  Kairos passes no explicit envelope sender, so `smtplib` derives `MAIL FROM` from the
+  **first** address in the `From:` header it just built (`send_message()` calls
+  `getaddresses(msg["From"])[0][1]` when `from_addr` is not supplied). Since Kairos builds
+  that header from `SMTP_FROM`, the envelope sender is `SMTP_FROM` — aligned while you
+  stay on relaxed alignment. Tightening to `aspf=s`/`adkim=s` later would also require
+  the relay's own `MAIL FROM`, which some providers set to a separate bounce domain of
+  their own; check that provider's domain, or stay relaxed.
+
+  This is also why `SMTP_FROM` is required to be **one bare addr-spec**: an address list
+  or a display name changes which address comes first, and the envelope sender follows
+  it. `kairos.email_service.domain_of()` rejects those forms rather than trusting them.
 
 ---
 
@@ -305,8 +346,9 @@ domain is the authenticated one:
 Two consequences worth stating, because both are load-bearing:
 
 - **The owner's address never appears in `From:`.** A poll owner's personal address
-  cannot be DKIM-signed by our domain, so a message sent *as* them fails SPF/DMARC
-  (RFC 7489 §5.2) — the design already put them in `Reply-To` and the display name
+  cannot be DKIM-signed by our domain, so a message sent *as* them fails DMARC — filtering
+  turns on whether the From domain is aligned with an authenticated one, and theirs is
+  not (RFC 7489 §4.2). The design already put them in `Reply-To` and the display name
   instead. That is correct and should not be "fixed".
 - **iMIP invites send no `Reply-To` override.** The client must answer
   `METHOD:REPLY` to `ORGANIZER:` so it lands in the mailbox Kairos polls
@@ -395,8 +437,32 @@ the records it claims to describe.
 M1 is **PARTIAL**. The code half is landed and tested: a hosted deployment refuses to
 send from an identity that cannot be authenticated, and logs what it is about to send
 at every boot. The DNS half is entirely the operator's and is unstarted — no records
-have been published and no provider has been chosen. Until they are, `KAIROS_HOSTED=1`
-plus a correct `KAIROS_FROM_DOMAIN` will still fail closed if the sender is wrong, but
-a correctly configured sender with **no** SPF/DKIM/DMARC published will send
-unauthenticated mail. Kairos cannot detect that, and this document is where that fact
-is recorded.
+have been published and no provider has been chosen.
+
+### State this plainly: the gate protects identity, not volume
+
+The sharpest residual risk, and the most likely operational state, is:
+
+> `KAIROS_HOSTED=1` + a correct `KAIROS_FROM_DOMAIN` + an on-domain `SMTP_FROM` +
+> **zero DNS records published** ⇒ Kairos sends on-domain mail that is entirely
+> unauthenticated and looks entirely legitimate.
+
+Every check in the gate passes, because all of them are about *which identity* is used
+and every one of them is satisfied. Nothing fails closed, because from Kairos' side
+nothing is wrong. Kairos cannot detect it — verifying DNS would need a resolver, which
+is a dependency, and the records live in an account Kairos has no credentials for. So
+**a green boot line is not evidence that the records exist**; it is evidence that the
+configuration is self-consistent. The `dig` commands in §3 are the only real check, and
+they have to be run by a person.
+
+Two further limits worth being blunt about:
+
+- **M1 does not protect the domain's reputation on its own.** The threat is a convincing
+  page on our domain mailed from our DKIM-signed domain to arbitrary recipients — but
+  that requires recipients to *receive* it, which is A2 (verify the creator before any
+  third-party send) and #51 (scoped API/MCP + send budgets). DKIM signing does not
+  help there; it makes the mail *more* convincing. The gate constrains the sender; the
+  abuse trio constrains the volume.
+- **What actually destroys a sending domain is the spam-complaint rate** (§4), which is
+  also a volume property. M1 buys authentication and DMARC eligibility; it does not buy
+  a good complaint rate.

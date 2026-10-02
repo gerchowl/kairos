@@ -6,12 +6,14 @@ SPF/DMARC. The owner appears as the From *display name* ("X via Kairos") and
 as Reply-To, so replies go to them.
 """
 
+import ipaddress
 import logging
 import os
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
+from typing import NamedTuple
 
 from kairos import settings
 from kairos.helpers import env
@@ -45,15 +47,16 @@ SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@example.org")
 # Domains nobody can publish DMARC for. "Never a personal Gmail" is structural rather
 # than stylistic: gmail.com's DNS is Google's to set, Google terminates consumer
 # accounts that send automated mail, and consumer SMTP submission is capped around
-# 5000 messages/day. Matched exactly, plus brand labels, which covers the country
-# variants (hotmail.co.uk, outlook.de, yahoo.co.jp) that an exact list always misses.
-# Not a Public Suffix List — that is a new dependency, and the false-positive risk is
-# nil here anyway because these names are only ever checked against addresses the
-# operator typed in themselves.
+# 5000 messages/day. This list is a floor, not a ceiling -- _aligned_with rejects any
+# foreign domain at all, a provider Kairos has never heard of included.
 #
-# This list is a floor, not a ceiling. The load-bearing check is alignment against
-# KAIROS_FROM_DOMAIN, which rejects any foreign domain at all, a provider Kairos has
-# never heard of included.
+# _CONSUMER_LABELS exists to catch the country variants (hotmail.co.uk, outlook.de,
+# yahoo.co.jp, mail.msn.com) that an exact list always misses. It cannot be a Public
+# Suffix List -- that is a new dependency -- so it matches brand names anywhere in the
+# domain. That over-matches operator domains that contain a brand name, which is why
+# the address checks below only apply it to domains that are NOT already aligned with
+# the operator's declared domain: alignment is the authoritative test, and it cannot
+# be spoofed by a coincidence in the label.
 _CONSUMER_DOMAINS = frozenset({
     "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com", "msn.com",
     "yahoo.com", "ymail.com", "rocketmail.com", "icloud.com", "me.com", "mac.com",
@@ -68,10 +71,12 @@ _CONSUMER_DOMAINS = frozenset({
 })
 
 _CONSUMER_LABELS = frozenset({
-    "gmail", "googlemail", "outlook", "hotmail", "yahoo", "ymail", "rocketmail",
-    "icloud", "aol", "gmx", "yandex", "protonmail", "tutanota", "zohomail",
-    "t-online", "wanadoo", "sbcglobal", "bellsouth", "earthlink", "optonline",
-    "btinternet", "interia", "onet", "sympatico",
+    "gmail", "googlemail", "outlook", "hotmail", "live", "msn",
+    "yahoo", "ymail", "rocketmail", "icloud", "aol", "gmx", "yandex",
+    "protonmail", "proton", "tutanota", "zohomail", "t-online", "wanadoo",
+    "sbcglobal", "bellsouth", "earthlink", "optonline", "btinternet", "interia",
+    "onet", "sympatico", "qq", "163", "126", "sina", "sohu", "nate", "hanmail",
+    "naver", "daum",
 })
 
 # RFC 2606 reserved names. Worth a message of their own because SMTP_FROM *defaults*
@@ -80,39 +85,119 @@ _CONSUMER_LABELS = frozenset({
 _PLACEHOLDER_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
 
 
-def domain_of(address: str) -> str:
-    """The domain of an email address, normalised for comparison.
+class MailRefusal(NamedTuple):
+    """Why outbound is blocked, in both machine- and human-readable form.
 
-    Accepts a bare domain too (KAIROS_FROM_DOMAIN is one) and strips the angle
-    brackets a From header carries. Returns "" for anything that is not a domain — a
-    bare word, a second "@", nothing at all — because callers must treat that as a
-    failure rather than as "no domain", which would align with everything.
+    Two fields because the two audiences differ: `message` is for the server log,
+    where naming the misconfigured variable is the whole point, while `code` is stable
+    enough for a caller to branch on. Callers surface `code` rather than `message` --
+    the message names internal addresses, and the person clicking Send in a hosted
+    deployment is a customer, not the operator.
     """
-    value = (address or "").strip().strip("<>").strip().rsplit("@", 1)[-1]
-    value = value.strip().rstrip(".").lower()
-    return value if "." in value and "@" not in value else ""
+
+    code: str
+    message: str
 
 
-def is_consumer_provider(address: str) -> bool:
-    """Is this a consumer/personal mailbox domain rather than one we control?"""
-    domain = domain_of(address)
+def is_ip_literal(value: str) -> bool:
+    """Is this an IP address rather than a domain name?
+
+    DKIM's `d=` tag must be a domain name, and DMARC alignment is defined over domain
+    names, so an IP literal can never be authenticated however it is published. An IPv6
+    literal additionally carries colons that no hostname may contain.
+    """
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def domain_of(value: str) -> str:
+    """The domain of a bare addr-spec or a bare domain, normalised. "" if not one.
+
+    Accepts `local@domain`, a bare `domain`, and either wrapped in angle brackets.
+    Everything else returns "". Strict on purpose, because SMTP_FROM is interpolated
+    into formataddr() as an *address* and formataddr does not escape what it is given:
+
+        formataddr(("Ada", "evil@attacker.test, kairos@our.domain"))
+        -> 'Ada <evil@attacker.test, kairos@our.domain>'
+
+    which is a single From header whose first address is the attacker's. smtplib then
+    derives the envelope sender from exactly that first address (send_message() calls
+    getaddresses(msg["From"])[0][1] when no from_addr is given), so a value that merely
+    *contains* our domain would sail through a naive "does it end in our domain" check
+    while the message goes out as somebody else entirely. Requiring one bare addr-spec
+    removes the whole class rather than trying to detect each separator.
+
+    Returns "" for an IP literal, which is never a domain name.
+    """
+    text = (value or "").strip()
+    if text.startswith("<") and text.endswith(">"):
+        text = text[1:-1].strip()
+    if not text:
+        return ""
+    local, sep, domain = text.rpartition("@")
+    if sep:
+        # A local part must exist and must not contain any character that could begin a
+        # second address, a group, or a quoted string -- those separators are precisely
+        # how an address list came to look aligned. "+" is deliberately allowed: it is
+        # valid atext, which is what reply+<token>@ (#34) depends on.
+        if not local or any(c in local for c in '<>@,;:"()[]\\'):
+            return ""
+    else:
+        domain = text  # a bare domain, as KAIROS_FROM_DOMAIN is written
+    domain = domain.strip().rstrip(".").lower()
+    if not domain or "." not in domain or is_ip_literal(domain):
+        return ""
+    return "" if any(c in domain for c in '<>@,;:"()[]\\ \t') else domain
+
+
+def _is_known_consumer_domain(domain: str) -> bool:
+    """Exact match against the consumer-provider list (no label heuristic)."""
+    return domain in _CONSUMER_DOMAINS
+
+
+def is_consumer_provider(value: str) -> bool:
+    """Does this look like a consumer/personal mailbox domain?
+
+    Exact set first, then the brand-label heuristic, which is what catches the country
+    and sub-addressed variants (`hotmail.co.uk`, `mail.gmail.com`, `mail.msn.com`).
+
+    The label half over-matches by construction: it cannot tell `gmx.de` from an
+    operator's own `gmx.example.com`. It is therefore only ever applied to a domain
+    that has *already* failed alignment, where a false positive costs nothing, and to
+    senders -- never to the operator's own declared domain. Use
+    `_is_known_consumer_domain` for that.
+    """
+    domain = domain_of(value)
     if not domain:
         return False
-    return domain in _CONSUMER_DOMAINS or any(lbl in _CONSUMER_LABELS for lbl in domain.split("."))
+    return _is_known_consumer_domain(domain) or any(
+        lbl in _CONSUMER_LABELS for lbl in domain.split("."))
 
 
-def _aligned_with(domain: str, declared: str) -> bool:
+def aligned_with(domain: str, declared: str) -> bool:
     """Would DMARC see `domain` as aligned with the visible From?
 
-    DMARC requires SPF or DKIM to pass on a domain sharing the From's Organizational
-    Domain, and computing an Organizational Domain needs the Public Suffix List.
-    Rather than approximate it, the operator names it (KAIROS_FROM_DOMAIN) and the
-    check becomes "is the sender that domain or a subdomain of it".
+    DMARC requires SPF or DKIM to pass on a domain whose Organizational Domain equals
+    the From's (relaxed alignment, RFC 7489 3.1.1), and computing an Organizational
+    Domain needs the Public Suffix List. Rather than approximate it, the operator names
+    it (KAIROS_FROM_DOMAIN) and the check becomes "is the sender that domain or a
+    subdomain of it".
 
-    The subdomain form is the *preferred* one — a dedicated mail.example.com sends for
-    the brand but keeps its reputation separate — so allowing it here is not a
-    loophole. The boundary does have to be a label boundary, though:
-    "evil-example.com" must not pass for "example.com", hence the leading dot.
+    That is a *narrower* test than relaxed alignment, not an equivalent one: it treats
+    any subdomain of the declared domain as aligned, which is right for the usual
+    single-registration case (mail.example.com under example.com) but would be wrong
+    for a public suffix -- under example.co.uk, co.uk is a public suffix, so
+    attacker.example.co.uk is a *different* registrable domain and would not in fact be
+    aligned. Documented in docs/design/mail-auth.md; an operator with such a domain must
+    declare the registrable parent.
+
+    The subdomain form is the *preferred* shape -- a dedicated mail.example.com sends
+    for the brand but keeps its reputation separate -- so allowing it is not a loophole.
+    The boundary does have to be a label boundary, though: "evil-example.com" must not
+    pass for "example.com", hence the leading dot.
     """
     if not domain or not declared:
         return False
@@ -134,66 +219,98 @@ def _identity_addresses() -> tuple[tuple[str, str], ...]:
     return tuple(slots)
 
 
-def sender_refusal() -> str | None:
+def sender_refusal() -> MailRefusal | None:
     """Why outbound mail must not be sent right now, or None to send.
 
     Every message goes out as one identity, so this checks a list of address slots
     rather than branching per mail type: one refused identity silences all of them.
-    Returns a sentence naming the knob to fix rather than a bare boolean, because the
-    point of this is that a human reads it in a log.
     """
     if not settings.HOSTED:
         return None
 
-    declared = domain_of(settings.FROM_DOMAIN)
+    raw = (settings.FROM_DOMAIN or "").strip()
+    declared = domain_of(raw)
     if not declared:
-        return ("KAIROS_HOSTED is set but KAIROS_FROM_DOMAIN is not, so there is no domain "
-                "to authenticate outbound mail from. Set KAIROS_FROM_DOMAIN to the domain "
-                "you publish SPF/DKIM/DMARC for (docs/design/mail-auth.md), or unset "
+        if not raw:
+            return MailRefusal(
+                "m1_from_domain_unset",
+                "KAIROS_HOSTED is set but KAIROS_FROM_DOMAIN is not, so there is no domain "
+                "to authenticate outbound mail from. Set KAIROS_FROM_DOMAIN to the domain you "
+                "publish SPF/DKIM/DMARC for (docs/design/mail-auth.md), or unset "
                 "KAIROS_HOSTED if this deployment authenticates its own mail.")
-    if is_consumer_provider(declared):
-        return (f"KAIROS_FROM_DOMAIN={declared!r} is a consumer mailbox provider, not a domain "
-                f"we can publish SPF/DKIM/DMARC for. Every message would go out "
-                f"unauthenticated (obligation M1). Use a domain we control.")
+        return MailRefusal(
+            "m1_from_domain_not_a_domain",
+            f"KAIROS_FROM_DOMAIN={raw!r} is not a domain name"
+            + (" (an IP address can never be authenticated: DKIM's d= tag and DMARC "
+               "alignment are both defined over domain names)"
+               if is_ip_literal(raw) else "")
+            + ". Set it to the domain you publish SPF/DKIM/DMARC for "
+              "(docs/design/mail-auth.md).")
+    # Exact-match only here, not the label heuristic: the declared domain is asserted by
+    # the operator, so a brand-name label inside it may well be theirs (`gmx.nerdmachines.com`)
+    # and there is no alignment to fall back on. The residual is that a country variant
+    # (hotmail.co.uk) as the *declared* domain escapes this check -- acceptable, because
+    # an operator who declares someone else's domain cannot publish the SPF/DKIM/DMARC
+    # records that M1 exists to require, so the configuration fails visibly at delivery
+    # rather than silently succeeding.
+    if _is_known_consumer_domain(declared):
+        return MailRefusal(
+            "m1_from_domain_consumer",
+            f"KAIROS_FROM_DOMAIN={declared!r} is a consumer mailbox provider, not a domain "
+            f"we can publish SPF/DKIM/DMARC for. Every message would go out "
+            f"unauthenticated (obligation M1). Use a domain we control.")
 
     for var, address in _identity_addresses():
         domain = domain_of(address)
         if not domain:
-            return (f"{var}={address!r} is not an email address, so the From domain cannot "
-                    f"be authenticated. Set it to a mailbox on {declared!r}.")
-        if domain in _PLACEHOLDER_DOMAINS:
-            return (f"{var}={address!r} is a reserved placeholder domain, not a mailbox we "
+            return MailRefusal(
+                "m1_address_unreadable",
+                f"{var}={address!r} is not a single valid email address, so the From domain "
+                f"cannot be authenticated. Set it to one bare address on {declared!r}.")
+        # Alignment is the authoritative test, so the consumer list (which cannot help
+        # but over-match a domain like gmx.nerdmachines.com) is only consulted for
+        # domains alignment has already rejected.
+        if not aligned_with(domain, declared):
+            if domain in _PLACEHOLDER_DOMAINS:
+                return MailRefusal(
+                    "m1_address_placeholder",
+                    f"{var}={address!r} is a reserved placeholder domain, not a mailbox we "
                     f"control. Set it to a real address on {declared!r}.")
-        if is_consumer_provider(domain):
-            return (f"{var}={address!r} is a consumer mailbox provider. Mail from it cannot "
+            if is_consumer_provider(domain):
+                return MailRefusal(
+                    "m1_address_consumer",
+                    f"{var}={address!r} is a consumer mailbox provider. Mail from it cannot "
                     f"be authenticated as ours (obligation M1) — set a mailbox on "
                     f"{declared!r}.")
-        if not _aligned_with(domain, declared):
-            return (f"{var}={address!r} is not on KAIROS_FROM_DOMAIN={declared!r}. DMARC "
-                    f"authenticates the visible From domain, so this mail would be "
-                    f"unauthenticated (obligation M1).")
+            return MailRefusal(
+                "m1_address_misaligned",
+                f"{var}={address!r} is not on KAIROS_FROM_DOMAIN={declared!r}. DMARC "
+                f"authenticates the visible From domain, so this mail would be "
+                f"unauthenticated (obligation M1).")
     return None
 
 
-_refusal_logged = False
+_last_refusal_logged: str | None = None
 
 
-def check_sender() -> str | None:
-    """Evaluate the M1 gate, logging a refusal once per process.
+def check_sender() -> MailRefusal | None:
+    """Evaluate the M1 gate, logging a refusal once per distinct reason.
 
     Log-once because the API's invite path calls send_invite_email per recipient, so a
     200-person poll would otherwise bury the actual cause under 200 identical lines.
+    Keyed on the reason rather than a bool so a *different* refusal is still reported if
+    the configuration is changed under a long-running process.
 
     Deliberately independent of mail_identity_report(), which has already logged the same
     refusal at INFO on the way up: the boot line states the configuration, this one says
     an actual send was attempted and blocked. Collapsing them would lose the second fact.
     """
-    global _refusal_logged
-    reason = sender_refusal()
-    if reason and not _refusal_logged:
-        log.error("refusing to send mail (obligation M1): %s", reason)
-        _refusal_logged = True
-    return reason
+    global _last_refusal_logged
+    refusal = sender_refusal()
+    if refusal and refusal.message != _last_refusal_logged:
+        log.error("refusing to send mail (obligation M1, %s): %s", refusal.code, refusal.message)
+        _last_refusal_logged = refusal.message
+    return refusal
 
 
 def mail_identity_report() -> str:
@@ -204,20 +321,27 @@ def mail_identity_report() -> str:
     configured to send as and point at the records that must exist for it. That turns
     "did it rot" from DNS archaeology into one line in the boot log.
     """
+    if settings.HOSTED_UNKNOWN:
+        state = (f"but KAIROS_HOSTED={settings.HOSTED_RAW!r} is not a value Kairos "
+                 f"recognises, so the M1 gate is OFF — use 1/on/true/yes")
+    elif not settings.HOSTED:
+        state = ("and KAIROS_HOSTED is unset, so the M1 gate is off and Kairos does not "
+                 "require SPF/DKIM/DMARC here")
+    else:
+        state = f"and the M1 gate is ON for {domain_of(settings.FROM_DOMAIN) or 'nothing yet'}"
+
     if not SMTP_HOST:
-        state = "mail is off (SMTP_HOST unset)"
-    elif reason := sender_refusal():
-        return f"outbound mail: REFUSING TO SEND — {reason}"
+        detail = "mail is off (SMTP_HOST unset)"
+    elif refusal := sender_refusal():
+        return f"outbound mail: REFUSING TO SEND ({refusal.code}) — {refusal.message}"
     else:
         slots = ", ".join(f"{var}={value}" for var, value in _identity_addresses())
-        state = f"sending as {slots}"
-    if not settings.HOSTED:
-        return (f"outbound mail: {state}. KAIROS_HOSTED is unset, so the M1 gate is off "
-                f"and Kairos does not require SPF/DKIM/DMARC here (docs/design/mail-auth.md "
-                f"if you ever host this for others).")
-    return (f"outbound mail: {state}, authenticated as {settings.FROM_DOMAIN!r}. SPF/DKIM/"
-            f"DMARC must be published for it — Kairos cannot read DNS, so it cannot confirm "
-            f"they exist (docs/design/mail-auth.md).")
+        detail = f"sending as {slots}"
+    tail = ("SPF/DKIM/DMARC must be published for it — Kairos cannot read DNS, so it cannot "
+            "confirm they exist (docs/design/mail-auth.md)."
+            if settings.HOSTED else
+            "docs/design/mail-auth.md if you ever host this for others.")
+    return f"outbound mail: {detail}, {state}. {tail}"
 
 
 def is_configured() -> bool:

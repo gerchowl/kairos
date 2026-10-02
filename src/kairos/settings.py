@@ -95,7 +95,15 @@ TRUSTED_PROXY_NETWORKS = _parse_networks(TRUSTED_PROXY_CIDRS, "KAIROS_TRUSTED_PR
 # mail, which is their business and not something this app may second-guess — so unset
 # means "no M1 gate", byte-for-byte the previous behaviour. Set it when *we* send from
 # *our* domain and therefore own the reputation.
-HOSTED = os.environ.get("KAIROS_HOSTED", "").strip().lower() in ("1", "on", "true", "yes")
+# A recognised-true set rather than "anything else is false": a typo like KAIROS_HOSTED=y
+# must not silently disarm the gate, which is the failure mode a security control should
+# never have. An unrecognised value keeps HOSTED off (the safe direction for self-host)
+# but records itself so the boot line can WARN rather than quietly do nothing.
+HOSTED_RAW = os.environ.get("KAIROS_HOSTED", "").strip()
+HOSTED_TRUE = ("1", "on", "true", "yes")
+HOSTED = HOSTED_RAW.lower() in HOSTED_TRUE
+HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + (
+    "0", "off", "false", "no", "")
 # Normalised, not validated: a typo must fail as a loud refusal naming this knob, not as
 # an import error that would also break self-host, where the variable is unused. See
 # kairos.email_service.sender_refusal().
