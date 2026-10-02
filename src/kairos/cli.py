@@ -2,6 +2,30 @@
 
 import argparse
 import os
+from urllib.parse import urlparse, urlunparse
+
+DEFAULT_DB_URL = "sqlite:///kairos.db"
+
+
+def redacted_db_url(raw: str) -> str:
+    """`raw` with any URL password replaced, for display.
+
+    The startup banner is printed to stdout, which in a container is the
+    container log — and from there the journal and every log shipper. A MySQL
+    URL carries its credential in the userinfo, so printing the raw value
+    publishes it in cleartext to a stream nobody audits and nobody rotates.
+    The credential still lives where it belongs: the environment.
+
+    Userinfo is rebuilt rather than pattern-matched, because a regex over a URL
+    is how you end up leaking the part after the password on some other scheme.
+    """
+    parsed = urlparse(raw)
+    if parsed.password is None:
+        return raw  # sqlite paths, and any URL without credentials
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urlunparse(parsed._replace(netloc=f"{parsed.username}:***@{host}"))
 
 
 def main():
@@ -25,7 +49,8 @@ def main():
     )
     print(
         f"Kairos → http://{args.host}:{args.port}{settings.PREFIX}/  "
-        f"(auth={settings.AUTH_MODE}, db={os.environ.get('KAIROS_DB_URL', 'sqlite:///kairos.db')}, "
+        f"(auth={settings.AUTH_MODE}, "
+        f"db={redacted_db_url(os.environ.get('KAIROS_DB_URL', DEFAULT_DB_URL))}, "
         f"{trusted})"
     )
     # proxy_headers=False is load-bearing, not a preference. Uvicorn defaults it

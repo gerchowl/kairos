@@ -17,6 +17,13 @@ KAIROS_BRAND       display name (default "Kairos")
 KAIROS_HOME_URL    brand-link target in the navbar (default the app itself)
 SESSION_SECRET     signing key for cookies/CSRF (required outside demo mode)
 SMTP_HOST/PORT/USER/PASSWORD/FROM   outbound mail (optional; unauth relay ok)
+KAIROS_HOSTED      declares a deployment WE operate (the hosted product, not a
+                    self-hoster's own box). Off by default. When on, outbound
+                    mail is refused unless it is authenticated from
+                    KAIROS_FROM_DOMAIN — obligation M1.
+KAIROS_FROM_DOMAIN the domain outbound is authenticated as, e.g.
+                    nerdmachines.com or a dedicated mail.nerdmachines.com.
+                    Hosted mode only; see docs/design/mail-auth.md.
 KAIROS_FEED        reverse-calendar slot feeds + deep-link voting: off (default) | on
 KAIROS_IMIP        native iMIP invitations (Accept/Maybe/Decline): off (default) | on
 KAIROS_IMIP_ORGANIZER       reply mailbox = ORGANIZER mailto (must equal IMAP mailbox)
@@ -76,6 +83,35 @@ API_KEY = os.environ.get("KAIROS_API_KEY") or os.environ.get("SCHEDULER_API_KEY"
 # that header is exactly the thing an attacker controls.
 TRUSTED_PROXY_CIDRS = os.environ.get("KAIROS_TRUSTED_PROXY_CIDRS", "")
 TRUSTED_PROXY_NETWORKS = _parse_networks(TRUSTED_PROXY_CIDRS, "KAIROS_TRUSTED_PROXY_CIDRS")
+
+# Obligation M1 (issue #48): outbound mail must be authenticated from a domain we
+# control (SPF + DKIM + DMARC), never from a personal mailbox. Those records live in
+# DNS, which Kairos can neither read nor publish, so the honest split is:
+#
+#   - this pair makes the *identity* we are about to send as explicit and checkable,
+#     and turns a sender nobody could authenticate for us into a refusal rather than
+#     a silent send;
+#   - the DNS records themselves are the operator's, and docs/design/mail-auth.md
+#     says exactly which ones to publish and how to check them.
+#
+# HOSTED is what separates the two worlds, and it is opt-in on purpose. A self-hoster
+# or the ETH/duplet deployment has configured a relay that authenticates their own
+# mail, which is their business and not something this app may second-guess — so unset
+# means "no M1 gate", byte-for-byte the previous behaviour. Set it when *we* send from
+# *our* domain and therefore own the reputation.
+# A recognised-true set rather than "anything else is false": a typo like KAIROS_HOSTED=y
+# must not silently disarm the gate, which is the failure mode a security control should
+# never have. An unrecognised value keeps HOSTED off (the safe direction for self-host)
+# but records itself so the boot line can WARN rather than quietly do nothing.
+HOSTED_RAW = os.environ.get("KAIROS_HOSTED", "").strip()
+HOSTED_TRUE = ("1", "on", "true", "yes")
+HOSTED = HOSTED_RAW.lower() in HOSTED_TRUE
+HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + (
+    "0", "off", "false", "no", "")
+# Normalised, not validated: a typo must fail as a loud refusal naming this knob, not as
+# an import error that would also break self-host, where the variable is unused. See
+# kairos.email_service.sender_refusal().
+FROM_DOMAIN = os.environ.get("KAIROS_FROM_DOMAIN", "").strip().strip(".").lower()
 
 # Legal pages (/imprint, /privacy) — rendered when KAIROS_OPERATOR is set.
 # Structured input, no HTML needed; the operator carries the legal duty

@@ -36,7 +36,13 @@ from kairos.db import (
     update_poll,
     update_response,
 )
-from kairos.email_service import send_decision_email, send_imip, send_invite_email, webcal_from
+from kairos.email_service import (
+    send_decision_email,
+    send_imip,
+    send_invite_email,
+    sender_refusal,
+    webcal_from,
+)
 from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
@@ -343,8 +349,17 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
                                  actor["name"], reply_to=actor["email"], subscribe_url=sub)
         if sent:
             log_contact(poll_id, email, "invite", invite["id"])
-        results.append({"email": email, "invite_url": invite_url,
-                        "required": body.required, "email_sent": sent})
+        # Obligation M1: `email_sent: false` is ambiguous on its own -- it means either
+        # "mail is not configured" or "the M1 gate is refusing this sender". An API caller
+        # holding the operator's API key can be told which, so an unattended agent does not
+        # retry a send that can never succeed. The web UI shows a generic variant instead,
+        # because there the reader is a poll owner rather than the operator.
+        entry = {"email": email, "invite_url": invite_url,
+                 "required": body.required, "email_sent": sent}
+        if not sent and (refusal := sender_refusal()) is not None:
+            entry["email_blocked"] = refusal.code
+            entry["blocked_reason"] = refusal.message
+        results.append(entry)
     return {"invites": results}
 
 

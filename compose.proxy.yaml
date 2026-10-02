@@ -1,0 +1,201 @@
+# Kairos — the multi-user production topology (obligation D4, "secure default
+# topology"): automatic-TLS Caddy + OIDC proxy in front of Kairos.
+#
+#   cp .env.example .env    # fill in the OIDC_* values + generate the secrets
+#   podman compose -f compose.proxy.yaml up -d
+#
+# With MariaDB instead of SQLite, layer it on:
+#   podman compose -f compose.proxy.yaml -f compose.mysql.yaml up -d
+#
+# ── This file is STANDALONE, not an overlay of compose.yaml ────────────────
+# That is deliberate, and it is a security requirement rather than a style
+# choice. Compose overrides MERGE list-valued keys; they never subtract them.
+# So an overlay on top of compose.yaml would leave compose.yaml's
+# `127.0.0.1:8003:8003` mapping in place, and a published app port silently
+# defeats the trusted-proxy allowlist below. Measured on this repo with
+# rootless podman, a request arriving through a published port is presented to
+# the app as coming from the forwarder's address *inside* the container's
+# network namespace — which, on a pinned subnet like the one below, is inside
+# the allowlist. Anything that can reach the published port can then assert any
+# identity. There is no allowlist value that reliably fixes this, because the
+# address the app sees depends on the engine's port-forwarding implementation.
+# The only robust control is: do not publish the app port. Hence duplication
+# below instead of an overlay.
+#
+# ── Why this shape and not "just put nginx in front" ───────────────────────
+# Kairos trusts identity headers (ADR-0002, KAIROS_AUTH=header). Two controls
+# make that safe, and both are required:
+#
+#   1. The app port is not published — only Caddy is reachable from off-box, so
+#      nothing can skip the proxy.
+#   2. KAIROS_TRUSTED_PROXY_CIDRS is set, so Kairos rejects with 403 any
+#      request whose real transport peer is outside this compose network. This
+#      is the part nginx cannot do for you, and the reason
+#      `proxy_headers=False` in the image is load-bearing: with uvicorn's
+#      default the app would read the *caller's claimed* X-Forwarded-For here
+#      and the allowlist would be no allowlist at all.
+#
+# The CIDR below is literal because the subnet is pinned here. Change one,
+# change both — a stale allowlist is fail-closed, and it presents as 403 on
+# every page, which looks exactly like a broken app.
+#
+# Any OIDC provider works: Google, GitHub, Microsoft, Authentik, Keycloak,
+# Zitadel, Authelia's own endpoint. Kairos implements no OAuth surface of its
+# own — it reads the headers the proxy sets. (PLAN.md: federated login outside
+# Kairos is the recommended default.)
+#
+# Identity header mapping uses oauth2-proxy's native header names, so neither
+# side needs custom configuration:
+#   oauth2-proxy                      -> Kairos
+#   X-Forwarded-User                  -> KAIROS_AUTH_UID_HEADER
+#   X-Forwarded-Email                 -> KAIROS_AUTH_EMAIL_HEADER
+#   X-Forwarded-Preferred-Username    -> KAIROS_AUTH_NAME_HEADER
+name: kairos
+
+services:
+  caddy:
+    image: docker.io/library/caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      # Fixed 80/443 by design, not by accident: in Caddy a site address of
+      # `host:port` sets the LISTEN port, so the public hostname and the listen
+      # port cannot be varied independently here. Rootless podman cannot bind a
+      # privileged port unless you lower the threshold once:
+      #   sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+      # or run Caddy rootful. See docs/design/self-host-hardening.md.
+      - "80:80"
+      - "443:443"
+      # :443 must also be reachable on UDP or HTTP/3 silently never happens.
+      - "443:443/udp"
+    environment:
+      KAIROS_SITE: "${KAIROS_SITE:?set KAIROS_SITE to your hostname, e.g. polls.example.org}"
+      ACME_EMAIL: "${ACME_EMAIL:?set ACME_EMAIL — the CA expiry/renewal contact}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates. Losing this volume means re-acquiring them, and ACME rate
+      # limits apply — back it up.
+      - caddy-data:/data
+      - caddy-config:/config
+    healthcheck:
+      # Caddy's admin API, on loopback inside the container. Alpine has wget.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - oauth2-proxy
+    networks:
+      - edge
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    restart: unless-stopped
+    command:
+      - --http-address=0.0.0.0:4180
+      - --upstream=http://kairos:8003
+      # Only these domains may become poll owners, enforced at the proxy.
+      # Kairos has a second, independent gate (KAIROS_ALLOW below), so a
+      # mis-scoped IdP app registration still cannot mint poll owners.
+      - --email-domain=${OIDC_ALLOWED_DOMAINS:?set OIDC_ALLOWED_DOMAINS, e.g. example.org}
+      # Hashed in the browser, so a captured cookie is not a usable session.
+      - --cookie-secure=true
+      - --session-store-type=cookie
+    environment:
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_OIDC_ISSUER_URL: "${OIDC_ISSUER_URL:?set OIDC_ISSUER_URL, e.g. https://id.example.org/realms/main}"
+      # NOTE the unprefixed names. oauth2-proxy v7 still reads the client id,
+      # secret and scope from OAUTH2_PROXY_CLIENT_ID / _CLIENT_SECRET / _SCOPE;
+      # the OIDC_-prefixed spellings are silently ignored, and the process exits
+      # with "provider missing setting: client-id". Verified against v7.7.1.
+      OAUTH2_PROXY_CLIENT_ID: "${OIDC_CLIENT_ID:?set OIDC_CLIENT_ID}"
+      OAUTH2_PROXY_CLIENT_SECRET: "${OIDC_CLIENT_SECRET:?set OIDC_CLIENT_SECRET}"
+      OAUTH2_PROXY_SCOPE: "openid email profile"
+      OAUTH2_PROXY_REDIRECT_URL: "${OIDC_REDIRECT_URL:?set OIDC_REDIRECT_URL to https://<your host>/oauth2/callback}"
+      OAUTH2_PROXY_COOKIE_SECRET: "${OAUTH2_PROXY_COOKIE_SECRET:?generate with: python3 -c 'import secrets; print(secrets.token_urlsafe(32))'}"
+      # Register OIDC_REDIRECT_URL as an allowed callback on the IdP, or
+      # sign-in loops forever. This is the most common setup failure here.
+    networks:
+      - edge
+      - kairos
+    security_opt:
+      - no-new-privileges:true
+    # No healthcheck: the image is distroless, so there is no shell and no HTTP
+    # client to probe /ping with. Caddy retries until oauth2-proxy is listening.
+
+  kairos:
+    build:
+      context: .
+    image: localhost/kairos:local
+    restart: unless-stopped
+    environment:
+      KAIROS_AUTH: header
+      KAIROS_AUTH_UID_HEADER: X-Forwarded-User
+      KAIROS_AUTH_EMAIL_HEADER: X-Forwarded-Email
+      KAIROS_AUTH_NAME_HEADER: X-Forwarded-Preferred-Username
+      # The allowlist (S1). The pinned subnet and NOTHING else — deliberately
+      # not 127.0.0.1 and not the container's own address: anything that could
+      # reach the app over loopback or over the engine's own forwarder would
+      # otherwise be inside this list. /health is matched before the allowlist,
+      # so the healthcheck below still works regardless.
+      KAIROS_TRUSTED_PROXY_CIDRS: 172.30.30.0/24
+      # Second owner gate, evaluated inside Kairos: even a valid identity from
+      # the proxy must be on this list to own a poll. Empty = any identity the
+      # IdP vouches for may own polls.
+      KAIROS_ALLOW: "${KAIROS_ALLOW:-}"
+      # S2: outside demo mode this is mandatory — the app refuses to serve
+      # authenticated requests without it (observed as a 500 on any page).
+      SESSION_SECRET: "${SESSION_SECRET:?generate with: python3 -c 'import secrets; print(secrets.token_hex(32))'}"
+      # Share links and .ics deep links must carry the public origin, not the
+      # in-network one.
+      KAIROS_PUBLIC_URL: "https://${KAIROS_SITE:?set KAIROS_SITE}"
+      KAIROS_LOGIN_URL: /oauth2/start
+      KAIROS_API_KEY: "${KAIROS_API_KEY:-}"
+      KAIROS_DB_URL: sqlite:////data/kairos.db
+      # Uncomment for the operator's legal pages (/imprint, /privacy):
+      # KAIROS_OPERATOR: "${KAIROS_OPERATOR:-}"
+      # KAIROS_OPERATOR_ADDRESS: "${KAIROS_OPERATOR_ADDRESS:-}"
+      # KAIROS_OPERATOR_EMAIL: "${KAIROS_OPERATOR_EMAIL:-}"
+    # `expose`, never `ports`. See the note at the top of this file: a published
+    # app port is the one thing that reliably defeats the allowlist above.
+    expose:
+      - "8003"
+    volumes:
+      - kairos-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      - oauth2-proxy
+    # compose.yaml leaves the app on the implicit `default` network, and naming
+    # networks here REPLACES that rather than adding to it. Without this key
+    # the app is unreachable by service name from the proxy: it boots fine,
+    # /health answers, and every real page 502s through Caddy.
+    networks:
+      - kairos
+
+networks:
+  edge: {}
+  kairos:
+    # Pinned so KAIROS_TRUSTED_PROXY_CIDRS above can be written out literally
+    # instead of being discovered at runtime. Pick a subnet that does not
+    # collide with your LAN; 172.30.30.0/24 is deliberately unusual.
+    ipam:
+      config:
+        - subnet: 172.30.30.0/24
+
+volumes:
+  kairos-data:
+  caddy-data:
+  caddy-config:

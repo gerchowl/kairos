@@ -73,6 +73,16 @@ def create_app() -> FastAPI:
             "yourself, do the same (uvicorn --no-proxy-headers)."
         )
 
+    # Obligation M1 (#48): say at every boot which identity outbound mail will be
+    # sent as, and whether the gate is in force. SPF/DKIM/DMARC are DNS records the
+    # app cannot read, so this line is the only place the deployment's mail identity
+    # is stated — a misconfiguration that silently sends is far more expensive than
+    # a log line. Logged here rather than in cli.main because the ETH/duplet adapter
+    # calls create_app() itself and never goes through the console script.
+    from kairos.email_service import mail_identity_report
+
+    logging.getLogger("kairos.mail").info("%s", mail_identity_report())
+
     @app.middleware("http")
     async def trusted_proxy_only(request, call_next):
         if request.url.path != health_path and not peer_is_trusted(request):

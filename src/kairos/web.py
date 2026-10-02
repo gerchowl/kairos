@@ -29,7 +29,13 @@ from kairos.db import (
     update_response_contact,
 )
 from kairos.dbconn import db_now
-from kairos.email_service import send_decision_email, send_invite_email, send_update_emails, webcal_from
+from kairos.email_service import (
+    send_decision_email,
+    send_invite_email,
+    send_update_emails,
+    sender_refusal,
+    webcal_from,
+)
 from kairos.helpers import (
     TIMEZONES,
     convergence,
@@ -69,7 +75,26 @@ _MSG_TEXT = {
     "saved": "Poll updated.",
     "reopened": "Poll reopened — it accepts responses again.",
     "mailfail": "Email not sent — SMTP is not configured or no recipient has an email address.",
+    # Obligation M1: a refused sender is a different problem from an unconfigured
+    # one, and telling an operator their SMTP is missing when it is set correctly
+    # sends them to the wrong knob. Deliberately carries no addresses: in a hosted
+    # deployment the person reading this is a poll owner, not the operator. The
+    # specific reason is already in the server log at ERROR.
+    "mailblocked": "Email not sent — this deployment’s outbound mail is blocked by "
+                    "its mail-identity policy (the sending address is not authorised for "
+                    "this domain). See the server log for the reason.",
 }
+
+
+def _mail_failure_msg() -> str:
+    """Which flash key explains a send that produced nothing.
+
+    A refusal takes precedence over mailfail: if the M1 gate is blocking, then SMTP being
+    configured or not is beside the point, and mailfail would name the wrong cause. The
+    refusal is a process-wide condition, so consulting it here cannot mislead when the
+    real reason was an empty recipient list.
+    """
+    return "mailblocked" if sender_refusal() else "mailfail"
 
 
 def _msg_text(query_params) -> str | None:
@@ -552,7 +577,8 @@ def remind_selected(poll_id: str, request: Request, form=Depends(form_data),
         return RedirectResponse(f"{P}/polls/{poll_id}?msg=nonudge", status_code=302)
     counts = nudge_participants(request, poll, user, only_emails=emails, force=True)
     if not (counts["invited"] or counts["updated"]):
-        return RedirectResponse(f"{P}/polls/{poll_id}?msg=mailfail", status_code=302)
+        return RedirectResponse(f"{P}/polls/{poll_id}?msg={_mail_failure_msg()}",
+                                status_code=302)
     return RedirectResponse(
         f"{P}/polls/{poll_id}?msg=nudged&inv={counts['invited']}&upd={counts['updated']}",
         status_code=302)
@@ -605,7 +631,8 @@ def email_decision(poll_id: str, request: Request, form=Depends(form_data),
     for email in sent:
         log_contact(poll_id, email, "decision")
     if not sent:
-        return RedirectResponse(f"{P}/polls/{poll_id}?msg=mailfail", status_code=302)
+        return RedirectResponse(f"{P}/polls/{poll_id}?msg={_mail_failure_msg()}",
+                                status_code=302)
     return RedirectResponse(f"{P}/polls/{poll_id}?msg=emailed&n={len(sent)}", status_code=302)
 
 
