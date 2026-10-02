@@ -28,6 +28,112 @@ mail, rate limits #37) are blocking for hosted custom pages**, not merely "befor
 public launch". A convincing page on our domain, mailed from our DKIM-signed domain,
 is a phishing kit — and it destroys the mail reputation everything else depends on.
 
+## Identity: three families, not one — how Google/GitHub/MS/OpenAthens fit
+
+Asked whether the trust model should be IdPs and tokens rather than proxy
+allowlists. It already is — they are three *different* families, and conflating
+them is what makes the question feel open. Kairos supports all three; the design
+question is which is default and how they compose.
+
+| Family | Mechanism | Where it lives | Who uses it |
+|---|---|---|---|
+| **Proxy-asserted** | a trusted proxy injects `X-User` etc. | `KAIROS_AUTH=header` + #47 allowlist | Shibboleth, **OpenAthens**, oauth2-proxy, Authelia, Cloudflare Access, Tailscale — i.e. *any* SAML/OIDC IdP |
+| **First-party login** | Kairos is the OAuth/OIDC client | planned, #32 (magic-link) and see below | Google, GitHub, Microsoft — federated/social |
+| **Capability** | possession of a token in the URL | `KAIROS_AUTH=capability` (#30), invite tokens today | respondents, share links, agents |
+
+**The key point: every IdP named above already works today without Kairos
+knowing it exists.** Shibboleth and OpenAthens are SAML brokers; oauth2-proxy
+and Authelia terminate OIDC. All of them reduce to the same thing — *something
+verified the user and wrote the result into a request header* — which is exactly
+the header-mode contract, and exactly what #47 makes safe to rely on. Point any
+of them at Kairos, set `KAIROS_TRUSTED_PROXY_CIDRS` to the proxy, and you have
+Google/GitHub/MS/ETH federation with **zero Kairos code**.
+
+So the choice is not "IdPs vs proxy". It is:
+
+- **Federated login *outside* Kairos (proxy) — recommended default.** Kairos
+  stays a small, dependency-light backend with no OAuth surface, no token
+  storage, no session/redirect/PKCE machinery. Every compliance-reviewed IdP
+  stays in front of it. One integration, N IdPs.
+- **Federated login *inside* Kairos — only when we must be the client.** Worth it
+  when there is no proxy to deploy (hosted, single-tenant, no ops staff), or when
+  we want a one-click "sign in with Google" without the operator running
+  anything. Costs: a client per IdP, redirect URIs, `state`/`nonce`/PKCE, a
+  session table, an *IdP-side* subject allowlist (which then replaces the CIDR
+  allowlist as the trust boundary), plus account linking and recovery.
+
+### Correction: the ETH deployment does not use header-trust at all
+
+Checked rather than assumed (`duplet-webserver/libs/duplet_common/auth.py`, and
+`apps/scheduler/src/main.py`):
+
+- The adapter does **not** go through `kairos.cli` — it calls
+  `create_app()` itself, so `proxy_headers=False` does not apply there. That part
+  of the earlier warning was right.
+- But it also does `kairos_auth.get_user = lambda r: duplet_auth.get_user(r,
+  "scheduler")`, i.e. it **replaces identity resolution entirely**. Kairos's
+  `_header_user` never runs, so `KAIROS_AUTH=header` is vestigial there.
+- ETH's real model is stronger than header trust: SWITCHaai produces headers for
+  *any* Swiss-university account, so `get_user` requires the identity to resolve
+  to a **known user in the directory** (`find_user_by_emails`) with an explicit
+  app grant. Its own comment: "spoofed headers fail the DB check".
+
+So the S1 allowlist is **not** what makes the flagship deployment safe, and
+#47 cannot regress it — the middleware still runs (it is inside `create_app`) but
+is not load-bearing there. Correcting my earlier claim that #47 being inert
+"silently still works": it is inert, but nothing depended on it.
+
+Two things this changes:
+
+1. **Directory-allowlist is the pattern worth copying**, not header trust. Any
+   first-party OIDC work should allowlist by *known subject*, never admit
+   "anyone the IdP vouched for".
+2. **It sets the bar for universal self-hosting.** ETH is a bespoke Shibboleth +
+   directory + per-app-grant adapter. That is a fine flagship and a terrible
+   default — no self-hoster is going to build one. So the *primary* self-host path
+   must be the one requiring least wiring, which is not header mode.
+
+### What "industry standard" actually means here — separating two things
+
+- **TLS termination in front: yes, still universal.** Something has to do TLS,
+   and nginx/Caddy in front of uvicorn is the normal answer. Keep that.
+- **Auth by injected headers: no, this is the legacy pattern.** nginx cannot
+   terminate OIDC, which is precisely why `oauth2-proxy` and `Authelia` exist as
+   separate boxes to bolt on. Every self-hosted app that people actually run
+   (Grafana, Nextcloud, Vault, Gitea, Immich, Jellyfin) terminates OIDC itself,
+   because that is what makes deployment one env var instead of an infrastructure
+   project.
+
+So the duplet/ETH shape is a *legacy-integration* pattern and should be labelled as
+one — good for an institutional deployment that already has Shibboleth, not the
+template for "self-host Kairos".
+
+### The universal ladder, by wiring required
+
+| Effort for the operator | Mode | Notes |
+|---|---|---|
+| **zero** | `demo` (current default) | single owner, no auth. Already universal. |
+| **zero** | capability tokens (#30) | link-based; respondents and sharing never need accounts (ADR-0001) |
+| **~4 env vars** | **first-party OIDC (#53)** | any OIDC provider: Google, GitHub, Microsoft, Authentik, Keycloak, Zitadel, Authelia's own OIDC endpoint |
+| an infrastructure project | proxy + header mode (#47) | correct when you already run Shibboleth/oauth2-proxy/Authelia |
+
+**Revised recommendation: promote #53 to the primary multi-user self-host path.**
+It is the only rung that is both multi-user and cheap, and implementing OIDC
+properly is the same work whether the trigger is "no proxy available" or "this is
+the default". Keep header mode as the adapter/legacy path — it is genuinely the
+right answer inside an institution that already has a broker — and keep
+`auth.get_user` as the runtime seam.
+`auth.get_user` is already a documented runtime-seam (`kairos.auth.get_user =
+mine`) for bespoke portals, which is a third escape hatch and should not be
+removed.
+
+**The composition rule to write down:** these are *not* alternatives to be
+picked once — they are layers. Capability tokens stay for respondents whatever
+the owner auth is (they must: respondents never get accounts). Owner auth picks
+family 1 or 2. And #47's allowlist is the trust boundary for family 1 only —
+if Kairos ever terminates OIDC itself, the allowlist stops being the thing that
+matters, which is exactly why defaulting to family 1 is the conservative choice.
+
 ## Exposure gates that have no owner (raised from `docs/design/productization-obligations.md`)
 
 The register names the hard pre-exposure gate as **A1–A3 + S1/S6 + M1**. S6 is
@@ -65,6 +171,96 @@ small change and it is a precondition for putting this thing online at all.
    `#28` release 0.9.1 → `#20` checkout 6→7 → `#22` ui-deps → `#46` python-deps.
    Note `#28` and `#46` both touch `pyproject.toml` — land the release first so
    the version bump does not have to rebase through the dependency hunks.
+
+## Deployment targets — Cloudflare (general) + ETH (self-host dogfood)
+
+Operator direction: the general/hosted version runs on **Cloudflare**; **ETH stays
+self-hosted** for academia and doubles as the dogfood test of the self-deployment
+path. That pairing is right, and it lines up with decisions already made:
+
+- **SQLite (#36) is now load-bearing, not just cheap.** Cloudflare D1 *is* SQLite.
+- **The WASM story is already proven here.** `site/playground/` runs this exact
+  server on **Pyodide** in the browser. Cloudflare Python Workers are also Pyodide,
+  so the playground is a working prototype of the hosted runtime — not a
+  from-scratch bet.
+- **Python Workers went GA 2026-09-21** (verified) and run FastAPI/Flask/Django
+  directly; Python 3.14 by default. Hyperdrive now exposes **PostgreSQL and MySQL**
+  to Python Workers through a socket bridge.
+
+### The honest catch: it is a DB-driver port, not a config change
+
+`dbconn.py` is 97 lines and branches on `DB_URL.startswith("sqlite")` into either
+`sqlite3.connect(path)` or `pymysql`. That works because both are *in-process*
+drivers over a real socket or file.
+
+- **D1 is not `sqlite3`.** It is a *binding* (`env.DB.prepare(...).all()`) — async,
+  HTTP-backed. The Workers filesystem is ephemeral, so there is no local
+  `kairos.db` to open. A D1 dialect means rewriting the driver layer and auditing
+  every query for D1's constraints (single-writer, no cross-request transactions).
+- **Hyperdrive keeps `pymysql`-shaped code**, but Hyperdrive is for *connection
+  pooling to an existing DB*, which reintroduces the external-database dependency
+  (Neon/PlanetScale/RDS) that the SQLite decision deliberately avoided.
+- `threading` and `multiprocessing` import but are non-functional in Workers.
+
+So the real work is a third dialect adapter, not deployment config. Filed as #54.
+Sequencing note: this is a **bigger** change than anything in Phase 1, and it is
+the one item that would change the shape of the project. Do it after #47/#51/#48,
+not before.
+
+### #54 settled: D1, not Hyperdrive — settled on the numbers
+
+Spiked rather than argued (limits verified 2026-10-02). First, a correction to
+the obvious assumption: **storage is a tie, not a D1 win.**
+
+| | storage | compute ceiling | egress | cold start | extra dependency |
+|---|---|---|---|---|---|
+| **D1 Free** | **500 MB/db**, 1 db/account, 5M rows read/day, 100k rows written/day | none — not billed for idle | none (inside Workers) | none | **no** |
+| **Neon Free** | **0.5 GB/project** | **100 CU-hours/month**, scale-to-zero fixed at 5 min and *cannot be disabled* | 5 GB/month | resumes in a few hundred ms | yes (Neon + Hyperdrive) |
+
+500 MB vs 0.5 GB is the same 500 MB. Measured against the real schema — a
+time_slot poll over one week, 5 slots/day, 10 respondents is ~17,800 rows and
+**~24 KiB with indexes** (a date poll is ~7 KiB) — both tiers hold roughly
+**21,000 polls**. So the user's size argument does not separate them.
+
+**D1 wins on everything else, and two of those are structural:**
+
+1. **No CU-hours ceiling.** Neon Free suspends compute when the 100 CU-hours run
+   out, and scale-to-zero cannot be turned off, so a database that is busy 24/7
+   gets no benefit. D1 is not a running compute and is not billed while idle.
+2. **One provider, one hop.** Hyperdrive adds a network round trip and an external
+   service to a product whose whole thesis is being small and self-hostable.
+
+**The binding constraint is neither — it is Workers Free at 100,000 requests/day.**
+At ~62 requests per poll lifecycle that is ~1,600 polls/day. So:
+
+- **Retention is not a nicety, it is what makes the free tier work.** A 14-day
+  window at full request utilisation needs ~22,500 polls and *overflows* 500 MB.
+  **A 7–10 day window fits.** That is also the honest product answer: a scheduling
+  poll is dead weight once the meeting happened, and a short retention window is a
+  *privacy improvement* that suits Kairos's existing strictly-necessary-data-only
+  posture (obligation P1).
+- **Free tier cannot host a staging environment.** One database per account, so
+  `[env.staging]` with its own D1 binding needs **Workers Paid (~$5/mo)**, which
+  also raises the per-database cap to 10 GB. Cheap, but not free — worth knowing
+  before planning the two-environment setup on free.
+- Free Workers also allows only **50 read subrequests per invocation** (1000 paid),
+  which is a real constraint for the poll dashboard's fan-out queries.
+
+**Decision: D1.** Revisit only if D1's write path forces an architectural change
+the SQLite dialect cannot absorb, or if request volume passes ~1,600 polls/day.
+
+### ETH dogfooding: worth it, but it tests a *different* dialect
+
+**Now that ETH moves to SQLite too (1 GB VM disk is ample for a ~21k-poll DB),
+the dialect mismatch is closed** — ETH and Cloudflare would run the same dialect,
+so dogfooding covers the hosted path as well as the self-host path. That also makes
+the MariaDB adapter unnecessary for ETH.
+
+Two caveats to carry: SQLite on a 1 GB volume needs `journal_mode=WAL` plus a
+`journal_size_limit` and periodic checkpointing, or the WAL grows unbounded —
+there is no WAL tuning in `dbconn.py` today, only `PRAGMA foreign_keys = ON`. And
+retention (above) is what keeps a 1 GB volume safe as well as keeping D1 under
+500 MB.
 
 ## Phase 1 — independent enablers (parallel, unblock hosting)
 
@@ -144,6 +340,47 @@ putting a consent-bannered, mail-capable origin on the public internet.
 - Refresh `README.md` / `FEATURE-MATRIX.md` as ADRs get accepted (the
   `guardrails-adr-matrix` pre-commit gate, run by the CI `gates` job, enforces
   the latter).
+
+## CI — stay on GitHub Actions, and self-host the runners if you want "own infra"
+
+Operator asked about Buildkite vs Tekton/Argo. Deciding against all three, for a
+specific reason rather than inertia: **Argo and Tekton require a Kubernetes
+cluster, and the stated hosting target is Cloudflare, which is not one.** Choosing
+them means adopting a cluster purely to run CI for a scheduling-poll app — a new
+infrastructure burden, in a different paradigm from the target platform, for a
+project whose CI is six jobs that finish in ~45s.
+
+The Buildkite column is worth separating out, because it is the only real
+question: *"can we build on our own infrastructure?"* Yes — and you do not need
+Buildkite for it. **Self-hosted GitHub Actions runners** give you the same
+property (your infra, your agents, no vendor, free for a public repo) inside the
+tooling you already have. Buildkite would add a vendor, a licence, and a plugin
+ecosystem to solve a problem you can solve with a runner label.
+
+```
+runs-on: [self-hosted, linux, x64, eth]   # instead of ubuntu-latest
+```
+
+### The caveat that decides where the runner lives
+
+A self-hosted runner **executes code from pull requests**. Putting one on the same
+box that serves ETH academic traffic means any PR — including a hostile one —gets
+code execution on a production host. That is a real and avoidable risk.
+
+Options, best first:
+
+1. **A separate small VM** (or a local container on a non-production host). Clean.
+2. **Restrict the runner to non-PR events** — run CI on push to `main`, not on
+   `pull_request`. Loses pre-merge signal; pairs with required-checks configured
+   accordingly.
+3. **Do nothing.** Current cost is ~6 jobs × ~45s on GitHub-hosted runners, which
+   for a public repo is free. The honest assessment: the *motivation* for own-infra
+   CI is usually speed, privacy, or cost — and at this size none of the three is
+   binding yet.
+
+Recommendation: **stay on `ubuntu-latest` now**, revisit if CI time or a
+data-residency requirement actually bites. Write the runner label into the workflow
+as a comment so the migration is a one-line change when it does.
 
 ## Per-PR working agreement
 

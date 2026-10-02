@@ -1,5 +1,6 @@
 """Kairos app factory + ASGI entrypoint (kairos.main:app)."""
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from kairos import settings
 from kairos.db import get_connection, init_schema
 
 P = settings.PREFIX
+log = logging.getLogger("kairos.proxy")
 
 
 @asynccontextmanager
@@ -22,6 +24,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     from kairos.api import router as api_router
+    from kairos.auth import peer_address, peer_is_trusted
     from kairos.public import router as public_router
     from kairos.web import router as web_router
 
@@ -41,6 +44,51 @@ def create_app() -> FastAPI:
         redoc_url=None,
     )
 
+    # Obligation S1 (#47): if an allowlist is configured, only requests from a
+    # trusted peer may reach the app at all. Enforced at the edge rather than
+    # inside each route, so a new route cannot forget the check. Unconfigured =>
+    # middleware is a no-op and behaviour is byte-for-byte what it always was.
+    # /health is exempt: container HEALTHCHECKs, k8s liveness/readiness probes and
+    # load-balancer health checks all originate from loopback or pod-internal
+    # addresses, so gating it turns a probe into a crashloop. It runs SELECT 1 and
+    # returns {"status","app"}.
+    #
+    # Matched exactly, not by substring. `endswith("/health")" would also exempt
+    # /api/polls/health and /static/health; nothing reachable does today, but that
+    # safety came from Starlette routing rather than from this check, so it is not
+    # a property worth leaving to chance.
+    health_path = f"{P}/health"
+
+    if settings.TRUSTED_PROXY_NETWORKS:
+        # The allowlist reads the ASGI scope's peer. If a server rewrote that from
+        # X-Forwarded-For first, the allowlist would be checked against a value the
+        # caller supplied. The app cannot detect this from inside -- uvicorn's
+        # ProxyHeadersMiddleware mutates the scope with no marker -- so say so loudly
+        # rather than fail silently and look like the control is working.
+        log.warning(
+            "KAIROS_TRUSTED_PROXY_CIDRS is set, so peer identity matters: the ASGI "
+            "server MUST NOT rewrite the client address from X-Forwarded-For. The "
+            "`kairos` entrypoint passes proxy_headers=False; if you launch uvicorn "
+            "yourself, do the same (uvicorn --no-proxy-headers)."
+        )
+
+    @app.middleware("http")
+    async def trusted_proxy_only(request, call_next):
+        if request.url.path != health_path and not peer_is_trusted(request):
+            peer = peer_address(request)
+            log.warning(
+                "rejected untrusted peer %s (allowed: %s)",
+                peer or "<unknown>",
+                # Log the value enforcement actually reads, not the raw string:
+                # they can disagree if the var was set without a re-parse.
+                ",".join(str(n) for n in settings.TRUSTED_PROXY_NETWORKS) or "<unset: trusting every peer>",
+            )
+            return JSONResponse(
+                content={"detail": "Forbidden: request did not arrive from a trusted proxy"},
+                status_code=403,
+            )
+        return await call_next(request)
+
     app.include_router(api_router)
     app.include_router(web_router, include_in_schema=False)
     app.include_router(public_router, include_in_schema=False)
@@ -49,10 +97,14 @@ def create_app() -> FastAPI:
     def _openapi_with_bearer():
         if app.openapi_schema:
             return app.openapi_schema
-        schema = get_openapi(title=app.title, version=app.version,
-                             description=app.description, routes=app.routes)
+        schema = get_openapi(
+            title=app.title, version=app.version, description=app.description, routes=app.routes
+        )
         schema.setdefault("components", {}).setdefault("securitySchemes", {})["bearerAuth"] = {
-            "type": "http", "scheme": "bearer", "description": "KAIROS_API_KEY"}
+            "type": "http",
+            "scheme": "bearer",
+            "description": "KAIROS_API_KEY",
+        }
         schema["security"] = [{"bearerAuth": []}]
         app.openapi_schema = schema
         return schema
@@ -103,14 +155,19 @@ never reads your calendar — you (or your agent) tell it what works.
     def robots_txt():
         return PlainTextResponse(
             f"# Agent/API discovery: {P}/llms.txt and {P}/api/openapi.json\n"
-            f"User-agent: *\nDisallow: {P}/p/\nDisallow: {P}/api/\n")
+            f"User-agent: *\nDisallow: {P}/p/\nDisallow: {P}/api/\n"
+        )
 
     if settings.OPERATOR:
         from kairos.templating import create_env, render
+
         legal_env = create_env()
-        legal_ctx = {"operator": settings.OPERATOR,
-                     "address": [a.strip() for a in settings.OPERATOR_ADDRESS.split(",") if a.strip()],
-                     "email": settings.OPERATOR_EMAIL, "extra": settings.LEGAL_EXTRA}
+        legal_ctx = {
+            "operator": settings.OPERATOR,
+            "address": [a.strip() for a in settings.OPERATOR_ADDRESS.split(",") if a.strip()],
+            "email": settings.OPERATOR_EMAIL,
+            "extra": settings.LEGAL_EXTRA,
+        }
 
         @app.get(f"{P}/imprint", include_in_schema=False)
         def imprint():
@@ -131,7 +188,11 @@ never reads your calendar — you (or your agent) tell it what works.
             conn.close()
             return {"status": "ok", "app": "kairos"}
         except Exception as e:
-            return JSONResponse(content={"status": "degraded", "error": str(e)}, status_code=503)
+            # Log the detail; do not return it. str(e) on a sqlite failure carries
+            # absolute paths and driver text, and this endpoint is deliberately
+            # reachable without passing the trusted-proxy allowlist.
+            log.error("health check failed: %s", e, exc_info=True)
+            return JSONResponse(content={"status": "degraded"}, status_code=503)
 
     return app
 

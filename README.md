@@ -73,4 +73,14 @@ Kairos trusts identity headers from whatever reverse proxy you already run
 Access, Tailscale… Respondents never need accounts — share links and invite
 tokens are self-contained. See `kairos/settings.py` for all env knobs.
 
+> **Before exposing a hosted instance, set `KAIROS_TRUSTED_PROXY_CIDRS`.** Header
+> mode trusts whoever sets the identity headers, so anything that can reach the
+> app port directly can assert any identity — including becoming any poll owner.
+> Set it to the proxy's address(es), e.g. `KAIROS_TRUSTED_PROXY_CIDRS=10.0.0.0/8,127.0.0.1`.
+> Requests from any other peer are refused with 403 and logged. Unset means *trust
+> everyone*, which is only safe while the port is unreachable except through your
+> proxy. The check uses the real transport peer, never `X-Forwarded-For`; if you
+> run uvicorn yourself rather than via the `kairos` entrypoint, pass
+> `proxy_headers=False` so it does not rewrite that address before Kairos sees it.
+
 > **Cookie note for operators:** Kairos sets only strictly-necessary cookies (session, signed response-edit token, theme preference) — disclosed on `/privacy`, no consent banner required (ePrivacy Art. 5(3) / Swiss TCA 45c exemptions). If you add analytics or any third-party embeds to your deployment, that changes — you'll need consent management.

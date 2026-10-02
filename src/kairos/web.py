@@ -182,9 +182,20 @@ def dashboard(request: Request):
 
     polls = list_polls(user["uid"])
     for poll_row in polls:
-        poll_row["conv"] = convergence(poll_row, get_responses(poll_row["id"]),
-                                       get_invites(poll_row["id"]))
-        poll_row["invite_count"] = len(get_invites(poll_row["id"]))
+        # Fetch invites once and reuse. This called get_invites() twice per poll
+        # with identical arguments -- once for convergence, once for invite_count.
+        # Measured against real SQLite: the dashboard costs 3N+2 SQL statements
+        # for N polls (was 4N+2), see tests/test_dashboard_queries.py.
+        #
+        # That is a real saving and NOT the fix for hosted. 3N+2 still exhausts
+        # the Cloudflare free tier's 50 D1 subrequests per invocation at 16 polls
+        # with no responses, and at 8 polls once each poll has any responses,
+        # because list_polls() also runs a COUNT(*) per poll. Hosted needs
+        # convergence denormalised onto sched_polls (making this 1 query) or the
+        # grid loaded per poll as a JS island. Tracked in PLAN.md.
+        invites = get_invites(poll_row["id"])
+        poll_row["conv"] = convergence(poll_row, get_responses(poll_row["id"]), invites)
+        poll_row["invite_count"] = len(invites)
 
     return render(env, "dashboard.html", user=user, title="Kairos",
                   polls=polls, **_nav_ctx(user))

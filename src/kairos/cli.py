@@ -17,9 +17,27 @@ def main():
     import uvicorn
 
     from kairos import settings
-    print(f"Kairos → http://{args.host}:{args.port}{settings.PREFIX}/  "
-          f"(auth={settings.AUTH_MODE}, db={os.environ.get('KAIROS_DB_URL', 'sqlite:///kairos.db')})")
-    uvicorn.run("kairos.main:app", host=args.host, port=args.port)
+
+    trusted = (
+        f"trusted-proxies={settings.TRUSTED_PROXY_CIDRS}"
+        if settings.TRUSTED_PROXY_NETWORKS
+        else "trusted-proxies=ANY (set KAIROS_TRUSTED_PROXY_CIDRS to restrict)"
+    )
+    print(
+        f"Kairos → http://{args.host}:{args.port}{settings.PREFIX}/  "
+        f"(auth={settings.AUTH_MODE}, db={os.environ.get('KAIROS_DB_URL', 'sqlite:///kairos.db')}, "
+        f"{trusted})"
+    )
+    # proxy_headers=False is load-bearing, not a preference. Uvicorn defaults it
+    # on and then rewrites scope["client"] from X-Forwarded-For for peers it
+    # deems local — so kairos.auth.peer_address() would hand back the client's
+    # *claimed* address and KAIROS_TRUSTED_PROXY_CIDRS would be checked against
+    # a value the caller supplied. Verified against uvicorn 0.54: with
+    # proxy_headers=True a request carrying `X-Forwarded-For: 203.0.113.99`
+    # reports client.host=203.0.113.99; with it False, client.host is the true
+    # peer. Kairos reads forwarded headers itself where it needs them
+    # (auth.get_base_url).
+    uvicorn.run("kairos.main:app", host=args.host, port=args.port, proxy_headers=False)
 
 
 if __name__ == "__main__":
