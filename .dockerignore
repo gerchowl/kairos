@@ -1,0 +1,40 @@
+# Keep the build context to what the image actually needs, and keep secrets out
+# of it: the Dockerfile copies pyproject.toml, uv.lock, README.md and src/, so
+# everything else is dead weight — and a `.env` copied into a layer is a leaked
+# session secret that survives in the build cache (obligation S4).
+.git
+.github
+.gitignore
+.gitleaks.toml
+.dockerignore
+Dockerfile
+.env
+.env.*
+!.env.example
+compose*.yaml
+docs
+tests
+mcp
+site
+ui
+.github
+node_modules
+dist
+.venv
+.direnv
+__pycache__
+*.pyc
+.pytest_cache
+kairos.db
+*.db-wal
+*.db-shm
+CLAUDE.md
+HANDOFF.md
+PLAN.md
+goal.md
+CHANGELOG.md
+FEATURE-MATRIX.md
+ruff.toml
+flake.nix
+flake.lock
+opencode.json

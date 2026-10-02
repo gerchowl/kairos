@@ -72,6 +72,90 @@ jobs:
             -d '{"title":"MariaDB poll","mode":"full_day","slots":[{"date":"2026-12-01"}]}' | grep share_url
           kill %1 && wait || true   # free uv for the cache post-step
 
+  image:
+    # Obligation D3 (#35): the OCI image wraps the same uvicorn app, so prove it
+    # by booting it and exercising the same lifecycle the `quickstart` job runs.
+    # Podman is preinstalled on the hosted runners; `docker compose` validates
+    # the compose files (the v2 plugin ships with the runner's docker).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image
+        run: podman build -t kairos:ci .
+      - name: Boot non-root, probe /health, run a poll lifecycle
+        run: |
+          podman run -d --name kairos -p 127.0.0.1:8003:8003 \
+            -e KAIROS_API_KEY=ci -v kairos-ci-data:/data kairos:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8003/health && break; sleep 1; done
+          set -ex
+          curl -sf http://127.0.0.1:8003/health | grep '"ok"'
+          # uid must not be 0 — the image ships a kairos user.
+          podman exec kairos id -u | grep -vx 0
+          # the SQLite file must be on the mounted volume, owned by that user
+          podman exec kairos ls -l /data/kairos.db
+          POLL=$(curl -sf -X POST http://127.0.0.1:8003/api/polls \
+            -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
+            -d '{"title":"Image poll","mode":"full_day","slots":[{"date":"2026-12-01"}]}')
+          ID=$(echo "$POLL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+          SLOT=$(echo "$POLL" | python3 -c 'import json,sys;print(json.load(sys.stdin)["slots"][0]["id"])')
+          curl -sf -X POST "http://127.0.0.1:8003/api/polls/$ID/respond" \
+            -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
+            -d "{\"name\":\"CI\",\"availabilities\":{\"$SLOT\":\"yes\"}}" | grep CI
+          curl -sf -X POST "http://127.0.0.1:8003/api/polls/$ID/decide" \
+            -H 'Authorization: Bearer ci' -H 'Content-Type: application/json' \
+            -d "{\"slot_id\":\"$SLOT\"}" | grep decided
+          curl -sf "http://127.0.0.1:8003/api/polls/$ID/event.ics" \
+            -H 'Authorization: Bearer ci' | grep "BEGIN:VCALENDAR"
+      - name: The database survives a container rebuild
+        run: |
+          set -ex
+          POLL_ID=$(podman exec kairos python -c "
+          import sqlite3; c = sqlite3.connect('/data/kairos.db')
+          print(c.execute('SELECT id FROM sched_polls ORDER BY created_at DESC LIMIT 1').fetchone()[0])")
+          podman rm -f kairos                       # destroy the container...
+          podman run -d --name kairos -p 127.0.0.1:8003:8003 \
+            -e KAIROS_API_KEY=ci -v kairos-ci-data:/data kairos:ci  # ...keep the volume
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8003/health && break; sleep 1; done
+          # An ephemeral filesystem would 404 this: the poll is only in the volume.
+          curl -sf "http://127.0.0.1:8003/api/polls/$POLL_ID" -H 'Authorization: Bearer ci' | grep decided
+      - name: A forged X-Forwarded-For cannot defeat the trusted-proxy allowlist
+        # The security property the image's CMD exists to preserve: uvicorn's
+        # default proxy_headers=True would rewrite the peer from XFF *before*
+        # Kairos sees it, so this would return 200 instead of 403.
+        run: |
+          set -ex
+          podman rm -f kairos-s1
+          podman run -d --name kairos-s1 -e KAIROS_AUTH=header \
+            -e SESSION_SECRET=ci -e KAIROS_TRUSTED_PROXY_CIDRS=192.0.2.0/24 kairos:ci
+          sleep 5
+          # /health is exempt from the allowlist, so probes still work
+          podman exec kairos-s1 python -c "
+          import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8003/health').status == 200"
+          # everything else is refused, including with a forged XFF inside the
+          # allowlist and an asserted identity
+          test "$(podman exec kairos-s1 python -c "
+          import urllib.request, urllib.error
+          r = urllib.request.Request('http://127.0.0.1:8003/api/polls', method='POST',
+            data=b'{\"title\":\"evil\",\"mode\":\"full_day\",\"slots\":[{\"date\":\"2026-12-01\"}]}',
+            headers={'Content-Type': 'application/json', 'X-Forwarded-For': '192.0.2.7',
+                     'X-User': 'attacker'})
+          try:
+              urllib.request.urlopen(r); print('REACHED')
+          except urllib.error.HTTPError as e:
+              print(e.code)")" = "403"
+      - name: Compose files are valid
+        run: |
+          docker compose -f compose.yaml config -q
+          KAIROS_DB_PASSWORD=ci KAIROS_DB_ROOT_PASSWORD=ci \
+            docker compose -f compose.yaml -f compose.mysql.yaml config -q
+          KAIROS_SITE=x ACME_EMAIL=a@b.c OIDC_ISSUER_URL=https://id.example.org \
+            OIDC_CLIENT_ID=c OIDC_CLIENT_SECRET=s OIDC_REDIRECT_URL=https://x/cb \
+            OIDC_ALLOWED_DOMAINS=e.org OAUTH2_PROXY_COOKIE_SECRET=k SESSION_SECRET=s \
+            docker compose -f compose.proxy.yaml config -q
+          # A missing operator secret must fail the deploy, not boot with a blank one.
+          # (No .env in a fresh checkout, so this is the unset case.)
+          ! docker compose -f compose.proxy.yaml config -q
+
   licenses:
     # No copyleft surprises in the dependency tree (we ship MIT)
     runs-on: ubuntu-latest

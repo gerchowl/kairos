@@ -9,5 +9,13 @@ dist/
 site/playground/wheels/
 site/playground/wheels.json
 
+# Operator secrets for the container stack (obligation S4). `.env` is read
+# automatically by compose and is excluded from the Docker build context, so a
+# session secret lives in exactly one place and never in a layer or a commit.
+# Ship `.env.example` instead.
+/.env
+/.env.*
+!/.env.example
+
 # Local agent tooling config (machine-specific Nix store paths) — not portable
 /opencode.json

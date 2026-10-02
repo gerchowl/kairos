@@ -1,0 +1,81 @@
+# Kairos — default self-host topology: SQLite on a named volume.
+#
+#   podman compose up -d
+#   podman compose logs -f kairos
+#   podman compose down            # the volume survives; `down -v` deletes the DB
+#
+# Then open http://127.0.0.1:8003/ (see the ports note below for anything else).
+#
+# What this file is NOT: it is not a production topology. It is the smallest
+# thing that boots and persists, so that "does it work" is one command. For
+# anything reachable from a network you do not own, add the reverse-proxy
+# topology:
+#
+#   podman compose -f compose.yaml -f compose.proxy.yaml up -d
+#
+# Operator-level choices this file deliberately does NOT make for you (base
+# image family, registry/publication, retention, TLS termination) are listed in
+# docs/design/self-host-hardening.md.
+name: kairos
+
+services:
+  kairos:
+    build:
+      context: .
+    image: localhost/kairos:local
+    # Loopback by default on purpose. The app has no auth in demo mode, so
+    # publishing 0.0.0.0 by default would hand anyone on the internet a poll
+    # forge. Put a reverse proxy in front (compose.proxy.yaml) and keep this on
+    # loopback; only set KAIROS_BIND=0.0.0.0 if *something else* is listening
+    # in front of it.
+    ports:
+      - "${KAIROS_BIND:-127.0.0.1}:${KAIROS_PUBLISHED_PORT:-8003}:8003"
+    environment:
+      # Absolute, so the DB location does not depend on WORKDIR. Four slashes:
+      # "sqlite:///" + "/data/kairos.db". /data is the volume.
+      KAIROS_DB_URL: sqlite:////data/kairos.db
+      # Default `KAIROS_AUTH=demo` = one shared owner, no authentication. Fine
+      # on loopback, never fine on a public interface. For a multi-user
+      # instance see compose.proxy.yaml (header mode + trusted-proxy allowlist).
+      # API/agent access (optional): KAIROS_API_KEY from .env, or unset to
+      # disable the Bearer-key API surface entirely.
+      KAIROS_API_KEY: ${KAIROS_API_KEY:-}
+      # Absolute base for share links / .ics deep links. Unset, Kairos derives it
+      # from the request, which is wrong behind a proxy that does not forward
+      # X-Forwarded-Host — so set it when you put one in front.
+      KAIROS_PUBLIC_URL: ${KAIROS_PUBLIC_URL:-}
+    volumes:
+      # The whole point of the file: the SQLite file lives here, not in the
+      # container layer. A fresh named volume inherits /data's ownership
+      # (10001:10001) from the image, so this works without a chown step.
+      - kairos-data:/data
+    healthcheck:
+      # Repeated from the Dockerfile on purpose: podman's default image format
+      # is OCI, which cannot carry a HEALTHCHECK, so an image-only health check
+      # silently does not exist for many operators. Declaring it here works
+      # everywhere, and /health is exempt from the trusted-proxy allowlist
+      # precisely so probes do not crashloop.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8003/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+    # Nothing the container needs is written outside /data.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        # The app logs request lines; unbounded logs fill small disks, and a
+        # scheduling poll is not a thing anyone audits weeks later.
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  kairos-data:
