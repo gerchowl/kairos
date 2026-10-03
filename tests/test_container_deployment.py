@@ -539,6 +539,27 @@ def test_env_example_points_at_the_standalone_proxy_command():
     assert "-f compose.proxy.yaml up -d" in live
 
 
+def test_the_oidc_client_secret_is_optional_in_every_source_that_mentions_it():
+    """Four places talk about this variable and they must not disagree.
+
+    Kairos supports a public (PKCE-only) client and warns at boot when no secret
+    is configured, so `:?` on it in the compose file would refuse to start the
+    very path its own comment advertises — while `.env.example` told the operator
+    to leave it blank. Holding all four together is cheaper than rediscovering it.
+    """
+    compose = _commented_out(OIDC_COMPOSE)
+    suffixes = re.findall(r"\$\{KAIROS_OIDC_CLIENT_SECRET([^}]*)\}", compose)
+    assert suffixes, "compose.oidc.yaml must read the client secret from the environment"
+    assert all(not s.startswith(":?") for s in suffixes), (
+        "the client secret must be optional — an empty value is a valid public-client "
+        f"registration, got ${{KAIROS_OIDC_CLIENT_SECRET{suffixes[0]}}}"
+    )
+    assert "KAIROS_OIDC_CLIENT_SECRET" not in REQUIRED_VARS["compose.oidc.yaml"]
+    env_example = (ROOT / ".env.example").read_text()
+    assert "KAIROS_OIDC_CLIENT_SECRET" in env_example
+    assert "public" in env_example, ".env.example must keep documenting the public-client path"
+
+
 def test_env_example_points_at_the_standalone_oidc_command():
     """Same for #53's topology: the operator copies a header comment, not a file."""
     live = (ROOT / ".env.example").read_text()

@@ -51,7 +51,7 @@ POST {prefix}/oidc/logout    clears the session cookie (CSRF-protected)
 | `nonce` | an id_token replayed from an earlier login, or one minted for a different client flow |
 | PKCE (`S256`, never `plain`) | an intercepted authorization code being spent by whoever intercepted it |
 | The transaction cookie itself | the callback being *callable*: without it there is no state to compare, so nothing can be replayed into it |
-| Single use of the transaction cookie | replaying a successful callback response in the very browser that made it (the session-fixation shape) |
+| Single use of the transaction cookie — retired on **every** terminal outcome, refusal included | replaying a successful callback response in the very browser that made it (the session-fixation shape) |
 | Signature verification against the JWKS | a self-signed token. A `jwk` carried in the token's own header is **never** consulted |
 | `alg` allowlist | `alg: none`, and algorithm confusion (HS256 keyed with the RSA *public* key, which is public material) |
 | `iss`, `aud`, `azp`, `exp`, `nbf`, `iat` | a token from another provider, for another client, replayed across clients, or stale |
@@ -130,7 +130,7 @@ debugging session.
 | `KAIROS_AUTH` | yes | `demo` | set to `oidc` |
 | `KAIROS_OIDC_ISSUER` | yes | — | the issuer identifier **verbatim**; must equal the `issuer` in the discovery document |
 | `KAIROS_OIDC_CLIENT_ID` | yes | — | |
-| `KAIROS_OIDC_CLIENT_SECRET` | for a confidential client | — | unset = public client (PKCE only) |
+| `KAIROS_OIDC_CLIENT_SECRET` | for a confidential client | — | unset or empty = public client (PKCE only), which Kairos accepts and warns about |
 | `KAIROS_OIDC_ALLOWED_SUBJECTS` | one of the two | — | comma-separated exact `sub`s |
 | `KAIROS_OIDC_ALLOWED_EMAIL_DOMAINS` | one of the two | — | comma-separated bare domains |
 | `SESSION_SECRET` | yes | — | already required outside demo mode; also signs the session cookie |
@@ -152,6 +152,15 @@ that prefix.
 `KAIROS_OIDC_CLIENT_AUTH=post` is the default because that is what the hosted
 providers document; Authentik and Keycloak both accept HTTP Basic as well. If the
 exchange returns `invalid_client`, try `basic` before suspecting the secret.
+
+`KAIROS_OIDC_CLIENT_SECRET` may be left unset or empty. That makes Kairos a
+**public client**: PKCE still applies (S256), and the token request carries the
+client id with no secret. It is the right registration for a self-hosted IdP
+configured as a public client, and the wrong one for a confidential client, whose
+token endpoint answers `invalid_client` — so every boot logs a warning when no
+secret is configured. `compose.oidc.yaml` passes it through as an optional value
+for exactly this reason; the variables it *requires* are the ones with no valid
+empty setting.
 
 ### A minimal working set
 
@@ -275,6 +284,19 @@ runs entirely offline against a fake provider, so these are unproven:
   provider-specific, and revoking the refresh token with it is out of scope.
 - **Clock behaviour under real skew.** 60s of tolerance is asserted in tests, not
   observed against a real IdP's clock.
+- **The derived redirect URI is not validated.** With neither
+  `KAIROS_OIDC_REDIRECT_URI` nor `KAIROS_PUBLIC_URL` set, the URI is built from
+  the request's forwarded headers, so a hostile `X-Forwarded-Host` produces a
+  redirect URI pointing elsewhere. The provider rejects an unregistered URI, so
+  the result is one self-inflicted failed login and no session — and it is the
+  same behaviour `auth.get_base_url` already has for share links. Set
+  `KAIROS_PUBLIC_URL`; the boot warning says so.
+- **`alg` is allowlisted, not pinned per deployment.** An RS256 deployment would
+  also accept an HS256 token keyed on its own client secret. That needs the
+  secret, so it is not remote, but a leaked secret would then suffice to forge an
+  owner identity without the private key. `KAIROS_OIDC_ALLOWED_ALGS` would close
+  it; it is not built, because it adds configuration everywhere to defend against
+  a compromise that already leaks the client secret.
 - **Anything about EC-signed tokens** (`ES256`/`ES384`/`ES512`) or RSA-PSS
   (`PS256`). Both are refused with a clear error rather than accepted
   unverified. Hand-rolling P-256 or PSS was not worth the attack surface; a

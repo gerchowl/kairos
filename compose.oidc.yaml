@@ -88,7 +88,14 @@ services:
       # Authelia's own endpoint.
       KAIROS_OIDC_ISSUER: "${KAIROS_OIDC_ISSUER:?set KAIROS_OIDC_ISSUER, e.g. https://id.example.org/realms/main}"
       KAIROS_OIDC_CLIENT_ID: "${KAIROS_OIDC_CLIENT_ID:?set KAIROS_OIDC_CLIENT_ID from your IdP app registration}"
-      KAIROS_OIDC_CLIENT_SECRET: "${KAIROS_OIDC_CLIENT_SECRET:?set KAIROS_OIDC_CLIENT_SECRET — or leave it unset for a client registered as public}"
+      # OPTIONAL, and that is deliberate: an empty value makes Kairos a public
+      # client, which is the correct registration for some self-hosted IdPs and
+      # wrong for a confidential one — a confidential IdP answers `invalid_client`
+      # and Kairos warns at boot that no secret is configured. `:?` here would be
+      # self-contradictory: it refuses to start on the very path the comment
+      # advertises, and `.env.example` documents leaving it blank. Required vars in
+      # this file are the ones with no valid empty value.
+      KAIROS_OIDC_CLIENT_SECRET: "${KAIROS_OIDC_CLIENT_SECRET:-}"
       # The redirect URI must match the one registered on the IdP, exactly.
       # Derived from KAIROS_PUBLIC_URL + KAIROS_PREFIX when unset; setting it
       # explicitly is the safer habit, because that is the string to register.

@@ -480,8 +480,15 @@ def test_an_id_token_signed_with_a_key_the_provider_did_not_use_is_refused(idp):
         ({"iat": int(time.time()) + 3600}, "iat is in the future"),
         ({"nonce": "a-different-login"}, "nonce"),
         ({"sub": None}, "no sub"),
-        ({"exp": "soon"}, "numeric exp"),
+        ({"exp": "soon"}, "exp is not a number"),
         ({"aud": {"nope": 1}}, "aud is neither"),
+        # A malformed *optional* claim must refuse, not be skipped. If it were
+        # skipped, `"nbf": "soon"` would mean "no not-before check at all" —
+        # fail-open on malformed input, in a security control.
+        ({"nbf": "soon"}, "nbf is not a number"),
+        ({"iat": {}}, "iat is not a number"),
+        ({"nbf": []}, "nbf is not a number"),
+        ({"iat": True}, "iat is not a number"),
     ],
 )
 def test_every_claim_check_is_load_bearing(idp, overrides, match):
@@ -496,6 +503,21 @@ def test_a_token_for_several_audiences_must_name_this_client_in_azp(idp):
         _verify(idp.id_token(nonce="n", aud=[CLIENT_ID, "someone-elses-app"]), nonce="n")
     claims = _verify(idp.id_token(nonce="n", aud=[CLIENT_ID, "someone-elses-app"], azp=CLIENT_ID), nonce="n")
     assert claims["sub"] == "sub-alice"
+
+
+@pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_timestamp_is_refused_rather_than_defeating_the_comparison(
+    idp, claim, value
+):
+    """`json.loads` accepts NaN and Infinity; RFC 7519 does not.
+
+    Every comparison against a NaN is false, so `{"exp": NaN}` would be a token
+    that never expires — and `exp` is the claim that bounds replay. Same for
+    `nbf`/`iat`, where NaN would turn the not-before check into no check.
+    """
+    with pytest.raises(oidc.OidcError, match=f"{claim} is not a finite number"):
+        _verify(idp.id_token(nonce="n", **{claim: value}), nonce="n")
 
 
 def test_clock_skew_is_bounded_rather_than_infinite(idp):
@@ -1238,6 +1260,47 @@ def test_a_provider_that_does_not_echo_the_nonce_gets_nobody_in(client, monkeypa
     response = client.get(f"{P}/oidc/callback", params={"code": "c", "state": state}, follow_redirects=False)
     assert response.status_code == 400
     assert not client.cookies.get(oidc.SESSION_COOKIE)
+
+
+@pytest.mark.parametrize("outcome", ["exchange-failed", "not-allowlisted", "no-state",
+                                     "no-transaction", "idp-error"])
+def test_no_terminal_outcome_leaves_the_transaction_cookie_behind(client, monkeypatch, outcome):
+    """Single use has to mean single use on the *refused* paths too.
+
+    Two of these used to return their page directly and leave a live transaction
+    cookie standing. Not exploitable — `state` inside it is unguessable and
+    HttpOnly, and a real IdP consumes the code on the first exchange — but the
+    operator guide claims the cookie is retired on every outcome, and a security
+    claim in a document someone relies on should be true.
+    """
+    provider = FakeIdp()
+    provider.install(monkeypatch, ALLOWED_SUBJECTS=frozenset({"sub-alice"}))
+    state, nonce = _start(client)
+
+    if outcome == "no-transaction":
+        state = "no-state-at-all"
+    if outcome == "idp-error":
+        response = client.get(f"{P}/oidc/callback",
+                              params={"state": state, "error": "access_denied"},
+                              follow_redirects=False)
+    elif outcome == "no-state":
+        response = client.get(f"{P}/oidc/callback", params={"code": "c"},
+                              follow_redirects=False)
+    elif outcome == "exchange-failed":
+        provider.token_status = 400
+        provider.token_error = {"error": "invalid_client", "error_description": "no"}
+        response = client.get(f"{P}/oidc/callback", params={"code": "c", "state": state},
+                              follow_redirects=False)
+    else:  # not-allowlisted: a correct exchange, for a subject we did not admit
+        provider.install(monkeypatch, ALLOWED_SUBJECTS=frozenset({"sub-someone-else"}))
+        provider.token_nonce = nonce
+        response = client.get(f"{P}/oidc/callback", params={"code": "c", "state": state},
+                              follow_redirects=False)
+
+    assert response.status_code >= 400
+    assert not client.cookies.get(oidc.TRANSACTION_COOKIE), (
+        f"the transaction cookie survived the {outcome} path"
+    )
 
 
 def test_next_cannot_be_used_to_send_anyone_off_site(client, monkeypatch):

@@ -196,8 +196,12 @@ jobs:
           ! KAIROS_SITE=x ACME_EMAIL=a@b.c KAIROS_OIDC_ISSUER=https://id.example.org/realms/main \
             KAIROS_OIDC_CLIENT_ID=c SESSION_SECRET=s \
             docker compose -f compose.oidc.yaml config -q
-          ! KAIROS_SITE=x ACME_EMAIL=a@b.c KAIROS_OIDC_ISSUER=https://id.example.org/realms/main \
-            KAIROS_OIDC_CLIENT_ID=c KAIROS_OIDC_CLIENT_SECRET=s \
+          # The client secret is deliberately NOT required: an empty value is a
+          # legitimate public-client (PKCE-only) registration, which .env.example
+          # and compose.oidc.yaml both document. Asserted in the positive
+          # direction so the two cannot drift apart again.
+          KAIROS_SITE=x ACME_EMAIL=a@b.c KAIROS_OIDC_ISSUER=https://id.example.org/realms/main \
+            KAIROS_OIDC_CLIENT_ID=c SESSION_SECRET=s \
             docker compose -f compose.oidc.yaml config -q
           # compose.proxy.yaml must NOT validate as an overlay of compose.yaml.
           # Compose appends list-valued keys, so the two files' identical

@@ -55,6 +55,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -559,6 +560,14 @@ def _hs_verify(secret: str, signature: bytes, message: bytes, hash_name: str) ->
 # Symmetric signing is keyed by the client secret, which a provider only honours
 # when this client is registered confidential. RSA is keyed from the JWKS and is
 # what essentially every provider uses by default.
+#
+# KNOWN: this is an allowlist, not a pin, so an RS256 deployment would also
+# accept an HS256/384/512 token keyed on its own client secret. That needs the
+# secret, so it is not remote, but a *leaked* secret would then be enough to
+# forge an owner identity without the private key. A KAIROS_OIDC_ALLOWED_ALGS
+# knob closes it; deliberately not built here, because it adds configuration to
+# every deployment to defend against a compromise that already yields the
+# client secret.
 _ALGORITHMS = {
     "RS256": ("rsa", "sha256"),
     "RS384": ("rsa", "sha384"),
@@ -577,11 +586,26 @@ def _audiences(claim) -> list[str]:
     raise OidcError("id_token aud is neither a string nor a list of strings")
 
 
-def _numeric(claim) -> float | None:
-    """`claim` as a number, or None. Bools are numbers in Python and are not timestamps."""
+def _numeric(claim, name: str) -> float:
+    """`claim` as a finite number, or an error.
+
+    Three things are rejected here rather than downstream, because each of them
+    turns a *check* into a no-op instead of a refusal:
+
+      * a non-numeric value (`"soon"`, `{}`, `[]`) — `exp` was already refused on
+        this, and `nbf`/`iat` have to be too, or a malformed not-before quietly
+        skips the not-before check;
+      * a **bool**, which is an `int` in Python and so would read as 0 or 1;
+      * **`NaN` / `Infinity`**, which `json.loads` accepts by default and RFC 7519
+        does not. Every comparison against them is false, so `"exp": NaN` is a
+        token that never expires — and `exp` is what bounds replay.
+    """
     if isinstance(claim, bool) or not isinstance(claim, (int, float)):
-        return None
-    return float(claim)
+        raise OidcError(f"id_token {name} is not a number: {claim!r}")
+    value = float(claim)
+    if not math.isfinite(value):
+        raise OidcError(f"id_token {name} is not a finite number: {claim!r}")
+    return value
 
 
 def _check_claims(payload: dict, *, nonce: str, moment: float) -> None:
@@ -590,6 +614,11 @@ def _check_claims(payload: dict, *, nonce: str, moment: float) -> None:
     `iss` and `aud` pin the token to *this* deployment; `exp`/`nbf`/`iat` pin it
     to *now*; `nonce` and `sub` pin it to *this login of this browser*. All five
     are load-bearing — dropping `azp` in particular re-opens cross-client replay.
+
+    `exp` is mandatory. `nbf` and `iat` are optional, so the rule for them is
+    "absent, or a finite number that is not in the future" — never "absent, or
+    whatever it happens to be", which is how a malformed claim turns into a check
+    that never fires.
     """
     if str(payload.get("iss", "")).rstrip("/") != ISSUER.rstrip("/"):
         raise OidcError(f"id_token iss {payload.get('iss')!r} is not this deployment's issuer")
@@ -603,14 +632,12 @@ def _check_claims(payload: dict, *, nonce: str, moment: float) -> None:
         # it here.
         raise OidcError("id_token has several audiences and no azp naming this client")
 
-    expiry = _numeric(payload.get("exp"))
-    if expiry is None:
-        raise OidcError("id_token has no numeric exp")
-    if expiry < moment - CLOCK_SKEW:
+    if _numeric(payload.get("exp"), "exp") < moment - CLOCK_SKEW:
         raise OidcError("id_token has expired")
     for claim in ("nbf", "iat"):
-        value = _numeric(payload.get(claim))
-        if value is not None and value > moment + CLOCK_SKEW:
+        if payload.get(claim) is None:
+            continue
+        if _numeric(payload[claim], claim) > moment + CLOCK_SKEW:
             raise OidcError(f"id_token {claim} is in the future")
 
     if not payload.get("nonce") or not hmac.compare_digest(str(payload["nonce"]), nonce):
@@ -680,6 +707,16 @@ def resolve_redirect_uri(request: Request) -> str:
     (the SSoT `auth.get_base_url` already uses for share links), and only then
     the request's own headers — caller-supplied unless a proxy sets them, which
     is why that last case warns at boot.
+
+    KNOWN, and left as is: that last fallback does not go through `_check_url`,
+    so a hostile `X-Forwarded-Host` yields a `redirect_uri` pointing somewhere
+    else (including a `javascript://` one). The blast radius is one
+    self-inflicted failed login — the provider rejects the unregistered URI, so
+    nothing is exchanged and no cookie is issued — and it is exactly the
+    pre-existing behaviour of `auth.get_base_url` for share links. Validating it
+    here would mean trusting `Host` less than the rest of the app trusts it,
+    which is a larger change than this issue should make silently; the fix is
+    `KAIROS_PUBLIC_URL`, and the boot warning says so.
     """
     if REDIRECT_URI:
         return REDIRECT_URI
@@ -1058,22 +1095,26 @@ def oidc_callback(request: Request):
         claims = verify_id_token(tokens["id_token"], nonce=str(transaction["nonce"]))
     except OidcError as exc:
         log.error("OIDC exchange or verification failed: %s", exc)
-        return _page(
-            "Sign-in failed",
-            "The identity provider's response could not be verified, so no session was created. "
-            "The details are in the server log.",
-            400,
+        return _spent(
+            _page(
+                "Sign-in failed",
+                "The identity provider's response could not be verified, so no session was "
+                "created. The details are in the server log.",
+                400,
+            )
         )
     if not subject_allowed(claims):
         # Logged with the subject and never with the address: this check is what
         # makes the deployment safe, so an operator chasing "I cannot sign in"
         # needs to see which subject to allow.
         log.warning("rejected OIDC sign-in: %s", deny_reason(claims))
-        return _page(
-            "Not authorised",
-            "Your account is not on this deployment's owner allowlist. Ask the operator to add "
-            "your identity provider subject.",
-            403,
+        return _spent(
+            _page(
+                "Not authorised",
+                "Your account is not on this deployment's owner allowlist. Ask the operator to "
+                "add your identity provider subject.",
+                403,
+            )
         )
 
     response = RedirectResponse(safe_next(transaction.get("next")), status_code=302)
@@ -1103,6 +1144,21 @@ def oidc_logout(request: Request, form=Depends(form_data)):
     return response
 
 
+def _spent(response):
+    """End the transaction on a page that is not a success.
+
+    Every terminal outcome of the callback retires the transaction cookie, so this
+    is the *only* way to finish an attempt — two of these paths used to return
+    their page directly and left the cookie standing. Not exploitable (the
+    `state` inside it is unguessable and HttpOnly, and a real IdP consumes the
+    code on the first exchange), but it contradicted the "single use" claim the
+    operator guide makes, and a security claim in a document someone relies on
+    should be true rather than nearly true.
+    """
+    _clear_transaction(response)
+    return response
+
+
 def _expired():
     response = _page(
         "Sign-in expired",
@@ -1110,8 +1166,7 @@ def _expired():
         "the cookie. Start again.",
         400,
     )
-    _clear_transaction(response)
-    return response
+    return _spent(response)
 
 
 def _state_mismatch():
@@ -1127,8 +1182,7 @@ def _state_mismatch():
         "the sign-in page.",
         400,
     )
-    _clear_transaction(response)
-    return response
+    return _spent(response)
 
 
 def _idp_error(code: str):
@@ -1136,8 +1190,8 @@ def _idp_error(code: str):
     log.info("the identity provider returned error=%s", code)
     response = _page(
         "Sign-in cancelled",
-        "The identity provider did not return an authorization code" + (f" ({code})." if code else "."),
+        "The identity provider did not return an authorization code"
+        + (f" ({code})." if code else "."),
         400,
     )
-    _clear_transaction(response)
-    return response
+    return _spent(response)
