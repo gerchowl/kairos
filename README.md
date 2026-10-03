@@ -150,7 +150,9 @@ guide.)
 > identity boundary — the subject allowlist is. Every boot logs which is in force.
 
 **Before exposing a hosted instance, set `KAIROS_RATE_LIMIT=on`** (and
-`KAIROS_TRUSTED_PROXY_CIDRS`, which it depends on). See
+`KAIROS_TRUSTED_PROXY_CIDRS`, which it depends on), and consider handing out
+[scoped API keys](#api-keys-scopes-and-mail-budgets) rather than the single
+all-power one. See
 [Rate limiting](#rate-limiting-optional) below — the public token routes let
 anyone with a link create rows, and the owner routes can fan out mail to every
 address on a poll's participants table.
@@ -184,6 +186,14 @@ surface:
 | `invite` | `POST /p/<id>/invite` | 30/min |
 | `send` | `remind`, `remind-selected`, `email-decision` — actual SMTP | 10/hour |
 | `login` | `GET …/oidc/start`, `GET …/oidc/callback` — unauthenticated, one outbound call each | 30/min |
+| `api` | every authenticated `/api` call, charged to the **bearer key** | 600/min |
+| `api_write` | mutating `/api` routes | 60/min |
+| `mail` | `/api` routes that can send mail | 20/hour |
+| `mail_force` | `/api/.../nudge` with `force=true` — see [scoped API keys](#api-keys-scopes-and-mail-budgets) | 5/hour |
+
+The first six are charged to the caller's **transport address**; the last four to
+the **bearer key**, which an API client cannot vary — see the scoped-key section
+below for why that is the same limiter rather than a second one.
 
 Override any of them with `KAIROS_RATE_LIMIT_<RULE>="<count>/<window>"`
 (`second`/`minute`/`hour`/`day`), e.g. `KAIROS_RATE_LIMIT_SEND="30/hour"`. `0`
@@ -237,3 +247,108 @@ browser and as JSON otherwise.
 > how many addresses arrive. Beating deliberate rotation needs an identity the
 > client cannot vary — a cookie, or an API key — which is the bearer key #51
 > already introduces.
+
+## API keys: scopes and mail budgets
+
+<!-- #51 scoping. Self-contained section: append-only, so it rebases cleanly. -->
+
+`KAIROS_API_KEY` is a **single all-power key**: one bearer credential that reaches
+every poll, every route, and every third party's inbox. That is fine for a
+self-hoster with one agent, and it is what the ETH/duplet adapter sets, so it
+stays exactly as it is. It is *not* fine for a key that ends up in an agent's
+environment, gets pasted into a dotfile, and sends mail from your domain.
+
+So there is a second, opt-in way to hand out keys:
+
+```bash
+KAIROS_API_KEYS="k1:polls:read,respond;k2:mail:send;k3:mail:force"
+```
+
+* `;` separates keys, `,` separates the scopes of one key.
+* An entry is `<key>:<scopes>` or `<key>@<tier>` — never both, never neither. A
+  bare key is **refused**, because that is the one typo that would silently mean
+  full power; `KAIROS_API_KEY` is the only way to ask for that.
+* An unparseable entry **refuses the boot** rather than being skipped, so you are
+  never running with a scope you believe in and do not have.
+* `KAIROS_API_KEY` keeps working alongside the keyring, and **scoping wins** if a
+  key appears in both.
+
+A scope is a **capability, not a tenant**: it says what a key may *do*, not which
+polls it may see. Any key holding `polls:read` sees every poll, because
+`GET /api/polls` is not scoped per poll — one deployment, one set of polls, which
+is the single-team model this API has always had. Per-poll isolation is #29.
+
+| Scope | Routes it unlocks |
+|---|---|
+| `polls:read` | `GET` poll, responses, invites, contacts, `event.ics` |
+| `polls:write` | create / update / delete poll, add dates, decide, edit invitees and responses — *implies `polls:read`* |
+| `respond` | `POST .../respond` — submit availability |
+| `mail:send` | `invite`, `nudge`, `email-decision`, `imip-decision`, and `add_dates(notify=true)` |
+| `mail:force` | `nudge` with `force=true`, the 24h cooldown bypass — *implies `mail:send`* |
+| `imip:poll` | `POST /imip/poll`, the inbound mailbox poll |
+
+Default deny: a route a key has no scope for answers **403** naming the missing
+scope. `GET /api/whoami` reports what the presenting key holds, so an agent can
+find out instead of guessing — and the MCP server exposes it as `whoami()`.
+
+Two routes reach `mail:send` through a scope that is nominally something else
+(`add_dates(notify=true)`, `nudge(force=true)`), because that is exactly how a
+send path hides inside a harmless-looking route. Both are checked.
+
+### `force` is not a licence to spam
+
+`force=true` bypasses the reminder cooldown. It is an operator affordance for a
+human in the UI, so from the API it takes `mail:force` **and** its own
+`mail_force` budget of 5/hour. The web UI's `remind-selected` is unchanged: one
+click for a person, and the 24h cooldown still applies to everyone else.
+
+### Mail budgets
+
+| Knob | Default | What it bounds | On exceeding it |
+|---|---|---|---|
+| `KAIROS_MAIL_MAX_RECIPIENTS` | `100` | the recipient list a single **request** supplies — in practice `invite`, the only route whose list comes from the caller rather than from the poll | **400**, naming the knob. The caller still holds every address, so batching costs it nothing |
+| `KAIROS_MAIL_PER_POLL` | `2000/day` | recipients one **poll** may mail, counted across every send path — API and web UI alike — and charged to the poll, so it holds whatever key asks | **429** with `Retry-After` |
+
+The two failure modes are deliberately different. A caller-supplied list is
+refused outright; a fan-out over a poll's own participants is only *budgeted*,
+because a poll with more participants than the ceiling is a real meeting rather
+than an attack — and because the surfaces that reach it (the API's `nudge`, the
+UI's `remind-selected`) have no way to batch, so a 400 there would be a dead end.
+
+Everything else that fans out — `nudge`, `email-decision`, `imip-decision`,
+`remind`, `remind-selected` — is bounded by the per-poll budget, whatever
+surface asks and however the calls are split. That budget is the only one of these
+controls a rotated or stolen key cannot escape.
+
+Unlike the rate limits, these two ship **on**: they are keyed on nothing, so
+nobody legitimate is punished, and at the shipped numbers they are inert for a
+real workflow (`2000/day` is 500 participants × the ~4 messages a poll sends
+each). Raise them for a bigger meeting; `0` disables either one.
+
+### What these do *not* bound — read this before exposing an instance
+
+**With the shipped defaults, the total number of third-party recipients one key
+can reach is unbounded.** Both mail budgets are *per request* and *per poll*, so a
+key that mails the per-request ceiling to a **fresh poll** each time is refused
+nothing: 40 new polls × 100 recipients is 4 000 recipients mailed and not one
+429. Each poll gets its own allowance; there is no ceiling on the number of polls.
+
+This is deliberate, and it is not an oversight:
+
+* It is **not a regression.** Before this change there was no per-request cap and
+  no per-poll budget either, so the aggregate was unbounded then too.
+* ADR-0001/0002 require a deployment with nothing configured to behave exactly as
+  it did, and the ETH/duplet adapter sets no rate-limit variable. A rate limit
+  that fires by default is a behaviour change for it.
+
+What closes the aggregate is `KAIROS_RATE_LIMIT=on`, which enables the per-key
+`api` / `api_write` / `mail` / `mail_force` budgets above — charged to the key
+rather than to the poll, so N polls do not mean N allowances. **Set it, plus
+`KAIROS_TRUSTED_PROXY_CIDRS`, before exposing a hosted instance.** Kairos logs
+which of the two states it is in at every boot, so you do not have to remember:
+
+```
+per-key rate limits OFF -> the TOTAL across polls is UNBOUNDED: each poll gets its
+own allowance, so N fresh polls get N of them. Set KAIROS_RATE_LIMIT=on before
+exposing this deployment.
+```

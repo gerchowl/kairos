@@ -13,6 +13,10 @@ Modes (KAIROS_AUTH):
   none    no owner auth — the web management UI is disabled, API + public
           response pages only
 
+Poll *management* authority is a separate question from who the caller is, and
+lives in `require_manage` below (obligation S6, issue #29): an authenticated
+owner, or possession of the poll's `admin_token` capability.
+
 Respondent identity (signed per-poll cookies, invite tokens) is independent
 of this and always available. Replace get_user at runtime for custom
 integrations (e.g. a session-cookie portal): `kairos.auth.get_user = mine`.
@@ -143,6 +147,92 @@ def require_auth(request: Request) -> dict:
     return user
 
 
+# -- Poll management authority (obligation S6, issue #29) -------------------
+#
+# One predicate, so authorization stops being re-decided per route. Two
+# independent ways to be a poll's manager (ADR-0001, ADR-0002, ADR-0009):
+#
+#   1. an authenticated identity equal to the poll's `creator_id` (the rule that
+#      has always existed) or its `owner_id` (an account id, or the header uid,
+#      on polls created since #29);
+#   2. possession of the poll's `admin_token`, which the caller presents.
+#
+# In `KAIROS_AUTH=header` (ETH, every self-hoster) rule 1 fires exactly as it
+# always did and rule 2 is never reachable in practice -- no such route exists
+# and no token is ever shown to anyone -- so those deployments are unchanged.
+
+
+def _token_manages(poll: dict, token: str | None) -> bool:
+    """Does `token` equal this poll's management capability? Fails closed."""
+    expected = poll.get("admin_token")
+    if not expected or not token:
+        return False
+    # Both sides are str in practice -- a VARCHAR column and a URL path
+    # parameter -- and both are coerced anyway, because neither input is
+    # trustworthy enough to type-check: hmac.compare_digest raises TypeError on
+    # a non-ASCII str (a URL can carry any byte) and AttributeError on bytes (a
+    # hand-rolled `get_poll` seam need not), and a 500 provoked by someone
+    # else's malformed input is a worse answer than a 403.
+    return hmac.compare_digest(str(token).encode(), str(expected).encode())
+
+
+def can_manage(poll: dict, request: Request, *, token: str | None = None,
+               user: dict | None = None) -> bool:
+    """Does the caller of `request` hold management authority over `poll`?
+
+    `token` is the management capability the caller presented, if any. It is
+    passed explicitly rather than read out of the request on purpose:
+    `public.py` has routes whose path parameter is *also* called `token` and
+    holds a `public_token`, so a route that forgot to pass one would otherwise
+    hand this predicate a value it never meant to.
+
+    `user` is the caller's already-resolved identity; omit it and it is resolved
+    from `request` here. A route that has authenticated should pass the user it
+    holds, so `auth.get_user` -- a documented runtime seam (`kairos.auth.get_user
+    = mine`) whose replacement need not be cheap or idempotent -- runs at most
+    once per request. Omitting it is what an anonymous capability route (#30's
+    `/manage/<token>`) wants.
+
+    The poll is read with `.get()` throughout, so a row that predates these
+    columns -- or a stubbed dict in a test -- authorizes exactly as it always
+    did.
+
+    Deliberately *not* here: CSRF (request integrity, the route's business) and
+    the `manage_verified_at` send-gate (obligation A2, #31 -- a property of the
+    poll, not of who is asking). Keeping them out is what lets #31 add that gate
+    without re-deciding who may manage a poll.
+    """
+    user = user if user is not None else get_user(request)
+    # Truthiness-checked uid, compared with `==` rather than membership in a
+    # tuple: `None in (None, None)` is True, and `owner_id` IS NULL on every
+    # pre-#29 row and on every #30 accountless poll -- so a seam that returns
+    # `{"uid": None}` for "not logged in" (the natural shape for a session
+    # cookie portal, and `get_user` is a documented supported seam) would have
+    # granted management of every such poll. Fail closed on an absent uid.
+    uid = (user or {}).get("uid")
+    if uid and (uid == poll.get("creator_id") or uid == poll.get("owner_id")):
+        return True
+    return _token_manages(poll, token)
+
+
+def require_manage(poll: dict, request: Request, *, token: str | None = None,
+                   user: dict | None = None) -> dict:
+    """`poll` if the caller may manage it, else 403. Returns the poll so a
+    route can write `poll = require_manage(poll, request, user=user)`.
+
+    403 for an anonymous caller and for a wrong-but-authenticated one alike:
+    "you are not the owner" is the only thing either is entitled to learn. A
+    route that wants a different shape (an HTML error page, a login redirect)
+    asks `can_manage` first -- see web.edit_poll_page.
+
+    A missing poll is not handled here: that is a 404 and stays the route's
+    business, so "forbidden" and "gone" never share one code path.
+    """
+    if not can_manage(poll, request, token=token, user=user):
+        raise HTTPException(403, "Not the poll owner")
+    return poll
+
+
 def get_base_url(request: Request) -> str:
     """Public base URL for share links: explicit KAIROS_PUBLIC_URL (SSoT,
     e.g. the WASM playground or odd proxies), else forwarding headers."""
@@ -153,15 +243,33 @@ def get_base_url(request: Request) -> str:
     return f"{proto}://{host}"
 
 
-def require_api_key(request: Request) -> dict:
-    """`Authorization: Bearer <KAIROS_API_KEY>` with constant-time comparison."""
-    expected = settings.API_KEY or os.environ.get("KAIROS_API_KEY", "")
-    if not expected:
-        raise HTTPException(500, "KAIROS_API_KEY not configured")
+def bearer_credential(request: Request) -> str:
+    """The credential from `Authorization: Bearer <key>`, or a 401.
+
+    Split out of `require_api_key` because the scoped API (#51) must read the
+    header before it knows *which* credential to compare it against: its keyring
+    is checked before the legacy single key, not after.
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(401, "Missing or invalid Authorization header")
-    if not hmac.compare_digest(auth[7:], expected):
+    return auth[7:]
+
+
+def require_api_key(request: Request) -> dict:
+    """`Authorization: Bearer <KAIROS_API_KEY>` with constant-time comparison.
+
+    The single unscoped credential — every poll, every capability, no budget.
+    Deliberately unchanged: the ETH/duplet adapter (from `SCHEDULER_API_KEY`) and
+    every self-hoster set `KAIROS_API_KEY` and must keep working exactly as they
+    do (ADR-0001/0002). Least-privilege keys arrive via `KAIROS_API_KEYS`, and
+    `kairos.scoping` delegates back here for any credential not in that ring, so
+    there is one implementation of the legacy check and its 401/500 wording.
+    """
+    expected = settings.API_KEY or os.environ.get("KAIROS_API_KEY", "")
+    if not expected:
+        raise HTTPException(500, "KAIROS_API_KEY not configured")
+    if not hmac.compare_digest(bearer_credential(request), expected):
         raise HTTPException(401, "Invalid API key")
     return {"uid": "api", "email": "", "name": "API", "source": "api_key"}
 

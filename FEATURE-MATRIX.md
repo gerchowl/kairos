@@ -8,9 +8,11 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Scheduling polls (full-day / time-slot, when2meet grid) | `web.py`, `public.py`, `helpers.py` | ADR-0001, ADR-0002 |
 | Public share links + per-person invite links | `public.py`, `db.py` | ADR-0001 |
 | Owner management (create/decide/invite) | `web.py`, `api.py` | ADR-0002 |
+| Management authority in one predicate (`require_manage`, obligation S6) | `auth.py`, `db.py`, `web.py`, `api.py` | ADR-0001, ADR-0002, ADR-0009 |
 | Env-only configuration | `settings.py` | ADR-0003 |
 | Trusted-proxy allowlist (`KAIROS_TRUSTED_PROXY_CIDRS`, obligation S1) | `auth.py`, `main.py`, `cli.py` | ADR-0002 |
 | Abuse limits on the public/email surface (`KAIROS_RATE_LIMIT`, obligation A3) | `ratelimit.py`, `public.py`, `web.py` | ADR-0001, ADR-0002, ADR-0003 |
+| API key scopes + per-request / per-poll mail budgets + per-key budgets (`KAIROS_API_KEYS`) | `scoping.py`, `api.py`, `ratelimit.py` | ADR-0001, ADR-0002, ADR-0010 |
 | iCalendar generation + parsing | `ics.py`, `imip_inbound.py` | ADR-0004 |
 | Reverse-calendar: candidate feed + deep-link voting | `ics.py` (`build_feed_ics`), `public.py` | ADR-0005, ADR-0006 |
 | Native iMIP invites (REQUEST/CANCEL) + IMAP-poll ingest | `ics.py`, `email_service.py`, `imip_inbound.py`, `api.py` | ADR-0005, ADR-0006 |

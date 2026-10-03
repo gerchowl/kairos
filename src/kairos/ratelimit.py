@@ -21,10 +21,15 @@ addresses and defeats every budget here trivially, which is why production
 limiters bind something the client cannot vary — a cookie, or an API key. The
 mitigation in scope is the *ceiling*, not the identity: the keyspace is bounded
 at `MAX_BUCKETS` so rotation cannot be turned into unbounded memory or CPU, and
-the budgets still cap how much a caller can do from **one** address, which is
-the polite-abuse and single-source-flood case this actually targets. Anything
-that needs to survive deliberate rotation is #51's problem to solve with the
-bearer key it already introduces — see the PR for the interaction.
+the budgets still cap how much a caller can do from **one** address, which is the
+polite-abuse and single-source-flood case this actually targets.
+
+The API surface (issue #51) is that missing "something the client cannot vary",
+and it landed on the bearer key: `kairos.scoping` charges four more rules
+(`api`, `api_write`, `mail`, `mail_force`) to `key:<digest>` instead of to a
+peer, using **this** limiter and this `RateLimited` signal. One mechanism, two
+things to charge. Its per-poll send budget additionally reuses `check` with
+`cost=n`, because it counts recipients rather than requests.
 
 **Fail-open vs fail-closed.** Split by what can actually fail, because they are
 not the same failure:
@@ -96,9 +101,22 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def check(
-        self, rule: str, limit: int, window: int, key: str, now: float | None = None
+        self,
+        rule: str,
+        limit: int,
+        window: int,
+        key: str,
+        now: float | None = None,
+        cost: int = 1,
     ) -> tuple[bool, int]:
         """Charge one request against (rule, key).
+
+        `cost` charges N units rather than one, for a budget denominated in
+        something other than requests — issue #51's per-poll send budget counts
+        *recipients*, so 60 invites of 10 addresses each is 600 and not 60. It is
+        charged under the one lock and refused before any of it lands, so a
+        partial charge is not expressible. At `cost=1` the rule below is
+        byte-for-byte the pre-#51 one.
 
         Returns (allowed, retry_after_seconds). Never raises — the fail-open
         behaviour described in the module docstring lives at the call site.
@@ -111,12 +129,12 @@ class RateLimiter:
             start, count, width = self._buckets.get(bucket, (now, 0, window))
             if now - start >= width:
                 start, count = now, 0
-            if count >= limit:
+            if count + cost > limit:
                 return False, max(1, math.ceil(width - (now - start)))
             # pop-then-set so dict order is least-recently-charged first, which
             # is the order both eviction paths below walk.
             self._buckets.pop(bucket, None)
-            self._buckets[bucket] = (start, count + 1, width)
+            self._buckets[bucket] = (start, count + cost, width)
             if len(self._buckets) > self._max_buckets:
                 # Hard ceiling. O(1) amortised: evict exactly as many entries as
                 # this insert added, never a scan and never a sort. This is the
@@ -318,11 +336,16 @@ def install(app) -> None:
         retry_after = str(exc.retry_after)
         if "text/html" in request.headers.get("accept", ""):
             return render(
-                env, "message.html", status_code=429, title="Slow down",
+                env,
+                "message.html",
+                status_code=429,
+                title="Slow down",
                 heading="Too many requests",
                 detail=f"This link is being used too often. Please wait "
-                       f"{exc.retry_after} seconds and try again.",
-                error=True, noindex=True, headers={"Retry-After": retry_after},
+                f"{exc.retry_after} seconds and try again.",
+                error=True,
+                noindex=True,
+                headers={"Retry-After": retry_after},
             )
         return JSONResponse(
             {"detail": f"Rate limit exceeded for '{exc.rule}'. Retry in {exc.retry_after}s."},

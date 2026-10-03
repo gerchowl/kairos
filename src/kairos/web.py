@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
 
 from kairos import settings
-from kairos.auth import get_base_url, get_user
+from kairos.auth import can_manage, get_base_url, get_user, require_manage
 from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
     add_slots,
@@ -51,6 +51,7 @@ from kairos.helpers import (
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
 from kairos.ratelimit import rate_limit
+from kairos.scoping import charge_poll_recipients
 from kairos.templating import render
 
 P = settings.PREFIX
@@ -132,15 +133,21 @@ def _valid_timezone(tz: str) -> bool:
 
 
 def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
-    """Auth + CSRF + ownership gate shared by all owner POST actions."""
+    """Auth + CSRF + management-authority gate shared by all owner POST actions.
+
+    Three steps in a fixed order -- no identity (401), then CSRF (403), then
+    `require_manage` (403) -- which is the order and the status codes of every
+    version before #29. Only the ownership test moved: it is now the one shared
+    predicate (obligation S6) instead of a copy per route.
+    """
     user = get_user(request)
     if not user:
         raise HTTPException(401)
     require_csrf(user, form)
     poll = get_poll(poll_id)
-    if not poll or poll["creator_id"] != user["uid"]:
+    if not poll:
         raise HTTPException(403, "Not the poll owner")
-    return user, poll
+    return user, require_manage(poll, request, user=user)
 
 
 def expand_new_dates(poll: dict, dates: list[str]) -> list[dict]:
@@ -288,7 +295,11 @@ def create_poll_submit(request: Request, form=Depends(form_data),
     if not slots:
         return _error_page(user, "New Poll", "At least one date is required.", f"{P}/new")
 
-    poll = create_poll(user["uid"], title, description, mode, timezone, slots)
+    # owner_id is the authenticated owner (ADR-0009); in header mode that is the
+    # same uid as creator_id, and creator_email stays NULL because only the
+    # hosted accountless flow mails a management link (#30).
+    poll = create_poll(user["uid"], title, description, mode, timezone, slots,
+                       owner_id=user["uid"])
     return RedirectResponse(f"{P}/polls/{poll['id']}", status_code=302)
 
 
@@ -316,7 +327,7 @@ def view_poll(poll_id: str, request: Request):
 
     decided_slot = decided_slot_of(poll)
     decided_label = format_slot(decided_slot, poll["mode"]) if decided_slot else None
-    is_owner = poll["creator_id"] == user["uid"]
+    is_owner = can_manage(poll, request, user=user)
     conv = convergence(poll, responses, invites)
     # matrix-click decide is only wired when the strip renders the select
     decidable = is_owner and poll["status"] == "open" and conv["state"] in ("ready", "partial")
@@ -423,7 +434,7 @@ def edit_poll_page(poll_id: str, request: Request):
     poll = get_poll(poll_id)
     if not poll:
         return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
-    if poll["creator_id"] != user["uid"]:
+    if not can_manage(poll, request, user=user):
         return _error_page(user, "Not allowed", "Only the poll owner can edit it.",
                            f"{P}/polls/{poll_id}", status_code=403)
     existing_dates = sorted({str(s["date"]) for s in poll["slots"]})
@@ -471,6 +482,27 @@ def edit_poll_submit(poll_id: str, request: Request, form=Depends(form_data)):
 NUDGE_COOLDOWN = timedelta(hours=24)
 
 
+def _nudge_target_count(invites, responses, only_emails) -> int:
+    """How many addresses a nudge *aims at*, whether or not it mails them all.
+
+    The upper bound, deliberately: the send loop then skips anyone already
+    current, and charging only what goes out would make bypassing the cooldown
+    cheaper to abuse than respecting it. An address reachable both as an invitee
+    and as a walk-in counts once, because the loop sends it once.
+    """
+    invite_emails = {i["email"].lower() for i in invites}
+    targets = set()
+    for inv in invites:
+        email = inv["email"].lower()
+        if only_emails is None or email in only_emails:
+            targets.add(email)
+    for resp in responses:
+        email = (resp.get("respondent_email") or "").lower()
+        if email and email not in invite_emails and (only_emails is None or email in only_emails):
+            targets.add(email)
+    return len(targets)
+
+
 def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 — a state machine: per-participant timestamp gating is clearer flat than split
                        only_emails: set[str] | None = None, force: bool = False) -> dict:
     """State-driven, idempotent reminders — safe to trigger repeatedly.
@@ -487,12 +519,20 @@ def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 �
     ("email exactly these people now"): it bypasses cooldown/already-told
     gating, and up-to-date participants get a plain reminder.
     Every send lands in the contact audit log.
+
+    Charged against the poll's send budget (issue #51) before anything goes out,
+    and against the addresses it *targets* rather than the ones it ends up mailing
+    (see `_nudge_target_count`). The charge lives here, once, so the API's
+    `nudge` and `add_slots(notify=True)` and the UI's `remind` / `remind-selected`
+    all draw on one per-poll allowance -- which is how ADR-0012's parity
+    invariant holds: one ceiling, not two kept in step by review.
     """
     base = get_base_url(request)
     sender, reply = user.get("name", "Someone"), user.get("email")
     now = db_now()
     responses = get_responses(poll["id"])
     invites = get_invites(poll["id"])
+    charge_poll_recipients(poll["id"], _nudge_target_count(invites, responses, only_emails))
     slot_times = [s["created_at"] for s in poll["slots"] if s.get("created_at")]
     latest_slot_at = max(slot_times, default=None)
     by_invite = {r["invite_id"]: r for r in responses if r.get("invite_id")}
@@ -618,8 +658,12 @@ def email_decision(poll_id: str, request: Request, form=Depends(form_data),
         raise HTTPException(400, "Poll has no decided date yet")
 
     poll_url = f"{get_base_url(request)}{P}/p/{poll['public_token']}"
+    # The same per-poll send budget the API's email-decision charges (issue #51):
+    # one allowance for one poll, whichever surface asks for it.
+    recipients = recipient_emails(poll_id)
+    charge_poll_recipients(poll_id, len(recipients))
     sent = send_decision_email(
-        recipient_emails(poll_id),
+        recipients,
         poll["title"],
         format_slot(slot, poll["mode"]),
         poll_url,

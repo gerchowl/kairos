@@ -23,6 +23,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    from kairos import scoping
     from kairos.api import router as api_router
     from kairos.auth import peer_address, peer_is_trusted
     from kairos.oidc import boot_warnings, identity_report
@@ -39,7 +40,10 @@ def create_app() -> FastAPI:
             "Scheduling-poll API. Create polls, submit responses, invite "
             "participants (required/optional), send idempotent reminders, "
             "decide a final date and distribute it with an .ics file.\n\n"
-            "Auth: `Authorization: Bearer <KAIROS_API_KEY>`. "
+            "Auth: `Authorization: Bearer <KAIROS_API_KEY>`. Keys may be scoped "
+            "(`polls:read`, `polls:write`, `respond`, `mail:send`, `mail:force`, "
+            "`imip:poll`); `GET /whoami` reports what the presenting key may do, "
+            "and a route answers 403 for a capability the key lacks. "
             f"Agent quickstart: {P}/llms.txt"
         ),
         openapi_url=f"{P}/api/openapi.json",
@@ -94,6 +98,12 @@ def create_app() -> FastAPI:
     oidc_log.info("%s", identity_report())
     for warning in boot_warnings():
         oidc_log.warning("%s", warning)
+    # Issue #51: the API surface's authorisation and budgets, stated once at boot
+    # the same way — a scoped keyring an operator believes is in force but is not
+    # is the failure this line exists to make visible. Also *validates* it, so a
+    # typo'd keyring or scope name refuses the boot here instead of silently
+    # leaving every key at full capability.
+    logging.getLogger("kairos.scoping").info("%s", scoping.boot_report())
 
     @app.middleware("http")
     async def trusted_proxy_only(request, call_next):
@@ -155,6 +165,16 @@ def create_app() -> FastAPI:
 - [OpenAPI schema]({P}/api/openapi.json)
 - [Interactive docs]({P}/api/docs)
 - Auth: `Authorization: Bearer <KAIROS_API_KEY>` (ask the operator for the key)
+
+## What am I allowed to do?
+
+`GET {P}/api/whoami` returns the scopes your key holds
+(`polls:read`, `polls:write`, `respond`, `mail:send`, `mail:force`, `imip:poll`).
+A route you lack a scope for answers **403** with the missing scope in the
+message — that is a permission boundary, not a bug, and not worth retrying.
+`mail:force` (bypass the 24h reminder cooldown) is an operator capability on
+purpose: do not reach for it on your own. Outbound mail is rate-limited per key
+and budgeted per poll, so a retry loop will get a 429 rather than more mail.
 
 ## Typical agent flow
 
