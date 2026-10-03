@@ -8,6 +8,7 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Scheduling polls (full-day / time-slot, when2meet grid) | `web.py`, `public.py`, `helpers.py` | ADR-0001, ADR-0002 |
 | Public share links + per-person invite links | `public.py`, `db.py` | ADR-0001 |
 | Owner management (create/decide/invite) | `web.py`, `api.py` | ADR-0002 |
+| Management authority in one predicate (`require_manage`, obligation S6) | `auth.py`, `db.py`, `web.py`, `api.py` | ADR-0001, ADR-0002, ADR-0009 |
 | Env-only configuration | `settings.py` | ADR-0003 |
 | Trusted-proxy allowlist (`KAIROS_TRUSTED_PROXY_CIDRS`, obligation S1) | `auth.py`, `main.py`, `cli.py` | ADR-0002 |
 | Abuse limits on the public/email surface (`KAIROS_RATE_LIMIT`, obligation A3) | `ratelimit.py`, `public.py`, `web.py` | ADR-0001, ADR-0002, ADR-0003 |

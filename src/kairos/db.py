@@ -147,6 +147,26 @@ def _ensure_column(cursor, table: str, column: str, ddl: str, backfill: str | No
             cursor.execute(backfill)
 
 
+def _ensure_index(cursor, table: str, index: str, ddl: str):
+    """Idempotent index creation for pre-existing deployments.
+
+    An existence check rather than a bare `CREATE UNIQUE INDEX IF NOT EXISTS`:
+    that spelling is SQLite/MariaDB-only (MySQL 8 has no IF NOT EXISTS for
+    CREATE INDEX), and this layer claims the whole MySQL family. Probed on
+    MariaDB 11.8 and SQLite: both take the DDL below, both refuse a duplicate
+    non-NULL value, and both allow unlimited NULLs -- which is what makes a
+    UNIQUE index safe to add to a table whose existing rows are all NULL.
+    """
+    if IS_SQLITE:
+        cursor.execute(f"PRAGMA index_list({table})")  # noqa: S608
+        exists = index in {row[1] for row in cursor.fetchall()}
+    else:
+        cursor.execute(f"SHOW INDEX FROM {table} WHERE Key_name = '{index}'")  # noqa: S608
+        exists = cursor.fetchone() is not None
+    if not exists:
+        cursor.execute(ddl)  # noqa: S608
+
+
 def init_schema():
     conn = get_connection()
     cursor = conn.cursor()
@@ -167,6 +187,37 @@ def init_schema():
     # iMIP SEQUENCE per slot UID (issue #23): bumped on edit/cancel so clients
     # accept updates and tombstone the right event.
     _ensure_column(cursor, "sched_poll_slots", "ical_sequence", "ical_sequence INT DEFAULT 0")
+    # Accountless management (issue #29; ADR-0009, obligation S6) -- the columns
+    # #30's /manage/<token> route and #31's send-gate will read. Four nullable,
+    # additive columns, so a deployment that never sets them behaves exactly as
+    # before: a NULL admin_token means "no management capability was ever minted
+    # for this poll", and require_manage() (auth.py) treats NULL as matching
+    # nothing.
+    #
+    # Deliberately NOT backfilled. docs/design/multitenancy-hosting.md sketched
+    # `admin_token = new_token()` for existing rows; a token minted at migration
+    # time is mailed to nobody and read by nobody, so it would grant exactly zero
+    # authority while permanently marking the row as capability-managed. NULL is
+    # the honest state: those polls stay header-owned, exactly as before.
+    _ensure_column(cursor, "sched_polls", "admin_token", "admin_token VARCHAR(64) NULL")
+    # Same width as creator_id on purpose: in header mode owner_id carries that
+    # same uid, so a different width would change which uids are storable.
+    _ensure_column(cursor, "sched_polls", "owner_id", "owner_id VARCHAR(36) NULL")
+    _ensure_column(cursor, "sched_polls", "creator_email", "creator_email VARCHAR(255) NULL")
+    # DEFAULT NULL spelled out rather than a bare TIMESTAMP NULL: on a server
+    # with explicit_defaults_for_timestamp=OFF (MariaDB < 11, MySQL 5.7) a
+    # TIMESTAMP column added without an explicit default silently inherits
+    # DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP. Every pre-existing
+    # row would then read as "creator verified" -- exactly the fail-open state
+    # obligation A2 exists to prevent. Probed on MariaDB 11.8: the column comes
+    # back Default=NULL, Extra empty, and existing rows read NULL.
+    _ensure_column(cursor, "sched_polls", "manage_verified_at",
+                   "manage_verified_at TIMESTAMP NULL DEFAULT NULL")
+    # UNIQUE, because a management capability denotes exactly one poll: two rows
+    # sharing a value would let each holder manage both, silently. NULLs are
+    # exempt from UNIQUE on both dialects, so pre-existing rows are unaffected.
+    _ensure_index(cursor, "sched_polls", "idx_sched_polls_admin_token",
+                  "CREATE UNIQUE INDEX idx_sched_polls_admin_token ON sched_polls (admin_token)")
     conn.commit()
     cursor.close()
     conn.close()
@@ -196,14 +247,32 @@ def bump_slot_sequence(slot_id: str) -> int:
 
 # -- Polls --
 
-def create_poll(creator_id: str, title: str, description: str | None, mode: str, timezone: str, slots: list[dict]) -> dict:
+def create_poll(creator_id: str, title: str, description: str | None, mode: str, timezone: str, slots: list[dict],
+                owner_id: str | None = None, creator_email: str | None = None) -> dict:
+    """Create a poll, minting the management capability that authorises it.
+
+    `owner_id` and `creator_email` are the accountless-tenancy fields (#29); both
+    default to NULL, so a caller that knows nothing about them writes the row it
+    always wrote. `owner_id` is the authenticated owner (the header uid in ETH,
+    an account id once accounts exist); `creator_email` is where a management
+    link was sent, which only the hosted accountless flow does (#30).
+
+    Every new poll gets an `admin_token`, in every auth mode, so authorization
+    never has to ask which mode produced a row. In header mode nobody is ever
+    shown the token, so it grants nothing -- see init_schema() for why
+    pre-existing rows keep NULL instead of one.
+    """
     poll_id = new_id()
     public_token = new_token()
+    admin_token = new_token()  # same entropy as every other capability (ADR-0001)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO sched_polls (id, creator_id, title, description, mode, timezone, public_token) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (poll_id, creator_id, title, description, mode, timezone, public_token),
+        "INSERT INTO sched_polls (id, creator_id, title, description, mode, timezone, public_token,"
+        " admin_token, owner_id, creator_email)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (poll_id, creator_id, title, description, mode, timezone, public_token,
+         admin_token, owner_id, creator_email),
     )
     slot_rows = []
     for s in slots:
@@ -218,7 +287,8 @@ def create_poll(creator_id: str, title: str, description: str | None, mode: str,
     conn.close()
     return {"id": poll_id, "creator_id": creator_id, "title": title, "description": description,
             "mode": mode, "timezone": timezone, "public_token": public_token, "status": "open",
-            "decided_slot_id": None, "slots": slot_rows}
+            "decided_slot_id": None, "admin_token": admin_token, "owner_id": owner_id,
+            "creator_email": creator_email, "manage_verified_at": None, "slots": slot_rows}
 
 
 def get_poll(poll_id: str) -> dict | None:

@@ -25,7 +25,7 @@ Status: **MET** · **PARTIAL** · **PLANNED** (issue).
 | S3 | Capability tokens are unguessable (`token_urlsafe(32)`) and never logged | ADR-0001 | RUNTIME + no-secret-in-logs | MET (entropy); PARTIAL (log audit) |
 | S4 | No secrets committed to git | — | GATE (gitleaks, pre-commit + CI full-history) | MET |
 | S5 | TLS everywhere; no plaintext transport | — | CHECKLIST + CONFIG | CHECKLIST |
-| S6 | Every mutating route authorizes via one predicate (`require_manage`) | ADR-0001, #29 | RUNTIME | PLANNED (#29) |
+| S6 | Every mutating route authorizes via one predicate (`require_manage`) | ADR-0001, #29 | RUNTIME | **PARTIAL** (#29) — one predicate (`auth.require_manage`, and `can_manage` where a route renders its own refusal) now decides management authority for the owner surface: an authenticated identity equal to the poll's `creator_id` **or** `owner_id`, else possession of the poll's `admin_token`, compared with `hmac.compare_digest` and failing closed on a NULL token. Every mutating owner route calls it — CI asserts each one does, plus a test that the pre-#29 inline `creator_id != user` comparison has not crept back. Header mode resolves on the creator rule, so ETH/self-host behaviour is byte-for-byte unchanged with the new columns NULL. **Not MET**: the REST surface authorizes via `require_api_key`, which is also a single predicate but reaches every poll by contract; per-poll scoping there belongs to #51. |
 | S7 | No PII/secrets splatted into logs/traces | guardrails trace spine | GATE (no-raw-trace-fields, if traced) + review | N/A (no tracing yet) |
 
 ## 2. Tenant isolation

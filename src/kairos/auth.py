@@ -9,6 +9,10 @@ Modes (KAIROS_AUTH):
   none    no owner auth — the web management UI is disabled, API + public
           response pages only
 
+Poll *management* authority is a separate question from who the caller is, and
+lives in `require_manage` below (obligation S6, issue #29): an authenticated
+owner, or possession of the poll's `admin_token` capability.
+
 Respondent identity (signed per-poll cookies, invite tokens) is independent
 of this and always available. Replace get_user at runtime for custom
 integrations (e.g. a session-cookie portal): `kairos.auth.get_user = mine`.
@@ -126,6 +130,82 @@ def require_auth(request: Request) -> dict:
     if not user:
         raise HTTPException(401, "Not authenticated")
     return user
+
+
+# -- Poll management authority (obligation S6, issue #29) -------------------
+#
+# One predicate, so authorization stops being re-decided per route. Two
+# independent ways to be a poll's manager (ADR-0001, ADR-0002, ADR-0009):
+#
+#   1. an authenticated identity equal to the poll's `creator_id` (the rule that
+#      has always existed) or its `owner_id` (an account id, or the header uid,
+#      on polls created since #29);
+#   2. possession of the poll's `admin_token`, which the caller presents.
+#
+# In `KAIROS_AUTH=header` (ETH, every self-hoster) rule 1 fires exactly as it
+# always did and rule 2 is never reachable in practice -- no such route exists
+# and no token is ever shown to anyone -- so those deployments are unchanged.
+
+
+def _token_manages(poll: dict, token: str | None) -> bool:
+    """Does `token` equal this poll's management capability? Fails closed."""
+    expected = poll.get("admin_token")
+    if not expected or not token:
+        return False
+    # Compared as bytes, not str: hmac.compare_digest raises TypeError on a
+    # non-ASCII str, and the token arrives from a URL, so an odd byte there
+    # would otherwise be a 500 instead of a 403.
+    return hmac.compare_digest(token.encode(), expected.encode())
+
+
+def can_manage(poll: dict, request: Request, *, token: str | None = None,
+               user: dict | None = None) -> bool:
+    """Does the caller of `request` hold management authority over `poll`?
+
+    `token` is the management capability the caller presented, if any. It is
+    passed explicitly rather than read out of the request on purpose:
+    `public.py` has routes whose path parameter is *also* called `token` and
+    holds a `public_token`, so a route that forgot to pass one would otherwise
+    hand this predicate a value it never meant to.
+
+    `user` is the caller's already-resolved identity; omit it and it is resolved
+    from `request` here. A route that has authenticated should pass the user it
+    holds, so `auth.get_user` -- a documented runtime seam (`kairos.auth.get_user
+    = mine`) whose replacement need not be cheap or idempotent -- runs at most
+    once per request. Omitting it is what an anonymous capability route (#30's
+    `/manage/<token>`) wants.
+
+    The poll is read with `.get()` throughout, so a row that predates these
+    columns -- or a stubbed dict in a test -- authorizes exactly as it always
+    did.
+
+    Deliberately *not* here: CSRF (request integrity, the route's business) and
+    the `manage_verified_at` send-gate (obligation A2, #31 -- a property of the
+    poll, not of who is asking). Keeping them out is what lets #31 add that gate
+    without re-deciding who may manage a poll.
+    """
+    user = user if user is not None else get_user(request)
+    if user and user.get("uid") in (poll.get("creator_id"), poll.get("owner_id")):
+        return True
+    return _token_manages(poll, token)
+
+
+def require_manage(poll: dict, request: Request, *, token: str | None = None,
+                   user: dict | None = None) -> dict:
+    """`poll` if the caller may manage it, else 403. Returns the poll so a
+    route can write `poll = require_manage(poll, request, user=user)`.
+
+    403 for an anonymous caller and for a wrong-but-authenticated one alike:
+    "you are not the owner" is the only thing either is entitled to learn. A
+    route that wants a different shape (an HTML error page, a login redirect)
+    asks `can_manage` first -- see web.edit_poll_page.
+
+    A missing poll is not handled here: that is a 404 and stays the route's
+    business, so "forbidden" and "gone" never share one code path.
+    """
+    if not can_manage(poll, request, token=token, user=user):
+        raise HTTPException(403, "Not the poll owner")
+    return poll
 
 
 def get_base_url(request: Request) -> str:
