@@ -303,6 +303,16 @@ PROTECTED = {
     ("POST", "/scheduler/polls/{poll_id}/email-decision"): "send",
 }
 
+# #30, the accountless console. The two `/manage/<token>` routes are token pages
+# like `/p/<token>` and are charged `read`; the re-link request opens an SMTP
+# connection per matching poll, so it draws `send` — the budget every
+# SMTP-opening route already shares.
+PROTECTED.update({
+    ("GET", "/scheduler/manage/{token}"): "read",
+    ("POST", "/scheduler/manage/{token}"): "read",
+    ("POST", "/scheduler/manage/link"): "send",
+})
+
 # The OIDC login endpoints (#53): unauthenticated, and each one makes an outbound
 # call to a third party per request — `/oidc/callback` a token exchange, plus a
 # JWKS fetch whenever the key cache misses. That is the cheapest possible
@@ -352,6 +362,21 @@ UNLIMITED = {
     ("POST", "/scheduler/polls/{poll_id}/participants/remove"): "deletes rows the caller owns",
     ("POST", "/scheduler/notifications/read-all"): "the caller's own notifications",
     ("GET", "/scheduler/polls/{poll_id}/event.ics"): "owner download of a poll's own .ics",
+
+    # #30. `/manage` renders the console for a signed capability cookie and for
+    # nobody else — an absent, forged or spent cookie gets the "request a new
+    # link" page, which posts to the limited `/manage/link`. The action route
+    # additionally requires that cookie *and* a CSRF token bound to the poll id,
+    # and rewrites only rows of the one poll the capability names.
+    #
+    # `invite` and `send` ARE charged on that route — in the handler, because the
+    # rule follows the action (`invite` grows the participants table, `send` opens
+    # SMTP per recipient, `edit` costs nothing) and a route-level dependency cannot
+    # see the action in the path. So this entry says "not limited *by the
+    # dependency*", and `test_the_console_charges_the_budgets_the_owner_ui_charges`
+    # in tests/test_capability.py is what holds the budgets.
+    ("GET", "/scheduler/manage"): "capability cookie; reads one poll's rows",
+    ("POST", "/scheduler/manage/{poll_id}/{action}"): "capability cookie + CSRF; one poll's rows",
 
     # #53. `/login` renders a sign-in page and starts no flow; the redirect to the
     # IdP is `/oidc/start`, which is limited. `/oidc/logout` needs a valid session

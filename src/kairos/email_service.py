@@ -523,6 +523,73 @@ def send_invite_email(to_email: str, poll_title: str, invite_url: str,
         return False
 
 
+def build_manage_message(to_email: str, poll_title: str, manage_url: str) -> MIMEMultipart:
+    """The magic link that authenticates a poll's manager (#30).
+
+    No `sender_name` and no `reply_to`: an accountless creator has neither — they
+    are an address on a form, not an identity — so the From line is the service
+    account alone rather than a fabricated human. That is also why the poll title
+    is the subject's only content besides the link itself: the recipient is being
+    told that a link addressed to *them* is a credential, and everything else in
+    the message has to make that unmissable.
+    """
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Your manage link: {poll_title}"
+    msg["To"] = to_email
+    msg["From"] = formataddr((settings.BRAND, SMTP_FROM))
+
+    text = f"""{settings.BRAND} — here is the link that lets you manage this scheduling poll:
+
+{manage_url}
+
+What it is
+----------
+This link is the credential. There is no account and no password behind it:
+whoever holds it can manage "{poll_title}" -- add dates, invite people, decide
+the date, delete the poll.
+
+It works once. Opening it exchanges it for a private session in your browser,
+and the link itself stops working. That is deliberate: a link that stayed valid
+forever would still be sitting in your mailbox, your browser history and any
+forwarded copy of this message.
+
+Keep this page. To manage the poll again later, open
+{settings.BRAND}, create a poll, or use the "email me a new link" box on the
+manage page with this address.
+
+If you did not create this poll, ignore this message and delete it -- nobody's
+poll is reachable from it without this link, and the only address it was sent to
+is yours."""
+
+    html = env.get_template("email/manage.html").render(
+        poll_title=poll_title, manage_url=manage_url, brand=settings.BRAND)
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText(text, "plain"))
+    alt.attach(MIMEText(html, "html"))
+    msg.attach(alt)
+    return msg
+
+
+def send_manage_email(to_email: str, poll_title: str, manage_url: str) -> bool:
+    """Mail one poll's manage link. False if not configured / the send failed.
+
+    The one outbound message whose failure is not cosmetic: in
+    `KAIROS_AUTH=capability` the link IS the credential, so a False here means the
+    poll exists and nobody can reach it. Callers treat it as such rather than as
+    a missing flash message.
+    """
+    if not is_configured():
+        return False
+    msg = build_manage_message(to_email, poll_title, manage_url)
+    try:
+        with _smtp_session() as server:
+            server.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
 def build_update_message(to_email: str, poll_title: str, url: str, sender_name: str,
                          reply_to: str | None = None, n_dates: int = 0) -> MIMEMultipart:
     msg = MIMEMultipart("alternative")

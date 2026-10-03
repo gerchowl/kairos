@@ -151,3 +151,107 @@ Still to come, unchanged from the plan above: #30's magic-link mail and
 `/manage/<token>` route, #31's Turnstile verification and the `manage_verified_at`
 send-gate. The column exists and is guaranteed NULL on every existing poll, so
 that gate is closed by default the day #31 ships.
+
+## Step 2 shipped (#30) — `KAIROS_AUTH=capability` + `/manage/<admin_token>`
+
+The accountless creation + management flow, with no account and no proxy. What is
+settled here, so #31 (Turnstile + the send-gate) and #32 (accounts + dashboard)
+build on it rather than re-derive it:
+
+0. **A review found one 500 and one dead guard; both are fixed and pinned.**
+   `_fail`, the accountless refusal renderer in `web.create_poll_submit`, was
+   declared `(heading, detail)` and called with one argument — so *every* invalid
+   submission on the shared creation path (empty title, unknown timezone, no dates,
+   time-slot without times) raised a TypeError in **all five modes**, including
+   ETH. Capability mode's own refusals come from a different function, which is
+   exactly why the new suite missed it. And `rotate_admin_token` was written
+   `WHERE admin_token IS NOT NULL`, which cannot detect that the caller's token
+   lost a race: the loser was told it had rotated and would have minted a session
+   around a capability that had already been replaced. It is now a
+   compare-and-swap (`WHERE admin_token = <the token presented>`), so two
+   exchanges of one link produce one winner and one refusal — asserted directly on
+   the data-layer function, on SQLite and on MariaDB.
+1. **The emailed link is consumed, and the cookie is the credential from then on.**
+   `GET /manage/<token>` only renders a confirmation — a GET that consumed the
+   capability would be defeated by link prefetching (Outlook Safe Links,
+   Proofpoint, every corporate URL scanner), which spends the creator's only
+   credential before they click. `POST /manage/<token>` is the exchange: it
+   authorizes with `require_manage(poll, request, token=…)` (no identity — the
+   anonymous shape #29 documented), stamps `manage_verified_at` on first open,
+   **rotates** `admin_token`, and 302s to `{P}/manage`, which carries no token.
+2. **Lifetimes, stated rather than invented.** The link has **no clock** — it does
+   not expire, exactly like `public_token` and invite tokens, which never have. It
+   expires by *use*, and that is the only expiry on it; how long that is worth is
+   a product decision (#33), not a default TTL to smuggle in. The session cookie
+   is signed, `HttpOnly`, `SameSite=Lax`, scoped to `{P}/manage`, and bounded at
+   `KAIROS_CAPABILITY_SESSION_HOURS` (default 12h — #53's owner-session lifetime
+   for #53's reason: a working day, and a scheduling poll is a short-lived
+   artefact). It carries the capability itself, so rotation retires older cookies
+   instead of leaving parallel credentials nobody remembers to revoke.
+3. **`creator_id` stays `NOT NULL`, and accountless polls get a per-poll
+   unguessable placeholder** (`anon:` + 14 CSPRNG bytes = 33 chars, fits
+   `VARCHAR(36)`). A migration was the alternative and was rejected: SQLite cannot
+   alter a column's nullability at all, so it needs the twelve-step table rebuild
+   inside `init_schema()` — on every boot, on the live poll table, with five child
+   tables pointing at it and `PRAGMA foreign_keys = ON` per connection, where
+   dropping the parent cascades to every response, slot, invite, contact-log and
+   notification row. A data migration that can delete the poll is not worth paying
+   for a field whose only remaining job is "was there an account?". MySQL 5.7
+   makes it a blocking table copy. Three properties the placeholder must have, each
+   closing a way a sentinel could leak: **unguessable** (a constant sentinel is a
+   fail-open in `can_manage`'s `uid == creator_id` the moment anyone can present
+   it), **unique per poll** (a shared one makes `list_polls(creator_id)` return
+   every accountless poll in the deployment — the cross-tenant over-fetch ADR-0009
+   exists to prevent), and **unmistakably not an identity**. `owner_id` remains the
+   NULL accountless marker, which is where #29 said it lived.
+   Verified on MariaDB 11.8 as well as SQLite: the column is still `NOT NULL`, the
+   unique index holds, and all four new queries behave.
+4. **The console is its own small surface; `auth.get_user` is untouched.** It
+   returns `None` in this mode — there is no account, and giving it one would have
+   to mean `uid == creator_id`, which would make the placeholder creator
+   load-bearing for authorization. Every action goes through one route
+   (`POST /manage/{poll_id}/{action>`) and one `require_manage` call, and the
+   shared engines are reused rather than copied (`web.nudge_participants`,
+   `web.decided_slot_of`, `web.expand_new_dates`, `charge_poll_recipients`), so
+   the per-participant cooldown and the per-poll send budget hold across surfaces
+   (ADR-0012's parity invariant) instead of being re-implemented here.
+5. **Rotation needs a way back, so `POST /manage/link` exists.** It re-mails the
+   current capability to an address that already created a poll here. The response
+   is byte-identical whether or not anything matched (not an address oracle), it
+   never says how many it sent, it is capped at 10 links per request, and it draws
+   the `send` budget — the one every SMTP-opening route already shares.
+6. **Outbound mail is a precondition, not a feature.** In this mode the link *is*
+   the credential, so `is_configured()` is consulted before a poll is created and
+   creation is **refused** (503, with the operator-facing reason) when mail cannot
+   send. A row whose management link exists in no inbox and cannot be retrieved is
+   the exact failure this flow exists to prevent. Every boot says so.
+7. **No new rate-limit rule and no new dependency — but the existing budgets are
+   charged *in the right unit*.** The token routes take `read`; the re-link request
+   takes `send`, charged **per recipient it mails**, because one post can open up to
+   10 SMTP connections and charging the request would make the operator's `send`
+   limit ten times weaker on exactly that route; and `invite` / `send` are charged
+   inside the action handlers, because one route carries several rules (a
+   route-level dependency cannot see the action in the path) and ADR-0012's parity
+   invariant is about the *limits*, not just the per-poll budget.
+   `KAIROS_RATE_LIMIT` and its `KAIROS_RATE_LIMIT_<RULE>` vocabulary are unchanged,
+   and an unconfigured deployment still has no limits at all (ADR-0001/0002) — which
+   is why boot now says, out loud, that an unconfigured capability deployment lets
+   anyone who can reach the app have mail sent from its domain. That warning, plus
+   one for a missing `SESSION_SECRET` (the credential cookie is signed with it, and
+   without it every manage page is a 500 with a healthy-looking boot log) and one
+   for a missing `KAIROS_PUBLIC_URL` (a manage link's origin must not come from
+   request headers), is the whole operational contract of this mode.
+8. **`KAIROS_AUTH` is now validated at boot.** A typo like `capabilty` resolves
+   nobody in `get_user`, so every owner page 401s and the deployment looks like one
+   where everybody is logged out — a control the operator believes is in force and
+   is not. An unrecognised value refuses to boot, naming the variable and the
+   known modes, like `_parse_networks`, `_parse_rate_limit`, `parse_keyring` and
+   `_validate_config` already do. Every mode that existed before is still accepted.
+
+Deliberately **not** in this step: the `manage_verified_at` **send-gate** (#31),
+Turnstile (#31), accounts / dashboard / claim (#32 — which is also where a
+creator's several accountless polls stop being one-session-at-a-time), a
+`manage_url` field on `POST /api/polls` (two lines in `api.py`, deferred while
+#63/#64 are in it; `POST /manage/link` already reaches an API-created poll by its
+`creator_email`), any expiry on the link, and the token-lifetime product question.
+

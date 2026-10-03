@@ -993,10 +993,39 @@ def test_a_valid_session_cookie_resolves_to_an_owner(monkeypatch):
     assert user["source"] == "oidc"
 
 
+def _flip_at(token: str, at: int) -> str:
+    """`token` with the character at index `at` changed to a different one.
+
+    Interior positions only, and that is the whole point of these two helpers.
+    Flipping the *last* character of a base64url segment does not reliably tamper
+    with anything: the segment's length need not be a multiple of 4, so its final
+    character carries unused bits, and changing one of those decodes to the
+    identical bytes. itsdangerous signs with a 20-byte digest -- a 27-character
+    base64url signature holding 160 bits -- so its last character is always "A" and
+    flipping it to "B" changes only a spare bit: measured over 4000 tokens, that
+    "tampered" cookie verified 4000 times out of 4000. The test passed only when
+    something *else* happened to reject the token first, which is why it read as an
+    intermittent failure rather than as a test that asserts nothing. A test that
+    does not tamper is worse than no test, because it looks like coverage.
+    """
+    return token[:at] + ("A" if token[at] != "A" else "B") + token[at + 1:]
+
+
+def _flip_in_the_payload(token: str) -> str:
+    """A character flipped in the signed *payload* -- the claims themselves."""
+    return _flip_at(token, 5)
+
+
+def _flip_in_the_signature(token: str) -> str:
+    """A character flipped inside the signature, away from its spare bits."""
+    return _flip_at(token, -22)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda token: token[:-1] + ("A" if token[-1] != "A" else "B"),
+        _flip_in_the_payload,
+        _flip_in_the_signature,
         lambda token: token + "x",
         lambda token: token[:-4],
     ],

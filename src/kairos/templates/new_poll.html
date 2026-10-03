@@ -14,6 +14,18 @@
   <legend class="fieldset-legend">Description (optional)</legend>
   <textarea name="description" id="field-description" class="textarea w-full"></textarea>
 </fieldset>
+{#- #30: in capability mode there is no account behind this poll, so the address
+     below is the only thing that can receive the manage link. Rendered from the
+     auth mode rather than from a context key, because this template is shared
+     with every other mode and header/demo/oidc must be byte-for-byte unchanged. -#}
+{% if CAPABILITY %}
+{{ text_field('creator_email', 'Your email address', type='email', required=True) }}
+{% if mail_ok %}
+<p class="text-sm opacity-70">Your poll's management link is mailed here — it is the credential, it works once, and it is the only way back into a poll with no account.</p>
+{% else %}
+<p class="text-sm text-error">Outbound mail is not available on this deployment ({{ mail_note }}), so no manage link can be delivered and creating a poll is refused. Ask the operator to fix SMTP.</p>
+{% endif %}
+{% endif %}
 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <fieldset class="fieldset">
   <legend class="fieldset-legend">Mode</legend>
