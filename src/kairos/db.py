@@ -156,6 +156,20 @@ def _ensure_index(cursor, table: str, index: str, ddl: str):
     MariaDB 11.8 and SQLite: both take the DDL below, both refuse a duplicate
     non-NULL value, and both allow unlimited NULLs -- which is what makes a
     UNIQUE index safe to add to a table whose existing rows are all NULL.
+
+    Re-runnable: drop the index, run init_schema() again, and it comes back --
+    which is the whole reason this is a helper and not a raw statement in the
+    schema list.
+
+    Cost for an operator with a large table: building a unique index reads and
+    sorts the whole column, so on MySQL 5.7 at 2M rows the bare CREATE UNIQUE
+    INDEX measured 7.8s of blocking DDL, while the same statement with
+    `ALGORITHM=INPLACE, LOCK=NONE` completed with concurrent DML. That is not
+    what this function emits, because the syntax is dialect-specific and the
+    only caller is a 4-column migration on the smallest table in the schema
+    (~21k polls is the documented ceiling for a whole deployment) -- but an
+    operator with a table far past that should add the clause by hand first,
+    rather than discover it as downtime.
     """
     if IS_SQLITE:
         cursor.execute(f"PRAGMA index_list({table})")  # noqa: S608
@@ -204,13 +218,24 @@ def init_schema():
     # same uid, so a different width would change which uids are storable.
     _ensure_column(cursor, "sched_polls", "owner_id", "owner_id VARCHAR(36) NULL")
     _ensure_column(cursor, "sched_polls", "creator_email", "creator_email VARCHAR(255) NULL")
-    # DEFAULT NULL spelled out rather than a bare TIMESTAMP NULL: on a server
-    # with explicit_defaults_for_timestamp=OFF (MariaDB < 11, MySQL 5.7) a
-    # TIMESTAMP column added without an explicit default silently inherits
-    # DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP. Every pre-existing
-    # row would then read as "creator verified" -- exactly the fail-open state
-    # obligation A2 exists to prevent. Probed on MariaDB 11.8: the column comes
-    # back Default=NULL, Extra empty, and existing rows read NULL.
+    # The NULL is the load-bearing part, so it is measured rather than assumed.
+    # On MySQL 5.7 (explicit_defaults_for_timestamp=OFF is its default) the bare
+    # spelling is a trap whose form depends on the table: added to a table with
+    # no other TIMESTAMP column it becomes
+    #     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    # and stamps every existing row -- the fail-open state obligation A2 exists
+    # to prevent, arrived at by a migration that reads as additive; added to
+    # sched_polls, which already has created_at TIMESTAMP, it fails outright with
+    # ERROR 1067 instead. Measured on 5.7.44: TIMESTAMP NULL and TIMESTAMP NULL
+    # DEFAULT NULL both land as `NULL DEFAULT NULL` with existing rows NULL --
+    # identical, so `DEFAULT NULL` is documentation, not protection, and it is
+    # spelled out so nobody "simplifies" the NULL away.
+    #
+    # MariaDB cannot reproduce either outcome: it accepts
+    # explicit_defaults_for_timestamp and ignores it for DDL, so even the bare
+    # spelling lands NULL-able there. Which is exactly why the mariadb:11 CI job
+    # proves nothing about this, and why the reasoning above is written from the
+    # 5.7 measurement rather than from the family most people run.
     _ensure_column(cursor, "sched_polls", "manage_verified_at",
                    "manage_verified_at TIMESTAMP NULL DEFAULT NULL")
     # UNIQUE, because a management capability denotes exactly one poll: two rows
@@ -261,6 +286,11 @@ def create_poll(creator_id: str, title: str, description: str | None, mode: str,
     never has to ask which mode produced a row. In header mode nobody is ever
     shown the token, so it grants nothing -- see init_schema() for why
     pre-existing rows keep NULL instead of one.
+
+    `creator_email` must be a normalized address (`http.valid_email` caps one at
+    RFC 5321's 254 octets, so it always fits the column). Callers taking it from
+    a form must validate, not just check it is present: MySQL strict mode raises
+    on an over-long value, and a 500 is the wrong answer to a long address.
     """
     poll_id = new_id()
     public_token = new_token()

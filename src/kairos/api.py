@@ -128,10 +128,13 @@ _NEVER_SERIALIZED = ("admin_token", "creator_email")
 
 
 def _without_secrets(poll: dict) -> dict:
-    """`poll` with the never-serialized fields removed, in place."""
-    for field in _NEVER_SERIALIZED:
-        poll.pop(field, None)
-    return poll
+    """`poll` without the never-serialized fields -- a copy, not an in-place pop.
+
+    Copying rather than popping is the point: an in-place version whose return
+    value a caller forgets (or discards, as `list_polls_endpoint` once did)
+    leaks the token silently, and the leak would look like a working refactor.
+    """
+    return {k: v for k, v in poll.items() if k not in _NEVER_SERIALIZED}
 
 
 def _get_or_404(poll_id: str) -> dict:
@@ -198,8 +201,8 @@ def list_polls_endpoint(request: Request, user: dict = Depends(require_api_key))
     polls = list_polls()
     for poll in polls:
         poll["share_url"] = _share_url(request, poll)
-        _without_secrets(poll)
-    return polls
+    # Scrubbed on the way out, from the return value -- see _without_secrets.
+    return [_without_secrets(poll) for poll in polls]
 
 
 @router.get("/polls/{poll_id}")

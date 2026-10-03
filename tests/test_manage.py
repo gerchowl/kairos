@@ -252,6 +252,34 @@ def test_a_poll_without_a_token_fails_closed():
         assert can_manage(poll, request_from(), token="anything") is False
 
 
+def test_an_absent_uid_cannot_authorize_through_the_identity_path():
+    """Regression: the identity test used to be `uid in (creator_id, owner_id)`,
+    and `None in (None, None)` is True. `owner_id` IS NULL on every pre-#29 row
+    and on every accountless poll, so a seam returning `{"uid": None}` for "not
+    logged in" -- the natural shape for the session-cookie portal `get_user` is
+    documented to serve -- granted management of every such poll.
+
+    Not reachable through the stock `get_user` (demo returns "demo", header
+    rejects an empty uid, none returns None), which is why it survived review of
+    the first cut: the bug needed the seam, not a request.
+    """
+    legacy = {"creator_id": "alice", "owner_id": None}
+    accountless = {"creator_id": "anon", "owner_id": None}
+    for user in ({"uid": None}, {"uid": ""}, {"uid": False}, {}):
+        for poll in (legacy, accountless, {}):
+            assert can_manage(poll, request_from(), user=user) is False, (poll, user)
+            with pytest.raises(HTTPException) as exc:
+                require_manage(poll, request_from(), user=user)
+            assert exc.value.status_code == 403
+
+    # Not over-corrected: a real uid, and a correct token, still authorize.
+    assert can_manage(legacy, request_from(), user={"uid": "alice"}) is True
+    with_token = dict(accountless, admin_token="s3cret")
+    assert can_manage(with_token, request_from(), user={"uid": None}, token="s3cret") is True
+    with pytest.raises(HTTPException):
+        require_manage(with_token, request_from(), user={"uid": None}, token="wrong")
+
+
 def test_a_capability_is_only_presented_on_request_never_inferred():
     """`public.py` has routes whose `{token}` path parameter is a public_token.
     The predicate must not go looking in the request for one."""
@@ -268,6 +296,19 @@ def test_a_non_ascii_capability_is_refused_rather_than_crashing():
     with pytest.raises(HTTPException) as exc:
         require_manage(poll, request_from(), token="süß")
     assert exc.value.status_code == 403
+
+
+def test_a_capability_of_an_unexpected_type_is_refused_rather_than_crashing():
+    """Neither side of the comparison is type-checked by the caller, and both
+    failure modes are exceptions rather than refusals: a non-ASCII str is a
+    TypeError from compare_digest, a bytes value is an AttributeError from
+    `.encode()`. A row from a hand-rolled `get_poll` seam could be either."""
+    for stored, presented in ((b"bytes-token", "bytes-token"), ("bytes-token", b"bytes-token")):
+        poll = dict(POLL, admin_token=stored)
+        assert can_manage(poll, request_from(), token=presented) is False
+        with pytest.raises(HTTPException) as exc:
+            require_manage(poll, request_from(), token=presented)
+        assert exc.value.status_code == 403
 
 
 def test_the_capability_comparison_is_constant_time(monkeypatch):
@@ -408,13 +449,46 @@ def test_the_owner_only_pages_ask_the_predicate_too(owner_routes, monkeypatch, p
 
 
 def test_the_owner_check_is_not_reimplemented_per_route():
-    """S6 is "one predicate", so the pre-#29 inlined comparison must not creep
-    back into a route module."""
+    """A tripwire, not the guard, and deliberately modest about that.
+
+    The real S6 enforcement is
+    `test_every_mutating_owner_route_authorizes_through_the_predicate`, which
+    asserts each route *calls* the predicate and cannot be defeated by rewriting
+    the comparison. This one only catches the exact pre-#29 spelling coming
+    back verbatim; whitespace in the subscript, `.get()` in place of `[]`,
+    swapped operands, a hoisted local or `not in (...,)` all evade it. Kept
+    because a verbatim revert is the likely mistake, not because it is proof.
+
+    public.py is excluded deliberately, not by oversight: its mutating routes
+    (`submit_public_response`, `submit_invite_response`, `deep_link_vote`) are
+    respondent actions authorized by possession of the poll's public or invite
+    token, which *is* the identity -- there is no owner to authorize against.
+    """
     inlined = re.compile(r"""creator_id["']\]\s*[!=]=\s*user""")
     for module in ("web.py", "api.py"):
         assert not inlined.search((SRC / module).read_text()), (
             f"{module} compares creator_id to the user inline again -- call require_manage"
         )
+
+    # ...and the exclusion stays justified: public.py never looks at ownership
+    # at all. It calls get_user, but only to prefill a respondent's own name
+    # (public.py:53) -- its routes are authorized by the poll or invite token in
+    # the path, which is the respondent's identity.
+    public = (SRC / "public.py").read_text()
+    assert "creator_id" not in public and "owner_id" not in public
+
+
+def test_a_validated_creator_email_always_fits_the_column():
+    """`valid_email` caps an address at RFC 5321's 254 octets and
+    creator_email is VARCHAR(255), so MySQL strict mode cannot overflow on a
+    value that passed validation -- the assertion a future column change would
+    break, and the reason create_poll's docstring can tell #30 to validate
+    rather than merely presence-check."""
+    from kairos.http import valid_email
+
+    longest = valid_email("a" * 242 + "@example.org")
+    assert longest is not None and len(longest) == 254
+    assert valid_email("a" * 243 + "@example.org") is None
 
 
 # -- 4. the capability never escapes ---------------------------------------
@@ -453,6 +527,19 @@ def test_the_capability_is_never_serialized_to_an_api_client(live_client, monkey
 
     # ...and it never reaches a log line either.
     assert token not in caplog.text
+
+
+def test_the_scrub_copies_rather_than_pops_in_place():
+    """`_without_secrets` used to pop in place, and `list_polls_endpoint`
+    discarded its return value -- a leak that only a refactor away, and one that
+    would have looked like a working change. Both call sites now use the return
+    value; this pins the copy."""
+    from kairos import api
+
+    poll = {"id": "p1", "title": "T", "admin_token": "s3cret", "creator_email": "a@b.ch"}
+    scrubbed = api._without_secrets(poll)
+    assert scrubbed == {"id": "p1", "title": "T"}
+    assert poll["admin_token"] == "s3cret", "the source dict must be untouched"
 
 
 def _admin_token_of(poll_id: str) -> str:

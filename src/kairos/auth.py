@@ -152,10 +152,13 @@ def _token_manages(poll: dict, token: str | None) -> bool:
     expected = poll.get("admin_token")
     if not expected or not token:
         return False
-    # Compared as bytes, not str: hmac.compare_digest raises TypeError on a
-    # non-ASCII str, and the token arrives from a URL, so an odd byte there
-    # would otherwise be a 500 instead of a 403.
-    return hmac.compare_digest(token.encode(), expected.encode())
+    # Both sides are str in practice -- a VARCHAR column and a URL path
+    # parameter -- and both are coerced anyway, because neither input is
+    # trustworthy enough to type-check: hmac.compare_digest raises TypeError on
+    # a non-ASCII str (a URL can carry any byte) and AttributeError on bytes (a
+    # hand-rolled `get_poll` seam need not), and a 500 provoked by someone
+    # else's malformed input is a worse answer than a 403.
+    return hmac.compare_digest(str(token).encode(), str(expected).encode())
 
 
 def can_manage(poll: dict, request: Request, *, token: str | None = None,
@@ -185,7 +188,14 @@ def can_manage(poll: dict, request: Request, *, token: str | None = None,
     without re-deciding who may manage a poll.
     """
     user = user if user is not None else get_user(request)
-    if user and user.get("uid") in (poll.get("creator_id"), poll.get("owner_id")):
+    # Truthiness-checked uid, compared with `==` rather than membership in a
+    # tuple: `None in (None, None)` is True, and `owner_id` IS NULL on every
+    # pre-#29 row and on every #30 accountless poll -- so a seam that returns
+    # `{"uid": None}` for "not logged in" (the natural shape for a session
+    # cookie portal, and `get_user` is a documented supported seam) would have
+    # granted management of every such poll. Fail closed on an absent uid.
+    uid = (user or {}).get("uid")
+    if uid and (uid == poll.get("creator_id") or uid == poll.get("owner_id")):
         return True
     return _token_manages(poll, token)
 
