@@ -118,3 +118,36 @@ Every mutating route (`add_slots`, `invite`, `decide`, `delete`, `imip-decision`
 3. Turnstile + `manage_verified_at` send-gate (hosted middleware).
 4. `sched_accounts` + login + dashboard + claim (Pro).
 5. Stripe billing.
+
+## Step 1 shipped (#29) — three decisions the next two steps inherit
+
+The schema and the predicate landed in #29. Three choices below were made there
+and are settled; **#30 and #31 should build on them, not re-derive them.**
+
+1. **`admin_token` is minted on create and never backfilled.** The backfill line
+   above ("existing rows get `admin_token = new_token()`") was *not* implemented:
+   a token minted at migration time is mailed to nobody and read by nobody, so it
+   grants zero authority while permanently marking the row as capability-managed.
+   `NULL` means "no management capability was ever minted" and `require_manage`
+   treats it as matching nothing — so pre-#29 polls stay header-owned, exactly as
+   before. #30: `get_poll_by_admin_token()` (still to be written) resolves only
+   polls minted after #29, which is the correct answer, not a gap.
+2. **The predicate is `require_manage(poll, request, *, token=None, user=None)`.**
+   `token` is passed explicitly and never sniffed out of the request, because
+   `public.py` already has `{token}` path parameters holding *public* tokens.
+   `user` lets a route pass the identity it already resolved, so the documented
+   `auth.get_user` runtime seam runs at most once per request; omit it and the
+   predicate resolves the caller itself, which is what an anonymous capability
+   route wants. #30 gates `/manage/<token>` with
+   `require_manage(poll, request, token=token)` and no identity at all.
+3. **`admin_token` is not in any API response.** `create_poll` returns it in
+   process (it has to, to be able to build a manage link), and `api.py` strips it
+   — plus `creator_email` — from everything it serializes. Otherwise the single
+   bearer API key would become a permanent per-poll credential that survives key
+   rotation. #30, if an agent should be able to manage an accountless poll it
+   created, should return an explicit `manage_url` field rather than the token.
+
+Still to come, unchanged from the plan above: #30's magic-link mail and
+`/manage/<token>` route, #31's Turnstile verification and the `manage_verified_at`
+send-gate. The column exists and is guaranteed NULL on every existing poll, so
+that gate is closed by default the day #31 ships.

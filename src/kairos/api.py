@@ -84,6 +84,9 @@ class PollCreate(BaseModel):
     timezone: str = "Europe/Zurich"
     slots: list[SlotIn]
     creator: str | None = None  # account uid — attributes the poll to a real user
+    # Where a management link may be sent for this poll (#29/#30). Recorded,
+    # not acted on: nothing mails it yet, and the response never carries it.
+    creator_email: str | None = None
 
 class PollUpdate(BaseModel):
     title: str | None = None
@@ -125,6 +128,26 @@ class NudgeIn(BaseModel):
 
 # -- Helpers --
 
+# Fields that must never leave the process in an API response. `admin_token` is a
+# bearer management capability (ADR-0001): whoever holds it manages the poll with
+# no API key, indefinitely, so a response that started carrying it would turn the
+# operator's single bearer key into a permanent per-poll credential — strictly more
+# than the key already is, and durable across key rotation. `creator_email` is the
+# creator's own address, which no response carried before these columns existed.
+# The token stays inside the process until #30 has a manage link to put it in.
+_NEVER_SERIALIZED = ("admin_token", "creator_email")
+
+
+def _without_secrets(poll: dict) -> dict:
+    """`poll` without the never-serialized fields -- a copy, not an in-place pop.
+
+    Copying rather than popping is the point: an in-place version whose return
+    value a caller forgets (or discards, as `list_polls_endpoint` once did)
+    leaks the token silently, and the leak would look like a working refactor.
+    """
+    return {k: v for k, v in poll.items() if k not in _NEVER_SERIALIZED}
+
+
 def _get_or_404(poll_id: str) -> dict:
     poll = get_poll(poll_id)
     if not poll:
@@ -149,7 +172,7 @@ def _poll_detail(request: Request, poll: dict) -> dict:
     poll["invites"] = get_invites(poll["id"])
     poll["convergence"] = convergence(poll, poll["responses"], poll["invites"])
     poll["share_url"] = _share_url(request, poll)
-    return poll
+    return _without_secrets(poll)
 
 
 # -- Endpoints --
@@ -183,10 +206,18 @@ def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depend
             if not s.start_time or not s.end_time:
                 raise HTTPException(400, "time_slot mode requires start_time and end_time for each slot")
     creator_id = body.creator or user["uid"]
+    from kairos.http import valid_email
+
+    creator_email = valid_email(body.creator_email) if body.creator_email else None
+    if body.creator_email and not creator_email:
+        raise HTTPException(400, f"Invalid email address: {body.creator_email}")
     slots = [s.model_dump() for s in body.slots]
-    poll = create_poll(creator_id, body.title, body.description, body.mode, body.timezone, slots)
+    # owner_id == creator_id: the API attributes a poll either to the named user
+    # or to the service identity that made it, and that is its owner (ADR-0009).
+    poll = create_poll(creator_id, body.title, body.description, body.mode, body.timezone,
+                       slots, creator_id, creator_email)
     poll["share_url"] = _share_url(request, poll)
-    return poll
+    return _without_secrets(poll)
 
 
 @router.get("/polls")
@@ -194,7 +225,8 @@ def list_polls_endpoint(request: Request, user: dict = Depends(api_scope("polls:
     polls = list_polls()
     for poll in polls:
         poll["share_url"] = _share_url(request, poll)
-    return polls
+    # Scrubbed on the way out, from the return value -- see _without_secrets.
+    return [_without_secrets(poll) for poll in polls]
 
 
 @router.get("/polls/{poll_id}")
