@@ -32,7 +32,24 @@ KAIROS_IMAP_HOST/PORT/USER/PASSWORD/MAILBOX   inbound iMIP reply polling (P2)
 KAIROS_RATE_LIMIT      abuse limits on the public/email surface: off (default) | on
 KAIROS_RATE_LIMIT_<RULE>   per-rule override, "<count>/<window>", e.g. "20/minute"
                    (window = second|minute|hour|day; count 0 disables that one
-                   rule). Rules: READ RESPOND DEEPLINK_VOTE CREATE INVITE SEND.
+                   rule). Rules: READ RESPOND DEEPLINK_VOTE CREATE INVITE SEND
+                   (public/web, charged to the transport peer) plus API
+                   API_WRITE MAIL MAIL_FORCE (the /api surface, charged to the
+                   bearer key — see kairos/scoping.py). One switch, two
+                   families; both are off unless this is on.
+KAIROS_API_KEYS   least-privilege API keys, ';'-separated, each either
+                   "<key>:<scope>[,<scope>...]" or "<key>@<tier>", e.g.
+                   "k1:polls:read,respond;k2:mail:send". Scopes: polls:read
+                   polls:write respond mail:send mail:force imip:poll. A bare key
+                   is refused (that would silently mean full power). Unset = no
+                   scoped keys, and the single KAIROS_API_KEY keeps every
+                   capability, unchanged (ADR-0001).
+KAIROS_MAIL_MAX_RECIPIENTS  recipients one request may name, on every send path
+                   (issue #51). 0 disables the cap. Default 100.
+KAIROS_MAIL_PER_POLL  send budget for ONE poll as "<count>/<window>", counted in
+                   recipients across every send path and charged to the poll, so
+                   it holds regardless of which key asks. 0 disables. Default
+                   "2000/day".
 """
 
 import ipaddress
@@ -75,6 +92,15 @@ PUBLIC_URL = os.environ.get(
 )  # SSoT base for share links; empty -> derive from request headers
 API_KEY = os.environ.get("KAIROS_API_KEY") or os.environ.get("SCHEDULER_API_KEY", "")
 
+# Issue #51: least-privilege keys for the API/MCP surface, as
+# "<key>:<scope>[,<scope>]", "<key>@<tier>". Exported raw and parsed by
+# kairos.scoping, which owns the grammar — including the refusal to boot on a
+# malformed entry, which cannot live here without importing the scope vocabulary
+# (and an import cycle back through kairos.ratelimit). Empty = no scoped keys,
+# which is the state every existing deployment is in: KAIROS_API_KEY alone still
+# works and still reaches everything.
+API_KEYS = os.environ.get("KAIROS_API_KEYS", "")
+
 # Obligation S1 (issue #47): in header mode the owner identity comes from
 # request headers, so whoever can reach the port can assert any identity —
 # unless we know the request actually came through our proxy. Empty tuple =
@@ -106,8 +132,7 @@ TRUSTED_PROXY_NETWORKS = _parse_networks(TRUSTED_PROXY_CIDRS, "KAIROS_TRUSTED_PR
 HOSTED_RAW = os.environ.get("KAIROS_HOSTED", "").strip()
 HOSTED_TRUE = ("1", "on", "true", "yes")
 HOSTED = HOSTED_RAW.lower() in HOSTED_TRUE
-HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + (
-    "0", "off", "false", "no", "")
+HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + ("0", "off", "false", "no", "")
 # Normalised, not validated: a typo must fail as a loud refusal naming this knob, not as
 # an import error that would also break self-host, where the variable is unused. See
 # kairos.email_service.sender_refusal().
@@ -179,6 +204,27 @@ DEFAULT_RATE_LIMITS = {
     "create": (10, 60),  # POST /new
     "invite": (30, 60),  # POST /polls/<id>/invite — grows the recipient list
     "send": (10, 3600),  # remind / remind-selected / email-decision — actual SMTP
+    # The /api surface, issue #51. Same switch, same override syntax, same
+    # limiter and the same `RateLimited` signal as the six above; the only
+    # difference is what the budget is charged to — a bearer key rather than a
+    # transport peer, because an API caller presents something it cannot vary and
+    # a peer-keyed budget is evaded by source rotation. Sized, in order:
+    #   `api` is the floor under every authenticated call. An agent that walks a
+    #   poll through the API spends tens of requests, so 600/min is a runaway-loop
+    #   ceiling rather than a workflow budget.
+    #   `api_write` covers the mutating routes. A full-week slot sweep is ONE
+    #   add_dates call, not one per slot, so this is orders of magnitude above any
+    #   real workflow.
+    #   `mail` is the tight one, per ADR-0012's parity rule it must NOT be tighter
+    #   than the human path: the web UI's `send` above is 10/hour per address, and
+    #   an agent key is a single identity behind one NAT often enough that the
+    #   budget has to be the larger of the two or the agent path is second-class.
+    #   `mail_force` is the cooldown bypass, deliberately the tightest thing here:
+    #   5/hour is "a human pressing the button a few times", not "an agent looping".
+    "api": (600, 60),
+    "api_write": (60, 60),
+    "mail": (20, 3600),
+    "mail_force": (5, 3600),
 }
 
 _WINDOW_SECONDS = {
@@ -230,6 +276,46 @@ def _parse_rate_limits(env: dict) -> dict:
 
 
 RATE_LIMITS = _parse_rate_limits(os.environ)
+
+
+def _parse_count(raw: str, var: str) -> int:
+    """A non-negative integer knob. 0 means "no limit", never "no value"."""
+    try:
+        count = int(raw.strip())
+    except ValueError:
+        raise RuntimeError(f"{var}: {raw!r} is not an integer count") from None
+    if count < 0:
+        raise RuntimeError(f"{var}: {raw!r} must be 0 (no limit) or a positive count")
+    return count
+
+
+# Blast-radius ceilings on outbound mail (issue #51). ON by default, unlike the
+# rate limits above, and deliberately so:
+#
+#   * a rate limit is keyed on an identity and punishes a shared one — a whole
+#     office behind one NAT, or the ETH/duplet deployment's single egress — so
+#     #37's are opt-in and stay that way;
+#   * this is a ceiling on how much mail a *request* may name and how much one
+#     *poll* may send. Neither is keyed on an address, neither punishes anybody
+#     legitimate at the shipped values, and both are finite — which is the whole
+#     difference between "a mail cannon" and "an API".
+#
+# The per-request cap is on the recipient LIST the caller supplies, so refusing
+# costs the caller nothing they cannot get back by splitting the call. Fan-out
+# routes (nudge, email-decision) take their recipients from the poll, where a
+# big list is a real meeting rather than an attack, so they are bounded by the
+# per-poll budget below instead — a 429 they can retry tomorrow, not a 400 that
+# makes a 500-person meeting undecidable.
+MAIL_MAX_RECIPIENTS = _parse_count(
+    os.environ.get("KAIROS_MAIL_MAX_RECIPIENTS", "100"), "KAIROS_MAIL_MAX_RECIPIENTS"
+)
+
+# Recipients one poll may mail per window, across every send path (API and web
+# UI), charged to the poll so it holds regardless of which key asks. 2000/day is
+# 500 participants x the ~4 messages a legitimate poll sends each (invite,
+# reminder, new-dates notice, decision), so a large meeting fits in one window
+# and a mail cannon does not. Raise it for bigger meetings; 0 disables.
+MAIL_PER_POLL = _parse_rate_limit(os.environ.get("KAIROS_MAIL_PER_POLL", "2000/day"), "KAIROS_MAIL_PER_POLL")
 
 
 def session_secret() -> str:
