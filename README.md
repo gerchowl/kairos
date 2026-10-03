@@ -352,3 +352,44 @@ per-key rate limits OFF -> the TOTAL across polls is UNBOUNDED: each poll gets i
 own allowance, so N fresh polls get N of them. Set KAIROS_RATE_LIMIT=on before
 exposing this deployment.
 ```
+
+### Poll reach: which polls a caller may read
+
+<!-- #63/#64 reach. Self-contained section: appended at the end of the #51 scoping
+     block, so it rebases cleanly. -->
+
+A scope says what a key may *do*; **reach** says which *polls* it may do it to.
+Until now a scope was the only answer, so `polls:read` meant every poll on the
+instance and `GET /api/polls` enumerated it — while the web UI, three routes away,
+let only the owner manage a poll. Same rows, two rules, the weaker one on the
+machine-facing surface.
+
+`KAIROS_POLL_REACH` chooses the rule, on **both** surfaces:
+
+| `KAIROS_POLL_REACH` | web UI (`/polls/{id}`, `event.ics`) | API (`/api/polls…`) |
+|---|---|---|
+| unset / `open` (**default**) | any signed-in user | any authenticated key, every poll |
+| `scoped` | the poll's owner — **or** anyone invited to it or already answered on it | only the polls the key's `~` claim names |
+
+Unset means `scoped` when `KAIROS_HOSTED=on` (a deployment *we* operate is the
+multi-tenant case, where `open` is an IDOR) and `open` otherwise, so a self-hoster
+and the ETH group deployment keep the behaviour they have today. An
+unrecognised value refuses the boot.
+
+Under `scoped`, a key says which polls it reaches:
+
+```bash
+KAIROS_API_KEYS="k1:polls:read,respond~*;k2:mail:send~<poll-uuid>"
+```
+
+`~*` is the explicit instance-wide grant (also what `KAIROS_API_KEY` holds, so
+scoping a deployment never costs it the instance); `~<poll-id>+<poll-id>` names
+some; **omitting the clause reaches no poll** — default deny. `GET /api/polls`
+returns what the caller reaches (an empty list, not a 403, for a key granted
+nothing), and `GET /api/whoami` reports the reach next to the scopes.
+
+Flat owner-gating was the alternative, and it would have broken the group
+deployment: in header mode the authenticating proxy *is* the tenant boundary, so
+`scoped` admits everyone named on the poll rather than only its creator. Full
+reasoning, and the cases this does not cover yet, in
+`docs/design/poll-reach.md`.

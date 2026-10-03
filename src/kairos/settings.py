@@ -50,6 +50,16 @@ KAIROS_MAIL_PER_POLL  send budget for ONE poll as "<count>/<window>", counted in
                    recipients across every send path and charged to the poll, so
                    it holds regardless of which key asks. 0 disables. Default
                    "2000/day".
+KAIROS_POLL_REACH  who may read which poll, on BOTH surfaces (issue #63/#64):
+                   open (default) | scoped. "open" is the rule that has always
+                   existed — any authenticated caller reads any poll, which is
+                   what the ETH group deployment needs (ADR-0002). "scoped" is
+                   per-poll reach: the owner, and on the web surface anyone
+                   named on the poll; on the API surface only what the key's
+                   "~<poll-id>" grant names. Unset = "scoped" when
+                   KAIROS_HOSTED is on (a deployment WE operate is the
+                   multi-tenant case, where the open rule is an IDOR) and
+                   "open" otherwise. Parsed and enforced by kairos/reach.py.
 """
 
 import ipaddress
@@ -103,6 +113,14 @@ API_KEY = os.environ.get("KAIROS_API_KEY") or os.environ.get("SCHEDULER_API_KEY"
 # which is the state every existing deployment is in: KAIROS_API_KEY alone still
 # works and still reaches everything.
 API_KEYS = os.environ.get("KAIROS_API_KEYS", "")
+
+# Issues #63/#64: the reach policy — which polls a caller may read, on the web UI
+# and the API alike. Raw here, resolved and enforced in kairos.reach, which owns
+# the vocabulary and the default ("open" unless KAIROS_HOSTED says this is a
+# deployment we operate). Empty = unset = kairos.reach decides; it is read at
+# call time like every other knob here, so an operator can change it without a
+# code change and a test can set it with monkeypatch.setenv.
+POLL_REACH = os.environ.get("KAIROS_POLL_REACH", "")
 
 # Obligation S1 (issue #47): in header mode the owner identity comes from
 # request headers, so whoever can reach the port can assert any identity —

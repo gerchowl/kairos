@@ -51,6 +51,7 @@ from kairos.helpers import (
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
 from kairos.ratelimit import rate_limit
+from kairos.reach import can_reach, require_reach
 from kairos.scoping import charge_poll_recipients
 from kairos.templating import render
 
@@ -313,15 +314,35 @@ def view_poll(poll_id: str, request: Request):
     if not poll:
         return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
 
+    # The rows this page renders anyway, read up front so the reach check below can
+    # be handed them instead of fetching them a second time: refusing a stranger
+    # then costs this route no statement more than serving the owner does, which is
+    # the same discipline the dashboard's query budget records
+    # (tests/test_dashboard_queries.py).
+    responses = get_responses(poll_id)
+    slots = poll["slots"]
+    invites = get_invites(poll_id)
+
+    # Reach (issue #64). Until this, any authenticated user could open any poll by
+    # id and see every respondent's name and per-slot availability -- a real IDOR in
+    # the hosted accountless product, and inconsistent with the mutating routes
+    # beside it, which have always required the owner. Under the default (`open`)
+    # policy the answer is unchanged; under `scoped` it is the owner or an identity
+    # named on the poll, which is what lets the ETH group deployment share a poll
+    # without making it public (kairos.reach). Placed before the notifications are
+    # marked read, which is the only side effect on this path: a refused caller must
+    # not leave a trace.
+    if not can_reach(poll, request, user=user, participants=(responses, invites)):
+        return _error_page(user, "Not allowed",
+                           "Only the poll owner or a participant can view this poll.",
+                           f"{P}/", status_code=403)
+
     # Mark poll notifications as read
     notifs = get_notifications(user["uid"], unread_only=True)
     for n in notifs:
         if n["poll_id"] == poll_id:
             mark_notification_read(n["id"])
 
-    responses = get_responses(poll_id)
-    slots = poll["slots"]
-    invites = get_invites(poll_id)
     total, pending_n = expected_counts(invites, responses)
     share_url = f"{get_base_url(request)}{P}/p/{poll['public_token']}"
 
@@ -646,7 +667,10 @@ def poll_ics(poll_id: str, request: Request):
     poll = get_poll(poll_id)
     if not poll:
         raise HTTPException(404)
-    return ics_response(poll, request)
+    # Same reach rule as the poll page above (issue #64): the decided time and the
+    # title are the owner's to publish, and this route is easy to forget because it
+    # looks like a harmless read. `require_reach` refuses before the ICS is built.
+    return ics_response(require_reach(poll, request, user=user), request)
 
 
 @router.post("/polls/{poll_id}/email-decision")
