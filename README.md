@@ -238,6 +238,11 @@ KAIROS_API_KEYS="k1:polls:read,respond;k2:mail:send;k3:mail:force"
 * `KAIROS_API_KEY` keeps working alongside the keyring, and **scoping wins** if a
   key appears in both.
 
+A scope is a **capability, not a tenant**: it says what a key may *do*, not which
+polls it may see. Any key holding `polls:read` sees every poll, because
+`GET /api/polls` is not scoped per poll — one deployment, one set of polls, which
+is the single-team model this API has always had. Per-poll isolation is #29.
+
 | Scope | Routes it unlocks |
 |---|---|
 | `polls:read` | `GET` poll, responses, invites, contacts, `event.ics` |
@@ -264,21 +269,51 @@ click for a person, and the 24h cooldown still applies to everyone else.
 
 ### Mail budgets
 
-| Knob | Default | What it bounds |
-|---|---|---|
-| `KAIROS_MAIL_MAX_RECIPIENTS` | `100` | recipients one *request* may name (`invite`, `nudge(emails=…)`, the UI's `remind-selected`). `0` disables |
-| `KAIROS_MAIL_PER_POLL` | `2000/day` | recipients one *poll* may mail, counted across **every** send path — API and web UI alike — and charged to the poll, so it holds whatever key asks |
+| Knob | Default | What it bounds | On exceeding it |
+|---|---|---|---|
+| `KAIROS_MAIL_MAX_RECIPIENTS` | `100` | the recipient list a single **request** supplies — in practice `invite`, the only route whose list comes from the caller rather than from the poll | **400**, naming the knob. The caller still holds every address, so batching costs it nothing |
+| `KAIROS_MAIL_PER_POLL` | `2000/day` | recipients one **poll** may mail, counted across every send path — API and web UI alike — and charged to the poll, so it holds whatever key asks | **429** with `Retry-After` |
 
 The two failure modes are deliberately different. A caller-supplied list is
-refused with a **400** and loses nothing: it still holds the addresses and can
-send them in batches. A fan-out over a poll's participants is *budgeted* instead,
+refused outright; a fan-out over a poll's own participants is only *budgeted*,
 because a poll with more participants than the ceiling is a real meeting rather
-than an attack, and it gets a **429** it can retry tomorrow.
+than an attack — and because the surfaces that reach it (the API's `nudge`, the
+UI's `remind-selected`) have no way to batch, so a 400 there would be a dead end.
 
-Unlike the rate limits above, these two ship **on**. They are ceilings on blast
-radius rather than budgets keyed on an identity, so they do not punish a shared
-NAT address, and at the shipped numbers they are inert for any real workflow —
-`2000/day` is 500 participants × the ~4 messages a poll sends each (invite,
-reminder, new-dates notice, decision). Raise them for a bigger meeting; the
-per-poll budget is also the only one of the four that a rotated or stolen key
-cannot escape.
+Everything else that fans out — `nudge`, `email-decision`, `imip-decision`,
+`remind`, `remind-selected` — is bounded by the per-poll budget, whatever
+surface asks and however the calls are split. That budget is the only one of these
+controls a rotated or stolen key cannot escape.
+
+Unlike the rate limits, these two ship **on**: they are keyed on nothing, so
+nobody legitimate is punished, and at the shipped numbers they are inert for a
+real workflow (`2000/day` is 500 participants × the ~4 messages a poll sends
+each). Raise them for a bigger meeting; `0` disables either one.
+
+### What these do *not* bound — read this before exposing an instance
+
+**With the shipped defaults, the total number of third-party recipients one key
+can reach is unbounded.** Both mail budgets are *per request* and *per poll*, so a
+key that mails the per-request ceiling to a **fresh poll** each time is refused
+nothing: 40 new polls × 100 recipients is 4 000 recipients mailed and not one
+429. Each poll gets its own allowance; there is no ceiling on the number of polls.
+
+This is deliberate, and it is not an oversight:
+
+* It is **not a regression.** Before this change there was no per-request cap and
+  no per-poll budget either, so the aggregate was unbounded then too.
+* ADR-0001/0002 require a deployment with nothing configured to behave exactly as
+  it did, and the ETH/duplet adapter sets no rate-limit variable. A rate limit
+  that fires by default is a behaviour change for it.
+
+What closes the aggregate is `KAIROS_RATE_LIMIT=on`, which enables the per-key
+`api` / `api_write` / `mail` / `mail_force` budgets above — charged to the key
+rather than to the poll, so N polls do not mean N allowances. **Set it, plus
+`KAIROS_TRUSTED_PROXY_CIDRS`, before exposing a hosted instance.** Kairos logs
+which of the two states it is in at every boot, so you do not have to remember:
+
+```
+per-key rate limits OFF -> the TOTAL across polls is UNBOUNDED: each poll gets its
+own allowance, so N fresh polls get N of them. Set KAIROS_RATE_LIMIT=on before
+exposing this deployment.
+```

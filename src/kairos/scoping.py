@@ -246,12 +246,19 @@ def parse_keyring(raw: str) -> tuple[KeyEntry, ...]:
 def keyring() -> tuple[KeyEntry, ...]:
     """The configured keyring, read at call time.
 
+    The `settings.X or os.environ[...]` fallback is `_legacy_key`'s, deliberately:
+    both credential paths must be readable the same way, or a deployment that sets
+    the variable in its environment after import — or a test using
+    `monkeypatch.setenv` — sees one key accepted and the other refused.
+
     Not cached: `require_api_key` has always read its key from the environment on
     every request, and a memo keyed on a string of secrets would keep them alive
     in a module global for the life of the process. The parse is a split over a
     short string on a surface that is measured in requests per minute.
     """
-    return parse_keyring(settings.API_KEYS)
+    import os
+
+    return parse_keyring(settings.API_KEYS or os.environ.get("KAIROS_API_KEYS", ""))
 
 
 # -- Tiers: the seam #33 fills ---------------------------------------------
@@ -408,6 +415,11 @@ def _principal(entry: KeyEntry) -> Principal:
 def enforce(principal: dict, scope: str) -> None:
     """403 unless `principal` holds `scope`.
 
+    Two call shapes. `api_scope` calls it for the route's own declared capability;
+    a route calls it directly for one it needs only *sometimes* — `add_slots` and
+    `nudge` both reach `mail:send` through a scope that is nominally something
+    else, and a dependency cannot see the request body.
+
     The status is 403, not 404 and never 500: the caller is authenticated and
     the route exists, it is simply not theirs to use. Naming the missing scope
     in the message is what makes a scoped key debuggable by an agent — the whole
@@ -466,16 +478,6 @@ class api_scope:
             enforce(principal, self.scope)
         request.state.api_principal = principal
         return principal
-
-
-def require_capability(principal: dict, scope: str) -> None:
-    """Imperative form, for a capability a route needs only sometimes.
-
-    Two routes reach `mail:send` through a scope that is nominally something
-    else — `add_slots(notify=True)` and `nudge(force=True)` both mail. A
-    dependency cannot see the body, so those call this once the body is parsed.
-    """
-    enforce(principal, scope)
 
 
 # -- Budgets ----------------------------------------------------------------
@@ -610,13 +612,25 @@ def boot_report() -> str:
             )
     scopes = sorted({s for e in entries for s in (e.scopes or frozenset())})
     legacy = "KAIROS_API_KEY (full scope)" if _legacy_key() else "unset"
+    if settings.RATE_LIMIT_ENABLED:
+        aggregate = "per-key rate limits on -> the TOTAL across polls is bounded"
+    else:
+        # Said out loud at boot, because the alternative is an operator reading the
+        # two mail budgets below as "the mail cannon is capped". It is not: each
+        # poll gets its own allowance, so N fresh polls get N allowances. The
+        # aggregate is bounded only by the per-key rate limits, which are #37's
+        # opt-in switch — off by default so an unconfigured deployment behaves
+        # exactly as it did (ADR-0001/0002), which means off is also unbounded.
+        aggregate = (
+            "per-key rate limits OFF -> the TOTAL across polls is UNBOUNDED: each "
+            "poll gets its own allowance, so N fresh polls get N of them. Set "
+            "KAIROS_RATE_LIMIT=on before exposing this deployment."
+        )
     return (
         f"API surface: {legacy}; "
         f"{len(entries)} scoped key(s) in KAIROS_API_KEYS"
         + (f" granting {', '.join(scopes)}" if scopes else "")
-        + f"; rate limits {'on' if settings.RATE_LIMIT_ENABLED else 'off'}"
-        f" (api {', '.join(API_RATE_RULES)})"
-        f"; mail ceiling {settings.MAIL_MAX_RECIPIENTS or 'off'}/request,"
-        f" poll budget {settings.MAIL_PER_POLL[0] or 'off'}/"
-        f"{settings.MAIL_PER_POLL[1]}s"
+        + f"; mail ceiling {settings.MAIL_MAX_RECIPIENTS or 'off'} recipients/request,"
+        f" {settings.MAIL_PER_POLL[0] or 'off'} recipients/poll per"
+        f" {settings.MAIL_PER_POLL[1]}s; {aggregate}"
     )

@@ -51,7 +51,7 @@ from kairos.helpers import (
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
 from kairos.ratelimit import rate_limit
-from kairos.scoping import charge_poll_recipients, check_recipient_list
+from kairos.scoping import charge_poll_recipients
 from kairos.templating import render
 
 P = settings.PREFIX
@@ -605,9 +605,6 @@ def remind_selected(poll_id: str, request: Request, form=Depends(form_data),
     emails = {e.strip().lower() for e in form.getlist("emails") if e.strip()}
     if not emails:
         return RedirectResponse(f"{P}/polls/{poll_id}?msg=nonudge", status_code=302)
-    # The UI's counterpart to the API's per-request fan-out cap (issue #51): picking
-    # 500 people in the table must not outrun naming 500 in a request.
-    check_recipient_list(len(emails), what="selected addresses")
     counts = nudge_participants(request, poll, user, only_emails=emails, force=True)
     if not (counts["invited"] or counts["updated"]):
         return RedirectResponse(f"{P}/polls/{poll_id}?msg={_mail_failure_msg()}",

@@ -354,6 +354,24 @@ def test_an_unknown_key_is_401_when_only_the_keyring_is_configured(monkeypatch, 
     assert "not configured" not in r.text
 
 
+def test_a_scoped_key_readable_from_the_environment_is_accepted(monkeypatch, client):
+    """Both credential paths must be readable the same way.
+
+    `require_api_key` has always read `KAIROS_API_KEY` from the environment on every
+    request, because a settings-level constant taken at import misses a value set
+    afterwards. `KAIROS_API_KEYS` now reads its environment fallback too — a
+    deployment that exported it after import (or a test using
+    `monkeypatch.setenv`) would otherwise find one credential accepted and the other
+    silently refused.
+    """
+    monkeypatch.delenv("KAIROS_API_KEY", raising=False)
+    monkeypatch.setattr(settings, "API_KEY", "")
+    monkeypatch.setattr(settings, "API_KEYS", "")
+    monkeypatch.setenv("KAIROS_API_KEYS", f"{READER}:polls:read")
+    body = client.get(f"{API}/whoami", headers={"Authorization": f"Bearer {READER}"}).json()
+    assert body["scopes"] == ["polls:read"]
+
+
 def test_a_key_present_in_both_places_gets_its_scopes(monkeypatch, client):
     """Scoping must win over the legacy grant, or adding a scoped entry for a key
     that is also `KAIROS_API_KEY` would silently do nothing."""
@@ -415,27 +433,93 @@ EXPECTED_SCOPES = {
 }
 
 
-def _api_routes():
-    for route in _walk(main.app):
-        if "/api/" in getattr(route, "path", "") and hasattr(route, "dependant"):
+def _api_routes(app=None):
+    """Every endpoint mounted under `<prefix>/api`.
+
+    Anchored on **both** sides of the prefix — `<prefix>/api` itself, or
+    `<prefix>/api/…` — rather than the `"/api/" in path` substring this used to
+    use. The substring form has a blind spot at the bare prefix: a route declared
+    as `router.get("")` lands on `<prefix>/api`, contains no trailing slash, and so
+    never matched, which is precisely how an unguarded route ships under this audit
+    while being reachable with no `Authorization` header at all. A review of this PR
+    found that hole by adding exactly such a route.
+
+    Both anchors matter: matching the prefix alone would sweep in
+    `<prefix>/apixyz`, and matching only the suffix would miss every real route.
+    """
+    for route in _walk(app or main.app):
+        path = getattr(route, "path", "").rstrip("/")
+        if (path == API or path.startswith(f"{API}/")) and hasattr(route, "dependant"):
             yield route
 
 
-def test_every_api_route_declares_a_scope_and_a_budget_rule():
-    """The guard that pays for itself. A new `/api` route with no declared
-    capability, or with a rule that is not one of the budgets, fails here."""
+def _declared_scopes(app=None):
+    """{(method, api path): required scope} for everything under `/api`.
+
+    Raises on any endpoint that declares no capability and is not `/ping`, so the
+    audit below is an assertion rather than a tally.
+    """
     actual = {}
-    for route in _api_routes():
+    for route in _api_routes(app):
         guards = [d.call for d in route.dependant.dependencies if isinstance(d.call, scoping.api_scope)]
         methods = getattr(route, "methods", set()) - {"HEAD"}
         if not guards:
             # /ping is the only route allowed to be unauthenticated: it is the
             # liveness probe a container or a load balancer calls.
-            assert (route.path, methods) == (f"{API}/ping", {"GET"}), route.path
+            assert (route.path, methods) == (f"{API}/ping", {"GET"}), (
+                f"unauthenticated /api route: {methods} {route.path}"
+            )
         assert len(guards) <= 1, f"{route.path} declares {len(guards)} guards"
         for method in methods:
             actual[(method, route.path[len(API):])] = guards[0].scope if guards else None
-    assert actual == EXPECTED_SCOPES
+    return actual
+
+
+def test_every_api_route_declares_a_scope_and_a_budget_rule():
+    """The guard that pays for itself. A new `/api` route with no declared
+    capability, or with a rule that is not one of the budgets, fails here."""
+    assert _declared_scopes() == EXPECTED_SCOPES
+
+
+def test_the_audit_catches_a_route_at_the_bare_api_prefix():
+    """Regression for the blind spot above, on a synthetic app so the real route
+    table is never mutated.
+
+    Built as a real request as well as a real route: the point is not that the
+    audit notices, it is that such a route is genuinely reachable with no
+    credentials, which is what makes the audit noticing it matter.
+    """
+    from fastapi import APIRouter, FastAPI
+    from starlette.testclient import TestClient as _Client
+
+    rogue = APIRouter(prefix=API)
+
+    @rogue.get("")
+    def backdoor():
+        return {"pwned": True}
+
+    app = FastAPI()
+    app.include_router(rogue)
+
+    assert _Client(app).get(f"{API}").status_code == 200  # no Authorization header
+    with pytest.raises(AssertionError, match="unauthenticated /api route"):
+        _declared_scopes(app)
+
+
+def test_the_audit_filter_is_anchored_so_a_lookalike_prefix_is_not_an_api_route():
+    """/scheduler/apixyz is not under /scheduler/api, and must not be audited as
+    if it were — otherwise the guard grows a second blind spot to fix the first."""
+    from fastapi import APIRouter, FastAPI
+
+    lookalike = APIRouter(prefix=f"{API}xyz")
+
+    @lookalike.get("/thing")
+    def thing():
+        return {}
+
+    app = FastAPI()
+    app.include_router(lookalike)
+    assert list(_api_routes(app)) == []
 
 
 def test_every_api_rule_is_one_the_limiter_knows():
@@ -642,15 +726,32 @@ def test_a_nudge_counts_the_addresses_it_targets_not_the_ones_it_mails(
     assert as_(client, LEGACY).post(f"{API}/polls/p1/nudge", json={}).status_code == 429
 
 
-def test_the_web_ui_gets_the_same_per_request_ceiling(monkeypatch, client):
+def test_the_web_ui_selection_is_budgeted_not_refused(legacy_only, monkeypatch, client, sent):
+    """`remind-selected` has no batching affordance, so a hard 400 is a dead end:
+    the owner selects everyone, clicks once, and the JS toast says only "Sending
+    failed" — discarding the refusal's own advice to send them in batches, in a UI
+    with no way to do that. Its recipients are the poll's own participants, so it
+    is bounded by the poll's send budget like every other fan-out — a 429 it can
+    retry — and not by the per-request recipient ceiling."""
     monkeypatch.setattr(settings, "MAIL_MAX_RECIPIENTS", 2)
+    monkeypatch.setattr(settings, "MAIL_PER_POLL", (10, 3600))
     web_owner(client)
     r = client.post(
         "/scheduler/polls/p1/remind-selected",
-        data={"emails": ["a@x.ch", "b@x.ch", "c@x.ch"]},
+        data={"emails": ["a@x.ch", "b@x.ch"]},
         follow_redirects=False,
     )
-    assert r.status_code == 400
+    assert r.status_code == 302 and "msg=nudged" in r.headers["location"]
+    assert sent == ["a@x.ch", "b@x.ch"], "a selection over the cap is still sent"
+
+    # …and the poll's budget is what does stop it, once spent.
+    monkeypatch.setattr(settings, "MAIL_PER_POLL", (1, 3600))
+    exhausted = client.post(
+        "/scheduler/polls/p1/remind-selected",
+        data={"emails": ["a@x.ch"]},
+        follow_redirects=False,
+    )
+    assert exhausted.status_code == 429
 
 
 # -- 6. `force` IS NOT A LICENCE TO SPAM ------------------------------------
@@ -734,22 +835,122 @@ def test_the_budget_is_per_key_and_not_global(scoped, limited, client):
     assert as_(client, LEGACY).post(f"{API}/polls/p1/invite", json={"emails": ["a@x.ch"]}).status_code == 200
 
 
+def _charges(rule: str, key: str):
+    """How many units `key` has spent against `rule`, or 0 if it never spent any."""
+    bucket = ratelimit.limiter._buckets.get((rule, f"key:{scoping.key_id(key)}"))
+    return bucket[1] if bucket else 0
+
+
 def test_a_forbidden_call_still_spends_the_budget(scoped, limited, client, sent):
-    """Charged before the scope check, so a 403 is not a free probe of what a key
-    may not do."""
-    for _ in range(2):
-        as_(client, SENDER).post(f"{API}/polls/p1/invite", json={"emails": ["a@x.ch"]})
-    assert as_(client, READER).post(f"{API}/polls/p1/invite", json={"emails": ["a@x.ch"]}).status_code == 403
-    as_(client, READER)
-    assert as_(client, SENDER).post(f"{API}/polls/p1/invite", json={"emails": ["a@x.ch"]}).status_code == 429
+    """Charged *before* the scope check, so a 403 is not a free probe.
+
+    Asserted against the refused key's own counter rather than the caller's
+    eventual 429. An earlier version of this test probed with the reader and then
+    checked the *sender*, which its own two prior charges already explained — so it
+    passed just as happily with the charge moved after `enforce`, and the property
+    it described could have been deleted with the suite green.
+    """
+    assert _charges("mail", READER) == 0
+
+    first = as_(client, READER).post(f"{API}/polls/p1/invite", json={"emails": ["a@x.ch"]})
+    assert first.status_code == 403
+    assert _charges("mail", READER) == 1, "a refused call must still be charged"
+
+    # And the reader can exhaust its own budget purely by being refused, which is
+    # the whole point: a key that keeps asking what it may not do runs out.
+    second = as_(client, READER).post(f"{API}/polls/p1/invite", json={"emails": ["a@x.ch"]})
+    assert second.status_code == 403
+    third = as_(client, READER).post(f"{API}/polls/p1/invite", json={"emails": ["a@x.ch"]})
+    assert third.status_code == 429
+    assert sent == [], "nothing was ever sent"
+
+    # The sender's own budget is untouched by any of it.
+    assert _charges("mail", SENDER) == 0
 
 
-def test_no_budget_applies_while_the_switch_is_off(scoped, client):
+def test_no_rate_budget_applies_while_the_switch_is_off(scoped, client):
     """`KAIROS_RATE_LIMIT` stays #37's switch, off by default, so a self-hoster
-    who never turned it on gets no new refusals from this PR."""
+    who never turned it on gets no new refusals from this PR.
+
+    The two mail budgets are a different thing and are NOT covered by this: they
+    ship on, because they are keyed on nothing rather than on an identity.
+    """
     assert not settings.RATE_LIMIT_ENABLED
     for _ in range(30):
         assert as_(client, SENDER).get(f"{API}/polls/p1").status_code == 200
+
+
+def test_the_aggregate_across_polls_is_unbounded_at_the_shipped_defaults(
+    scoped, monkeypatch, client, sent
+):
+    """**The honest limit of this PR, pinned as a test so the docs cannot drift.**
+
+    Each poll gets its own `MAIL_PER_POLL` allowance, so a key that mails the
+    per-request ceiling to a *fresh* poll each time is refused nothing: at the
+    shipped defaults the total number of third-party recipients one key can
+    reach is unbounded. A review of this PR measured it — 40 fresh polls x 100
+    recipients = 4000 recipients, zero refusals — and that measurement is what
+    this asserts.
+
+    It is not a regression, and it is not what this PR set out to change:
+    ADR-0001/0002 require an unconfigured deployment to behave exactly as it did,
+    and a key-keyed rate limit that fires by default is a behaviour change for the
+    ETH/duplet deployment. So the aggregate stays unbounded by default and
+    `KAIROS_RATE_LIMIT=on` is what closes it — stated in the README, in the boot
+    line, and here, so none of the three can quietly stop being true.
+    """
+    assert not settings.RATE_LIMIT_ENABLED
+    everybody = [f"v{i}@x.ch" for i in range(settings.MAIL_MAX_RECIPIENTS)]
+    monkeypatch.setattr(api, "get_poll", lambda pid: dict(POLL, id=pid))
+    for n in range(4):
+        r = as_(client, SENDER).post(f"{API}/polls/fresh{n}/invite", json={"emails": everybody})
+        assert r.status_code == 200, f"poll {n} was refused"
+    assert len(sent) == 4 * settings.MAIL_MAX_RECIPIENTS
+    assert settings.MAIL_PER_POLL[0] > 0, "the per-poll budget was never consulted"
+
+
+def test_the_per_key_rate_limits_are_what_close_that_aggregate(scoped, monkeypatch, client, sent):
+    """The other half of the pair: turn the switch on and the same run is refused,
+    because `mail` is charged to the key and not to the poll."""
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS", {
+        **dict.fromkeys(settings.DEFAULT_RATE_LIMITS, (0, 60)),
+        "mail": (3, 3600),
+    })
+    everybody = [f"v{i}@x.ch" for i in range(settings.MAIL_MAX_RECIPIENTS)]
+    monkeypatch.setattr(api, "get_poll", lambda pid: dict(POLL, id=pid))
+    codes = [
+        as_(client, SENDER).post(f"{API}/polls/fresh{n}/invite", json={"emails": everybody}).status_code
+        for n in range(5)
+    ]
+    assert codes == [200, 200, 200, 429, 429]
+    assert len(sent) == 3 * settings.MAIL_MAX_RECIPIENTS
+
+
+def test_a_realistic_agent_session_is_nowhere_near_the_shipped_ceilings(scoped, monkeypatch, client):
+    """Why opt-in is defensible rather than merely cautious: with the switch ON, at
+    the shipped numbers, a whole meeting driven through one key — create, invite
+    500 people in batches, nudge, decide, mail the decision — spends a fraction of
+    the hourly budget and is refused nothing.
+
+    The switch is turned on deliberately: with it off nothing is charged at all, so
+    the shipped ceilings would be measuring nothing.
+    """
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    as_(client, SENDER).post(f"{API}/polls", json={
+        "title": "t", "mode": "full_day", "slots": [{"date": "2026-06-08"}]})
+    for _ in range(5):  # 500 invitees, in batches of 100
+        r = as_(client, SENDER).post(f"{API}/polls/p1/invite", json={
+            "emails": [f"p{i}@x.ch" for i in range(settings.MAIL_MAX_RECIPIENTS)]})
+        assert r.status_code == 200
+    for _ in range(5):
+        assert as_(client, SENDER).get(f"{API}/polls/p1").status_code == 200
+
+    # One rule per route, chosen by its declared scope — which is the property that
+    # keeps `mail:send` from ever drawing on the floor budget.
+    assert (_charges("mail", SENDER), _charges("api_write", SENDER), _charges("api", SENDER)) == (5, 1, 5)
+    assert _charges("mail", SENDER) < settings.RATE_LIMITS["mail"][0]
+    assert _charges("api", SENDER) < settings.RATE_LIMITS["api"][0]
 
 
 def test_an_agent_is_not_second_class_to_the_human_path():

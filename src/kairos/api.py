@@ -56,13 +56,7 @@ from kairos.email_service import (
 from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
-from kairos.scoping import (
-    api_scope,
-    charge_force,
-    charge_poll_recipients,
-    check_recipient_list,
-    require_capability,
-)
+from kairos.scoping import api_scope, charge_force, charge_poll_recipients, check_recipient_list, enforce
 from kairos.web import (
     _valid_timezone,
     decided_slot_of,
@@ -313,6 +307,13 @@ def decide_endpoint(poll_id: str, body: DecideIn, request: Request,
 def add_slots_endpoint(poll_id: str, body: SlotsAdd, request: Request,
                        user: dict = Depends(api_scope("polls:write"))):
     poll = _get_or_404(poll_id)
+    # `notify` mails, so it needs mail:send on top of polls:write — otherwise a key
+    # scoped "edit this poll" reaches every inbox through a route whose name promises
+    # none of that. Checked *first*, before any row is written: a refused request
+    # that has already mutated state is worse than no request at all to whoever
+    # reads the audit log afterwards. (kairos.scoping, issue #51)
+    if body.notify:
+        enforce(user, "mail:send")
     for d in body.dates:
         try:
             datetime.strptime(d, "%Y-%m-%d")
@@ -322,10 +323,6 @@ def add_slots_endpoint(poll_id: str, body: SlotsAdd, request: Request,
     added = add_slots(poll_id, slots) if slots else []
     nudged = None
     if body.notify and added:
-        # `notify` mails, so it needs mail:send on top of polls:write — otherwise a
-        # key scoped "edit this poll" reaches every inbox through a route whose name
-        # promises none of that. (kairos.scoping, issue #51)
-        require_capability(user, "mail:send")
         nudged = nudge_participants(request, get_poll(poll_id),
                                     _actor(poll, body.sender_name, body.reply_to))
     return {"added": added, "nudged": nudged}
@@ -360,10 +357,13 @@ def get_responses_endpoint(poll_id: str, user: dict = Depends(api_scope("polls:r
 @router.post("/polls/{poll_id}/invite")
 def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
                     user: dict = Depends(api_scope("mail:send"))):
-    # The one caller-supplied fan-out on this surface, so this is where the hard
-    # per-request ceiling belongs: the schema puts no bound on `emails`, and a
-    # caller who is refused still holds every address and can send them in
-    # batches. Charged before a single row is written, let alone a message sent.
+    # The ONLY route whose recipient list comes straight from the caller, and so
+    # the only one with a hard per-request ceiling: the schema puts no bound on
+    # `emails`, and a caller who is refused still holds every address and can send
+    # them in batches. Every other send path fans out over a poll's own
+    # participants, where a long list is a real meeting rather than an attack, so
+    # those are bounded by the per-poll budget (429, retryable) instead. Charged
+    # before a single row is written, let alone a message sent.
     check_recipient_list(len(body.emails), what="email addresses")
     poll = _get_or_404(poll_id)
     actor = _actor(poll, body.sender_name, body.reply_to)
@@ -416,12 +416,14 @@ def nudge_endpoint(poll_id: str, body: NudgeIn, request: Request,
                    user: dict = Depends(api_scope("mail:send"))):
     """Smart reminders. `force=True` bypasses the 24h cooldown — an operator
     affordance for a human in the UI, so from here it takes its own scope AND its
-    own, much tighter budget (issue #51). `emails=[...]` is a caller-supplied
-    fan-out and gets the same per-request ceiling as `invite`."""
-    if body.emails:
-        check_recipient_list(len(body.emails), what="email addresses")
+    own, much tighter budget (issue #51).
+
+    `emails=[...]` narrows the *audience*; only addresses already on the poll are
+    mailed, so a long list is not a fan-out and gets no per-request ceiling. What
+    bounds it is the poll's own send budget, charged in `nudge_participants` —
+    which is also what bounds the same operation from the web UI."""
     if body.force:
-        require_capability(user, "mail:force")
+        enforce(user, "mail:force")
         charge_force(user)
     poll = _get_or_404(poll_id)
     if poll["status"] != "open":
