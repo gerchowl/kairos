@@ -228,15 +228,33 @@ def get_base_url(request: Request) -> str:
     return f"{proto}://{host}"
 
 
-def require_api_key(request: Request) -> dict:
-    """`Authorization: Bearer <KAIROS_API_KEY>` with constant-time comparison."""
-    expected = settings.API_KEY or os.environ.get("KAIROS_API_KEY", "")
-    if not expected:
-        raise HTTPException(500, "KAIROS_API_KEY not configured")
+def bearer_credential(request: Request) -> str:
+    """The credential from `Authorization: Bearer <key>`, or a 401.
+
+    Split out of `require_api_key` because the scoped API (#51) must read the
+    header before it knows *which* credential to compare it against: its keyring
+    is checked before the legacy single key, not after.
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(401, "Missing or invalid Authorization header")
-    if not hmac.compare_digest(auth[7:], expected):
+    return auth[7:]
+
+
+def require_api_key(request: Request) -> dict:
+    """`Authorization: Bearer <KAIROS_API_KEY>` with constant-time comparison.
+
+    The single unscoped credential — every poll, every capability, no budget.
+    Deliberately unchanged: the ETH/duplet adapter (from `SCHEDULER_API_KEY`) and
+    every self-hoster set `KAIROS_API_KEY` and must keep working exactly as they
+    do (ADR-0001/0002). Least-privilege keys arrive via `KAIROS_API_KEYS`, and
+    `kairos.scoping` delegates back here for any credential not in that ring, so
+    there is one implementation of the legacy check and its 401/500 wording.
+    """
+    expected = settings.API_KEY or os.environ.get("KAIROS_API_KEY", "")
+    if not expected:
+        raise HTTPException(500, "KAIROS_API_KEY not configured")
+    if not hmac.compare_digest(bearer_credential(request), expected):
         raise HTTPException(401, "Invalid API key")
     return {"uid": "api", "email": "", "name": "API", "source": "api_key"}
 
