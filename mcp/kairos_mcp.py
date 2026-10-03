@@ -15,6 +15,14 @@ Env:
     KAIROS_API_KEY  bearer key of the instance
 
 Point an MCP client at it with `uv run mcp/kairos_mcp.py` (stdio).
+
+**Scoped keys (issue #51).** An operator may hand out a key that holds only some
+capabilities (`polls:read`, `polls:write`, `respond`, `mail:send`, `mail:force`,
+`imip:poll`) instead of the single all-power `KAIROS_API_KEY`. Call `whoami` to
+find out what the configured key can do; a tool the key lacks answers 403, which
+comes back here as `{"error": 403, "detail": ...}` naming the missing scope.
+`nudge(force=True)` needs `mail:force` and is rate-limited on purpose — it is an
+operator affordance for a human, not something to retry on a loop.
 """
 
 import os
@@ -40,10 +48,33 @@ def api_url(path: str) -> str:
 def _req(method: str, path: str, **kwargs):
     r = httpx.request(method, api_url(path), headers={"Authorization": f"Bearer {KEY}"}, timeout=30, **kwargs)
     if r.status_code >= 400:
-        return {"error": r.status_code, "detail": r.text[:500]}
+        # Unwrap FastAPI's {"detail": ...} so the agent reads the *reason* rather
+        # than a JSON blob — which is the whole point of the server naming the
+        # missing scope, the offending recipient count, or the Retry-After.
+        detail: object = r.text[:500]
+        try:
+            body = r.json()
+        except ValueError:
+            pass
+        else:
+            if isinstance(body, dict) and "detail" in body:
+                detail = body["detail"]
+        out = {"error": r.status_code, "detail": detail}
+        if (retry := r.headers.get("retry-after")):
+            out["retry_after"] = retry
+        return out
     if r.headers.get("content-type", "").startswith("text/calendar"):
         return r.text
     return r.json()
+
+
+@mcp.tool()
+def whoami() -> dict:
+    """What this key is allowed to do: its scopes (polls:read, polls:write,
+    respond, mail:send, mail:force, imip:poll), a non-reversible id, and the
+    tier it resolves to if the operator named one. Call this first when a tool
+    returns 403 — the refusal names the scope you are missing."""
+    return _req("GET", "/whoami")
 
 
 @mcp.tool()
@@ -103,7 +134,8 @@ def update_poll(
 def add_dates(poll_id: str, dates: list[str], notify: bool = False) -> dict:
     """Add dates (YYYY-MM-DD) to a poll additively — existing responses are
     kept; time_slot polls expand over the poll's time grid. notify=True runs
-    the idempotent reminder engine so participants hear about the new dates."""
+    the idempotent reminder engine so participants hear about the new dates —
+    which is mail, so it needs mail:send on top of polls:write."""
     return _req("POST", f"/polls/{poll_id}/slots", json={"dates": dates, "notify": notify})
 
 
@@ -121,7 +153,9 @@ def respond(poll_id: str, name: str, availabilities: dict[str, str], email: str 
 @mcp.tool()
 def invite(poll_id: str, emails: list[str], required: bool = True) -> dict:
     """Email personal invite links. required=False marks optional invitees —
-    only required ones gate the convergence light."""
+    only required ones gate the convergence light. Needs mail:send, and one call
+    may not name more addresses than the deployment's per-request ceiling:
+    split a long list rather than retrying it."""
     return _req("POST", f"/polls/{poll_id}/invite", json={"emails": emails, "required": required})
 
 
@@ -129,7 +163,10 @@ def invite(poll_id: str, emails: list[str], required: bool = True) -> dict:
 def nudge(poll_id: str, emails: list[str] | None = None, force: bool = False) -> dict:
     """Smart reminders, idempotent and safe to repeat: pending invitees (max
     once/day) and people who haven't seen newly added dates. Restrict with
-    emails=[...]; force=True mails exactly those now (bypasses gating)."""
+    emails=[...]. force=True bypasses that 24h cooldown — it is an operator
+    capability (scope mail:force, separately rate-limited), so leave it False
+    unless a human asked for an immediate reminder; a 403 or 429 here is a
+    boundary, not something to retry."""
     return _req("POST", f"/polls/{poll_id}/nudge", json={"emails": emails, "force": force})
 
 
@@ -143,7 +180,9 @@ def decide(poll_id: str, slot_id: str) -> dict:
 @mcp.tool()
 def email_decision(poll_id: str, note: str = "") -> dict:
     """Mail the decided date to every respondent + invitee with the .ics
-    calendar file attached. Optional note goes into the email body."""
+    calendar file attached. Optional note goes into the email body. Needs
+    mail:send, and the whole poll draws on one send budget — so mail once, not
+    once per attempt."""
     return _req("POST", f"/polls/{poll_id}/email-decision", json={"note": note})
 
 

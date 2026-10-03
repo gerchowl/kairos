@@ -51,6 +51,7 @@ from kairos.helpers import (
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
 from kairos.ratelimit import rate_limit
+from kairos.scoping import charge_poll_recipients, check_recipient_list
 from kairos.templating import render
 
 P = settings.PREFIX
@@ -471,6 +472,27 @@ def edit_poll_submit(poll_id: str, request: Request, form=Depends(form_data)):
 NUDGE_COOLDOWN = timedelta(hours=24)
 
 
+def _nudge_target_count(invites, responses, only_emails) -> int:
+    """How many addresses a nudge *aims at*, whether or not it mails them all.
+
+    The upper bound, deliberately: the send loop then skips anyone already
+    current, and charging only what goes out would make bypassing the cooldown
+    cheaper to abuse than respecting it. An address reachable both as an invitee
+    and as a walk-in counts once, because the loop sends it once.
+    """
+    invite_emails = {i["email"].lower() for i in invites}
+    targets = set()
+    for inv in invites:
+        email = inv["email"].lower()
+        if only_emails is None or email in only_emails:
+            targets.add(email)
+    for resp in responses:
+        email = (resp.get("respondent_email") or "").lower()
+        if email and email not in invite_emails and (only_emails is None or email in only_emails):
+            targets.add(email)
+    return len(targets)
+
+
 def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 — a state machine: per-participant timestamp gating is clearer flat than split
                        only_emails: set[str] | None = None, force: bool = False) -> dict:
     """State-driven, idempotent reminders — safe to trigger repeatedly.
@@ -487,12 +509,20 @@ def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 �
     ("email exactly these people now"): it bypasses cooldown/already-told
     gating, and up-to-date participants get a plain reminder.
     Every send lands in the contact audit log.
+
+    Charged against the poll's send budget (issue #51) before anything goes out,
+    and against the addresses it *targets* rather than the ones it ends up mailing
+    (see `_nudge_target_count`). The charge lives here, once, so the API's
+    `nudge` and `add_slots(notify=True)` and the UI's `remind` / `remind-selected`
+    all draw on one per-poll allowance -- which is how ADR-0012's parity
+    invariant holds: one ceiling, not two kept in step by review.
     """
     base = get_base_url(request)
     sender, reply = user.get("name", "Someone"), user.get("email")
     now = db_now()
     responses = get_responses(poll["id"])
     invites = get_invites(poll["id"])
+    charge_poll_recipients(poll["id"], _nudge_target_count(invites, responses, only_emails))
     slot_times = [s["created_at"] for s in poll["slots"] if s.get("created_at")]
     latest_slot_at = max(slot_times, default=None)
     by_invite = {r["invite_id"]: r for r in responses if r.get("invite_id")}
@@ -575,6 +605,9 @@ def remind_selected(poll_id: str, request: Request, form=Depends(form_data),
     emails = {e.strip().lower() for e in form.getlist("emails") if e.strip()}
     if not emails:
         return RedirectResponse(f"{P}/polls/{poll_id}?msg=nonudge", status_code=302)
+    # The UI's counterpart to the API's per-request fan-out cap (issue #51): picking
+    # 500 people in the table must not outrun naming 500 in a request.
+    check_recipient_list(len(emails), what="selected addresses")
     counts = nudge_participants(request, poll, user, only_emails=emails, force=True)
     if not (counts["invited"] or counts["updated"]):
         return RedirectResponse(f"{P}/polls/{poll_id}?msg={_mail_failure_msg()}",
@@ -618,8 +651,12 @@ def email_decision(poll_id: str, request: Request, form=Depends(form_data),
         raise HTTPException(400, "Poll has no decided date yet")
 
     poll_url = f"{get_base_url(request)}{P}/p/{poll['public_token']}"
+    # The same per-poll send budget the API's email-decision charges (issue #51):
+    # one allowance for one poll, whichever surface asks for it.
+    recipients = recipient_emails(poll_id)
+    charge_poll_recipients(poll_id, len(recipients))
     sent = send_decision_email(
-        recipient_emails(poll_id),
+        recipients,
         poll["title"],
         format_slot(slot, poll["mode"]),
         poll_url,

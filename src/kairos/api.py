@@ -1,9 +1,19 @@
 """Kairos REST API — full parity with the web UI, agent-friendly.
 
-Auth: `Authorization: Bearer <SCHEDULER_API_KEY>` over HTTPS. The key is a
+Auth: `Authorization: Bearer <KAIROS_API_KEY>` over HTTPS. The key is a
 service identity with access to ALL polls (single-team tool); pass `creator`
 on poll creation to attribute a poll to a real account so it appears on that
 user's dashboard and they can manage it in the web UI.
+
+**Scopes** (issue #51). Every route below declares the capability it needs, as
+`api_scope("...")`, and a key without it gets 403 -- so a read-only key cannot
+reach a mail-sending route by construction rather than by review. The single
+`KAIROS_API_KEY` still holds every capability (the paragraph above is still
+exactly true of it); least-privilege keys come from `KAIROS_API_KEYS`, and
+`GET .../whoami` reports what the presenting key may do. Outbound mail is
+additionally bounded three ways: a recipient-list cap per request, a per-poll
+send budget shared with the web UI, and per-key rate limits under
+`KAIROS_RATE_LIMIT=on`.
 
 Outbound mail triggered via the API is sent as the service address with the
 poll creator's name/Reply-To by default; override per call with
@@ -16,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from kairos import settings
-from kairos.auth import get_base_url, require_api_key
+from kairos.auth import get_base_url
 from kairos.db import (
     add_response,
     add_slots,
@@ -46,6 +56,13 @@ from kairos.email_service import (
 from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
+from kairos.scoping import (
+    api_scope,
+    charge_force,
+    charge_poll_recipients,
+    check_recipient_list,
+    require_capability,
+)
 from kairos.web import (
     _valid_timezone,
     decided_slot_of,
@@ -148,8 +165,21 @@ def api_ping():
     return {"pong": True, "app": "scheduler"}
 
 
+@router.get("/whoami")
+def whoami(user: dict = Depends(api_scope())):
+    """What this key may do — the discoverability half of least privilege.
+
+    An agent holding a scoped key that meets four 403s it was never told about
+    cannot plan, so the capabilities are readable over the API rather than only
+    documented in an operator's env file. Reports the key's digest, never the
+    key, and only what this key holds — not the whole vocabulary.
+    """
+    return {"scopes": sorted(user["scopes"]), "key_id": user["key_id"],
+            "tier": user.get("tier")}
+
+
 @router.post("/polls")
-def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depends(require_api_key)):
+def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depends(api_scope("polls:write"))):
     if body.mode not in ("full_day", "time_slot"):
         raise HTTPException(400, "mode must be 'full_day' or 'time_slot'")
     if not _valid_timezone(body.timezone):
@@ -166,7 +196,7 @@ def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depend
 
 
 @router.get("/polls")
-def list_polls_endpoint(request: Request, user: dict = Depends(require_api_key)):
+def list_polls_endpoint(request: Request, user: dict = Depends(api_scope("polls:read"))):
     polls = list_polls()
     for poll in polls:
         poll["share_url"] = _share_url(request, poll)
@@ -174,13 +204,13 @@ def list_polls_endpoint(request: Request, user: dict = Depends(require_api_key))
 
 
 @router.get("/polls/{poll_id}")
-def get_poll_endpoint(poll_id: str, request: Request, user: dict = Depends(require_api_key)):
+def get_poll_endpoint(poll_id: str, request: Request, user: dict = Depends(api_scope("polls:read"))):
     return _poll_detail(request, _get_or_404(poll_id))
 
 
 @router.patch("/polls/{poll_id}")
 def update_poll_endpoint(poll_id: str, body: PollUpdate, request: Request,
-                         user: dict = Depends(require_api_key)):
+                         user: dict = Depends(api_scope("polls:write"))):
     _get_or_404(poll_id)
     updates = body.model_dump(exclude_none=True)
     if not updates:
@@ -203,7 +233,7 @@ class InvitePatch(BaseModel):
 
 @router.patch("/polls/{poll_id}/invites/{invite_id}")
 def patch_invite_endpoint(poll_id: str, invite_id: str, body: InvitePatch,
-                          user: dict = Depends(require_api_key)):
+                          user: dict = Depends(api_scope("polls:write"))):
     """Edit an invitee's name/email/required flag."""
     _get_or_404(poll_id)
     from kairos.db import update_invite
@@ -217,7 +247,7 @@ def patch_invite_endpoint(poll_id: str, invite_id: str, body: InvitePatch,
 
 
 @router.delete("/polls/{poll_id}/invites/{invite_id}")
-def delete_invite_endpoint(poll_id: str, invite_id: str, user: dict = Depends(require_api_key)):
+def delete_invite_endpoint(poll_id: str, invite_id: str, user: dict = Depends(api_scope("polls:write"))):
     """Remove an invitee (and their linked response, if any)."""
     _get_or_404(poll_id)
     from kairos.db import delete_invite, delete_response, get_responses
@@ -237,7 +267,7 @@ class ResponsePatch(BaseModel):
 
 @router.patch("/polls/{poll_id}/responses/{response_id}")
 def patch_response_endpoint(poll_id: str, response_id: str, body: ResponsePatch,
-                            user: dict = Depends(require_api_key)):
+                            user: dict = Depends(api_scope("polls:write"))):
     """Edit a respondent's name/email or toggle required (via-link people
     count as required for convergence unless marked optional)."""
     _get_or_404(poll_id)
@@ -253,7 +283,7 @@ def patch_response_endpoint(poll_id: str, response_id: str, body: ResponsePatch,
 
 
 @router.delete("/polls/{poll_id}/responses/{response_id}")
-def delete_response_endpoint(poll_id: str, response_id: str, user: dict = Depends(require_api_key)):
+def delete_response_endpoint(poll_id: str, response_id: str, user: dict = Depends(api_scope("polls:write"))):
     """Remove a response (walk-in or invited)."""
     _get_or_404(poll_id)
     from kairos.db import delete_response
@@ -263,7 +293,7 @@ def delete_response_endpoint(poll_id: str, response_id: str, user: dict = Depend
 
 
 @router.delete("/polls/{poll_id}")
-def delete_poll_endpoint(poll_id: str, user: dict = Depends(require_api_key)):
+def delete_poll_endpoint(poll_id: str, user: dict = Depends(api_scope("polls:write"))):
     _get_or_404(poll_id)
     delete_poll(poll_id)
     return {"deleted": True}
@@ -271,7 +301,7 @@ def delete_poll_endpoint(poll_id: str, user: dict = Depends(require_api_key)):
 
 @router.post("/polls/{poll_id}/decide")
 def decide_endpoint(poll_id: str, body: DecideIn, request: Request,
-                    user: dict = Depends(require_api_key)):
+                    user: dict = Depends(api_scope("polls:write"))):
     poll = _get_or_404(poll_id)
     if body.slot_id not in {s["id"] for s in poll["slots"]}:
         raise HTTPException(400, "slot_id does not belong to this poll")
@@ -281,7 +311,7 @@ def decide_endpoint(poll_id: str, body: DecideIn, request: Request,
 
 @router.post("/polls/{poll_id}/slots")
 def add_slots_endpoint(poll_id: str, body: SlotsAdd, request: Request,
-                       user: dict = Depends(require_api_key)):
+                       user: dict = Depends(api_scope("polls:write"))):
     poll = _get_or_404(poll_id)
     for d in body.dates:
         try:
@@ -292,13 +322,17 @@ def add_slots_endpoint(poll_id: str, body: SlotsAdd, request: Request,
     added = add_slots(poll_id, slots) if slots else []
     nudged = None
     if body.notify and added:
+        # `notify` mails, so it needs mail:send on top of polls:write — otherwise a
+        # key scoped "edit this poll" reaches every inbox through a route whose name
+        # promises none of that. (kairos.scoping, issue #51)
+        require_capability(user, "mail:send")
         nudged = nudge_participants(request, get_poll(poll_id),
                                     _actor(poll, body.sender_name, body.reply_to))
     return {"added": added, "nudged": nudged}
 
 
 @router.post("/polls/{poll_id}/respond")
-def respond_endpoint(poll_id: str, body: ResponseCreate, user: dict = Depends(require_api_key)):
+def respond_endpoint(poll_id: str, body: ResponseCreate, user: dict = Depends(api_scope("respond"))):
     poll = _get_or_404(poll_id)
     if poll["status"] != "open":
         raise HTTPException(400, "Poll is not open")
@@ -318,14 +352,19 @@ def respond_endpoint(poll_id: str, body: ResponseCreate, user: dict = Depends(re
 
 
 @router.get("/polls/{poll_id}/responses")
-def get_responses_endpoint(poll_id: str, user: dict = Depends(require_api_key)):
+def get_responses_endpoint(poll_id: str, user: dict = Depends(api_scope("polls:read"))):
     _get_or_404(poll_id)
     return get_responses(poll_id)
 
 
 @router.post("/polls/{poll_id}/invite")
 def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
-                    user: dict = Depends(require_api_key)):
+                    user: dict = Depends(api_scope("mail:send"))):
+    # The one caller-supplied fan-out on this surface, so this is where the hard
+    # per-request ceiling belongs: the schema puts no bound on `emails`, and a
+    # caller who is refused still holds every address and can send them in
+    # batches. Charged before a single row is written, let alone a message sent.
+    check_recipient_list(len(body.emails), what="email addresses")
     poll = _get_or_404(poll_id)
     actor = _actor(poll, body.sender_name, body.reply_to)
     base = get_base_url(request)
@@ -340,6 +379,9 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
         raise HTTPException(400, f"Invalid email address(es): {', '.join(bad)}")
     names = {e: n for (n, e) in parsed}
     body.emails = [e for (_, e) in parsed]
+    # The per-poll budget, keyed on the poll rather than the key, so it holds
+    # whichever credential asks and however the calls are split up.
+    charge_poll_recipients(poll_id, len(body.emails))
     for email in body.emails:
         invite = create_invite(poll_id, email, required=body.required,
                                 name=names.get(email))
@@ -364,24 +406,35 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
 
 
 @router.get("/polls/{poll_id}/invites")
-def get_invites_endpoint(poll_id: str, user: dict = Depends(require_api_key)):
+def get_invites_endpoint(poll_id: str, user: dict = Depends(api_scope("polls:read"))):
     _get_or_404(poll_id)
     return get_invites(poll_id)
 
 
 @router.post("/polls/{poll_id}/nudge")
 def nudge_endpoint(poll_id: str, body: NudgeIn, request: Request,
-                   user: dict = Depends(require_api_key)):
+                   user: dict = Depends(api_scope("mail:send"))):
+    """Smart reminders. `force=True` bypasses the 24h cooldown — an operator
+    affordance for a human in the UI, so from here it takes its own scope AND its
+    own, much tighter budget (issue #51). `emails=[...]` is a caller-supplied
+    fan-out and gets the same per-request ceiling as `invite`."""
+    if body.emails:
+        check_recipient_list(len(body.emails), what="email addresses")
+    if body.force:
+        require_capability(user, "mail:force")
+        charge_force(user)
     poll = _get_or_404(poll_id)
     if poll["status"] != "open":
         raise HTTPException(400, "Poll is not open")
     only = {e.strip().lower() for e in body.emails} if body.emails else None
+    # The poll's own budget is charged inside nudge_participants, so the web UI's
+    # remind / remind-selected spend the same one.
     return nudge_participants(request, poll, _actor(poll, body.sender_name, body.reply_to),
                               only_emails=only, force=body.force)
 
 
 @router.get("/polls/{poll_id}/contacts")
-def contacts_endpoint(poll_id: str, user: dict = Depends(require_api_key)):
+def contacts_endpoint(poll_id: str, user: dict = Depends(api_scope("polls:read"))):
     """Outbound-mail audit trail for a poll, newest first."""
     _get_or_404(poll_id)
     return get_contact_log(poll_id)
@@ -389,15 +442,22 @@ def contacts_endpoint(poll_id: str, user: dict = Depends(require_api_key)):
 
 @router.post("/polls/{poll_id}/email-decision")
 def email_decision_endpoint(poll_id: str, body: MailIn, request: Request,
-                            user: dict = Depends(require_api_key)):
+                            user: dict = Depends(api_scope("mail:send"))):
     poll = _get_or_404(poll_id)
     slot = decided_slot_of(poll)
     if not slot:
         raise HTTPException(400, "Poll has no decided date yet")
     actor = _actor(poll, body.sender_name, body.reply_to)
     poll_url = _share_url(request, poll)
+    # Recipients come from the poll, not from the request, so this fan-out is
+    # bounded by the per-poll budget rather than refused outright — a poll with
+    # more participants than the per-request cap is a real meeting, not an attack.
+    # Charged here and in the web UI's equivalent, so the two surfaces share one
+    # allowance.
+    recipients = recipient_emails(poll_id)
+    charge_poll_recipients(poll_id, len(recipients))
     sent = send_decision_email(
-        recipient_emails(poll_id), poll["title"], format_slot(slot, poll["mode"]),
+        recipients, poll["title"], format_slot(slot, poll["mode"]),
         poll_url, build_ics(poll, slot, poll_url), actor["name"],
         note=body.note, reply_to=actor["email"])
     for email in sent:
@@ -406,12 +466,12 @@ def email_decision_endpoint(poll_id: str, body: MailIn, request: Request,
 
 
 @router.get("/polls/{poll_id}/event.ics")
-def event_ics_endpoint(poll_id: str, request: Request, user: dict = Depends(require_api_key)):
+def event_ics_endpoint(poll_id: str, request: Request, user: dict = Depends(api_scope("polls:read"))):
     return ics_response(_get_or_404(poll_id), request)
 
 
 @router.post("/imip/poll")
-def imip_poll_endpoint(user: dict = Depends(require_api_key)):
+def imip_poll_endpoint(user: dict = Depends(api_scope("imip:poll"))):
     """Run one IMAP poll cycle for inbound iMIP replies; returns the count
     applied. Operators schedule this (cron / systemd timer hitting the API).
     No-op unless KAIROS_IMIP + IMAP host are configured."""
@@ -421,7 +481,7 @@ def imip_poll_endpoint(user: dict = Depends(require_api_key)):
 
 @router.post("/polls/{poll_id}/imip-decision")
 def imip_decision_endpoint(poll_id: str, request: Request,
-                           user: dict = Depends(require_api_key)):
+                           user: dict = Depends(api_scope("mail:send"))):
     """Hybrid-C finalist step: send a native iMIP REQUEST for the decided slot
     to every participant, so they get real Accept/Maybe/Decline buttons and
     their reply flows back via the IMAP poller. Replies route to IMIP_ORGANIZER."""
@@ -441,8 +501,11 @@ def imip_decision_endpoint(poll_id: str, request: Request,
     subject = f"Invitation: {poll['title']} — {label}"
     base = get_base_url(request)
     invites = {i["email"]: i for i in get_invites(poll_id)}
+    # The same per-poll budget every other send path charges (see email-decision).
+    targets = recipient_emails(poll_id)
+    charge_poll_recipients(poll_id, len(targets))
     sent = []
-    for email in recipient_emails(poll_id):
+    for email in targets:
         inv = invites.get(email)
         # Per-invitee one-click RSVP links in the DESCRIPTION: Gmail renders these
         # (clickable) in its event card even when it suppresses native RSVP for a
