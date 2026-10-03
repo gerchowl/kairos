@@ -1,0 +1,16 @@
+{% extends "scheduler_base.html" %}
+{% block head %}<meta name="robots" content="noindex,nofollow">{% endblock %}
+{% block content %}
+<div class="card bg-base-100 shadow-sm">
+  <div class="card-body">
+    <h1 class="card-title text-2xl">Sign in</h1>
+    <p>Poll owners sign in with {{ provider }}. Everyone answering a poll does not need an
+       account &mdash; a share or invite link is all that is required.</p>
+    <div class="card-actions">
+      <a href="{{ start_url }}" class="btn btn-primary">Sign in with {{ provider }}</a>
+    </div>
+    <p class="text-sm opacity-60 mt-4">Only accounts on this deployment's owner allowlist get in.
+       If your account is missing, ask the operator to add it.</p>
+  </div>
+</div>
+{% endblock %}

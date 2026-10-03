@@ -36,11 +36,13 @@ deletes them). It publishes on **loopback only** and runs in demo auth, which
 means one shared owner and no authentication — fine locally, never on a public
 interface.
 
-Real deployments add a TLS terminator and an OIDC proxy in front:
+Real deployments add a TLS terminator and either Kairos-managed OIDC or an OIDC
+proxy in front:
 
 ```sh
 cp .env.example .env && $EDITOR .env   # secrets; compose refuses to start without them
-podman compose -f compose.proxy.yaml up -d
+podman compose -f compose.oidc.yaml up -d     # Kairos is the OIDC client (no auth proxy)
+podman compose -f compose.proxy.yaml up -d    # oauth2-proxy in front, Kairos reads headers
 ```
 
 MariaDB instead of SQLite, on the same image:
@@ -98,15 +100,45 @@ See `docs/design/reverse-calendar-imip.md` and issue #23 for the full design.
 
 ## Deployment model
 
-Kairos trusts identity headers from whatever reverse proxy you already run
-(`KAIROS_AUTH=header`): Shibboleth/Apache, oauth2-proxy, Authelia, Cloudflare
-Access, Tailscale… Respondents never need accounts — share links and invite
-tokens are self-contained. See `kairos/settings.py` for all env knobs.
-`compose.proxy.yaml` wires up the generic case (Caddy + oauth2-proxy + any OIDC
-provider); the ETH/duplet Shibboleth deployment is unchanged.
+Kairos supports three families of owner identity, and they are **layers, not
+alternatives** — pick the owner one, and the capability one applies regardless.
 
-> **Before exposing a hosted instance, set `KAIROS_TRUSTED_PROXY_CIDRS`.** Header
-> mode trusts whoever sets the identity headers, so anything that can reach the
+Respondents never need accounts in any of them: share links and invite tokens are
+self-contained.
+
+| Owner auth | Wiring | Use it when |
+|---|---|---|
+| `demo` (default) | zero | local trial; one shared owner, no identity check |
+| `oidc` | **~4 env vars** | **anything real.** Kairos terminates OIDC itself; no auth proxy |
+| `header` | an infrastructure project | you already run Shibboleth, OpenAthens, oauth2-proxy, Authelia, Cloudflare Access or Tailscale |
+| `none` | zero | public/respondent-only; the management UI is disabled |
+
+The `oidc` mode is the primary multi-user self-host path because it is the only
+one that is both multi-user and cheap — nginx cannot terminate OIDC, which is
+why `oauth2-proxy` and Authelia exist as separate boxes. See
+**[docs/design/oidc-login.md](docs/design/oidc-login.md)** for the whole picture.
+`header` mode is unchanged and still the right answer inside an institution that
+already has a broker; see `compose.proxy.yaml` for that wiring.
+
+```sh
+KAIROS_AUTH=oidc \
+KAIROS_OIDC_ISSUER=https://id.example.org/realms/main \
+KAIROS_OIDC_CLIENT_ID=kairos KAIROS_OIDC_CLIENT_SECRET=… \
+KAIROS_OIDC_ALLOWED_SUBJECTS=<sub-from-your-IdP> \
+SESSION_SECRET=$(openssl rand -hex 32) \
+uvx --from kairos-scheduler kairos --host 0.0.0.0
+```
+
+`KAIROS_OIDC_ALLOWED_SUBJECTS` is **required** — an empty allowlist refuses to
+boot, because Kairos will not admit "anyone the IdP vouched for". A successful
+exchange is necessary and not sufficient; the identity has to resolve to a known
+subject, and the allowlist is re-checked on every request, so removing a subject
+signs that person out immediately. The pattern is the ETH deployment's own
+directory check. (An email-domain allowlist is available and coarser; see the
+guide.)
+
+> **Before exposing a hosted instance in `header` mode, set `KAIROS_TRUSTED_PROXY_CIDRS`.**
+> Header mode trusts whoever sets the identity headers, so anything that can reach the
 > app port directly can assert any identity — including becoming any poll owner.
 > Set it to the proxy's address(es), e.g. `KAIROS_TRUSTED_PROXY_CIDRS=10.0.0.0/8,127.0.0.1`.
 > Requests from any other peer are refused with 403 and logged. Unset means *trust
@@ -114,6 +146,8 @@ provider); the ETH/duplet Shibboleth deployment is unchanged.
 > proxy. The check uses the real transport peer, never `X-Forwarded-For`; if you
 > run uvicorn yourself rather than via the `kairos` entrypoint, pass
 > `proxy_headers=False` so it does not rewrite that address before Kairos sees it.
+> In `oidc` mode the CIDR list still gates that edge, but it is no longer the
+> identity boundary — the subject allowlist is. Every boot logs which is in force.
 
 **Before exposing a hosted instance, set `KAIROS_RATE_LIMIT=on`** (and
 `KAIROS_TRUSTED_PROXY_CIDRS`, which it depends on). See
@@ -149,6 +183,7 @@ surface:
 | `create` | `POST /new` | 10/min |
 | `invite` | `POST /p/<id>/invite` | 30/min |
 | `send` | `remind`, `remind-selected`, `email-decision` — actual SMTP | 10/hour |
+| `login` | `GET …/oidc/start`, `GET …/oidc/callback` — unauthenticated, one outbound call each | 30/min |
 
 Override any of them with `KAIROS_RATE_LIMIT_<RULE>="<count>/<window>"`
 (`second`/`minute`/`hour`/`day`), e.g. `KAIROS_RATE_LIMIT_SEND="30/hour"`. `0`

@@ -6,6 +6,10 @@ Modes (KAIROS_AUTH):
           (Shibboleth/Apache, oauth2-proxy, Authelia, Cloudflare Access, ...);
           optionally gate with KAIROS_ALLOW (uids/emails) and with
           KAIROS_TRUSTED_PROXY_CIDRS (which peers may set those headers at all)
+  oidc    Kairos terminates OIDC itself — no proxy to deploy. Identity comes
+          from a signed session cookie minted by `kairos.oidc` after an
+          authorization-code exchange, gated by a subject allowlist that denies
+          by default. See docs/design/oidc-login.md.
   none    no owner auth — the web management UI is disabled, API + public
           response pages only
 
@@ -113,11 +117,22 @@ def _header_user(request: Request) -> dict | None:
 
 
 def get_user(request: Request) -> dict | None:
-    """The poll-owner identity for this request, or None."""
+    """The poll-owner identity for this request, or None.
+
+    This stays the one seam every caller goes through, and stays replaceable at
+    runtime (`kairos.auth.get_user = mine`) — the ETH/duplet adapter depends on
+    that, and so does any bespoke session-cookie portal.
+    """
     if settings.AUTH_MODE == "demo":
         return dict(DEMO_USER)
     if settings.AUTH_MODE == "header":
         return _header_user(request)
+    if settings.AUTH_MODE == "oidc":
+        # Imported here, not at module scope: `kairos.oidc` needs `_serializer`
+        # from this module, and a top-level import each way is a cycle.
+        from kairos.oidc import session_user
+
+        return session_user(request)
     return None
 
 

@@ -187,6 +187,18 @@ jobs:
           # A missing operator secret must fail the deploy, not boot with a blank
           # one. (No .env in a fresh checkout, so this is the unset case.)
           ! docker compose -f compose.proxy.yaml config -q
+          # The first-party-OIDC topology (#53): Caddy + Kairos as the OIDC client,
+          # no auth proxy in front. Standalone for the same reason compose.proxy.yaml
+          # is — an overlay would resurrect compose.yaml's published app port.
+          KAIROS_SITE=x ACME_EMAIL=a@b.c KAIROS_OIDC_ISSUER=https://id.example.org/realms/main \
+            KAIROS_OIDC_CLIENT_ID=c KAIROS_OIDC_CLIENT_SECRET=s SESSION_SECRET=s \
+            docker compose -f compose.oidc.yaml config -q
+          ! KAIROS_SITE=x ACME_EMAIL=a@b.c KAIROS_OIDC_ISSUER=https://id.example.org/realms/main \
+            KAIROS_OIDC_CLIENT_ID=c SESSION_SECRET=s \
+            docker compose -f compose.oidc.yaml config -q
+          ! KAIROS_SITE=x ACME_EMAIL=a@b.c KAIROS_OIDC_ISSUER=https://id.example.org/realms/main \
+            KAIROS_OIDC_CLIENT_ID=c KAIROS_OIDC_CLIENT_SECRET=s \
+            docker compose -f compose.oidc.yaml config -q
           # compose.proxy.yaml must NOT validate as an overlay of compose.yaml.
           # Compose appends list-valued keys, so the two files' identical
           # security_opt entries collide. It is standalone for a reason: merging

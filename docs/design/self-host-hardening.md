@@ -19,18 +19,27 @@ The gate references below point at the obligations register
 |---|---|---|---|
 | `compose.yaml` | SQLite on a named volume | `127.0.0.1` only | `demo` (one shared owner, none) |
 | `+ compose.mysql.yaml` | MariaDB | `127.0.0.1` only | `demo` |
+| `compose.oidc.yaml` | SQLite + Caddy + **Kairos as the OIDC client** | `0.0.0.0:80/443` | `oidc` + subject allowlist |
 | `compose.proxy.yaml` | SQLite + Caddy + oauth2-proxy | `0.0.0.0:80/443` | `header` + allowlist |
 
 `demo` mode has **no identity check at all**. Every user is the same owner and
 can create, edit and delete every poll. That is fine on loopback and is a
 disaster on any interface you do not exclusively control. If in doubt, use
-`compose.proxy.yaml`.
+`compose.oidc.yaml`.
 
 ```sh
 cp .env.example .env      # then fill it in; compose refuses to start on missing secrets
 podman compose -f compose.yaml up -d           # local trial
-podman compose -f compose.proxy.yaml up -d     # anything real
+podman compose -f compose.oidc.yaml up -d      # anything real; Kairos terminates OIDC
+podman compose -f compose.proxy.yaml up -d     # real; oauth2-proxy terminates OIDC
 ```
+
+Both real topologies publish **only Caddy**, so §1 and §2 apply to each; the
+difference is solely *where* OIDC terminates. See [oidc-login.md](oidc-login.md)
+§0 for which to pick, §4 for per-provider client registration, and §6 for what is
+and is not proven about the OIDC path. **Both files are standalone, not
+overlays** — see the note at the top of `compose.proxy.yaml`: an overlay
+resurrects `compose.yaml`'s published app port and defeats the allowlist.
 
 `.env` is gitignored **and** excluded from the Docker build context, so a
 session secret lives in one place and never reaches a layer or a commit (S4).
@@ -49,11 +58,11 @@ session secret lives in one place and never reaches a layer or a commit (S4).
       a certificate expires; nobody reads container logs on a Sunday.
 - [ ] Back up the `caddy-data` volume. Losing it means re-acquiring
       certificates, against rate limits you cannot see.
-- [ ] If you front Kairos with something *other* than `compose.proxy.yaml`, the
+- [ ] If you front Kairos with something *other than* these two compose files, the
       TLS obligation is now yours (CHECKLIST enforcement mode) — nothing in
       Kairos can enforce it.
 
-## 2. S1 — owner identity comes only from a trusted proxy
+## 2. S1 — owner identity comes only from a trusted boundary
 
 In `KAIROS_AUTH=header`, whoever can reach the app port can assert any identity,
 including ownership of any poll. Two controls, both required:
@@ -66,9 +75,11 @@ including ownership of any poll. Two controls, both required:
       is no allowlist value that fixes this, because the address depends on the
       engine's port-forwarding implementation. Unpublish the port.
 - [ ] **`KAIROS_TRUSTED_PROXY_CIDRS` is set** and matches the pinned subnet in
-      `compose.proxy.yaml`. Fail-closed: a stale value presents as 403 on every
-      page, which looks like a broken app rather than a security control. Check
-      the app log for `rejected untrusted peer …` when it happens.
+      `compose.proxy.yaml` **or `compose.oidc.yaml`** (both pin
+      `172.30.30.0/24`; change one, change the other). Fail-closed: a stale value
+      presents as 403 on every page, which looks like a broken app rather than a
+      security control. Check the app log for `rejected untrusted peer …` when it
+      happens.
 - [ ] Do not add `127.0.0.1` to the allowlist. Anything able to reach the app
       over loopback would then be trusted — including the host's own processes.
 - [ ] **Keep `proxy_headers=False`.** The image's `CMD` runs the `kairos`
@@ -93,7 +104,37 @@ including ownership of any poll. Two controls, both required:
       header and says nothing about header trust.
 - [ ] Set `KAIROS_ALLOW` as a second, independent owner gate if your IdP is
       broader than your user list. Empty means any identity the IdP vouches for
-      may own polls.
+      may own polls. (In `KAIROS_AUTH=oidc` the equivalent gate is
+      `KAIROS_OIDC_ALLOWED_SUBJECTS`; `KAIROS_ALLOW` is inert there because no
+      identity header is read, and Kairos warns if it is set.)
+
+## 2a. S1 in `oidc` mode — the boundary moved, and which one is load-bearing
+
+With Kairos terminating OIDC, **two** controls exist and they are not the same
+control. Read the boot line to see which is doing what:
+
+```
+owner auth: oidc (issuer=…, allowlist=3 subject(s) + trusted-proxy CIDRs
+  (edge only, not the identity boundary); …)
+```
+
+- [ ] **`KAIROS_OIDC_ALLOWED_SUBJECTS` (or `_ALLOWED_EMAIL_DOMAINS`) is set.** It
+      is the control that decides who may own polls, it **denies by default**, and
+      Kairos **refuses to boot** without one — so a running container is already
+      proof it is set. See [oidc-login.md](oidc-login.md) §2.
+- [ ] **`KAIROS_TRUSTED_PROXY_CIDRS` is still set** and still matches the pinned
+      subnet. It no longer decides identity; it holds the edge, so only your TLS
+      terminator can reach the app at all. Same fail-closed 403-on-every-page
+      behaviour when it goes stale.
+- [ ] `KAIROS_PUBLIC_URL` is set. It decides the redirect URI sent to the IdP and
+      the `Secure` flag on the session cookie; unset, both fall back to request
+      headers and the app warns at boot.
+- [ ] **Run one real sign-in, and one rejected one.** The verifier is hand-rolled
+      (see §6 of the OIDC guide for exactly what that does and does not cover),
+      and a deny path nobody has ever exercised is not a deny path.
+- [ ] Set `KAIROS_RATE_LIMIT=on` for anything reachable by people you do not
+      know: `/oidc/start` and `/oidc/callback` are unauthenticated and each makes
+      an outbound call per request.
 
 ## 3. S2 — `SESSION_SECRET`
 

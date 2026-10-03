@@ -23,7 +23,11 @@ def create_env(extra_dir: Path | str | None = None) -> Environment:
                       autoescape=select_autoescape(("html", "htm", "xml")))
     env.globals.update(static_v=STATIC_VERSION, P=settings.PREFIX,
                        BRAND=settings.BRAND, HOME_URL=settings.HOME_URL,
-                       LEGAL=bool(settings.OPERATOR))
+                       LEGAL=bool(settings.OPERATOR),
+                       # #53: only the OIDC mode has a session to sign out of, and
+                       # the logout route 404s in every other mode, so the nav
+                       # control is rendered from the mode rather than from a flag.
+                       OIDC=settings.AUTH_MODE == "oidc")
     return env
 
 
