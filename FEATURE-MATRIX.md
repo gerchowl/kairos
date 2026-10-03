@@ -18,7 +18,8 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Native iMIP invites (REQUEST/CANCEL) + IMAP-poll ingest | `ics.py`, `email_service.py`, `imip_inbound.py`, `api.py` | ADR-0005, ADR-0006 |
 | Self-hosted short vote links (`/v/<code>`) | `db.py`, `web.py` | ADR-0007 |
 | ETH/duplet deployment adapter | `duplet-webserver/apps/scheduler` | ADR-0008 |
-| Container / self-host deployment (OCI image + compose, obligation D3/D4) | `Dockerfile`, `compose*.yaml`, `deploy/Caddyfile`, `docs/design/self-host-hardening.md` | ADR-0008 |
+| Container / self-host deployment (OCI image + compose, obligation D3/D4) | `Dockerfile`, `compose*.yaml`, `deploy/Caddyfile*`, `docs/design/self-host-hardening.md` | ADR-0008 |
+| First-party OIDC owner login (`KAIROS_AUTH=oidc` + subject allowlist) | `oidc.py`, `auth.py`, `compose.oidc.yaml`, `docs/design/oidc-login.md` | ADR-0013 |
 | Optional accounts / multi-tenancy (planned) | — | ADR-0009 |
 | Agent surfaces: REST API, `/llms.txt`, OpenAPI, MCP, `agent.json` | `api.py`, `main.py`, `public.py`, `mcp/` | ADR-0010 |
 | Brand & hosting home (nerdmachines house brand, `kairos.nerdmachines.com`) | `docs/design/productization-obligations.md` | ADR-0011 |

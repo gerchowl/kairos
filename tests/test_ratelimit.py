@@ -303,6 +303,15 @@ PROTECTED = {
     ("POST", "/scheduler/polls/{poll_id}/email-decision"): "send",
 }
 
+# The OIDC login endpoints (#53): unauthenticated, and each one makes an outbound
+# call to a third party per request — `/oidc/callback` a token exchange, plus a
+# JWKS fetch whenever the key cache misses. That is the cheapest possible
+# amplification, so they carry a budget. Both 404 unless KAIROS_AUTH=oidc.
+PROTECTED.update({
+    ("GET", "/scheduler/oidc/start"): "login",
+    ("GET", "/scheduler/oidc/callback"): "login",
+})
+
 # Deliberately unlimited, with the reason. Owner-authenticated pages and
 # one-row edits are behind `require_manage`/proxy auth, and an IP budget would
 # punish a whole office sharing one NAT address for no abuse benefit — the
@@ -343,6 +352,13 @@ UNLIMITED = {
     ("POST", "/scheduler/polls/{poll_id}/participants/remove"): "deletes rows the caller owns",
     ("POST", "/scheduler/notifications/read-all"): "the caller's own notifications",
     ("GET", "/scheduler/polls/{poll_id}/event.ics"): "owner download of a poll's own .ics",
+
+    # #53. `/login` renders a sign-in page and starts no flow; the redirect to the
+    # IdP is `/oidc/start`, which is limited. `/oidc/logout` needs a valid session
+    # *and* a CSRF token bound to that session, and only clears a cookie — it
+    # touches no row and no third party. Both 404 unless KAIROS_AUTH=oidc.
+    ("GET", "/scheduler/login"): "renders a page; the outbound redirect is /oidc/start",
+    ("POST", "/scheduler/oidc/logout"): "session+CSRF gated; clears a cookie",
 }
 
 

@@ -1,0 +1,65 @@
+# Caddy in front of Kairos — automatic HTTPS, reverse-proxy to Kairos itself.
+#
+# The counterpart of deploy/Caddyfile for the compose.oidc.yaml topology, where
+# Kairos terminates OIDC and needs no auth proxy in front (issue #53). Mounted
+# read-only by that compose file. Every value is injected from the environment
+# (KAIROS_SITE, ACME_EMAIL) so the same file works for staging and production
+# without an edit.
+#
+# Caddy is deliberately the *only* thing published on the host. Kairos is
+# reachable only on the compose network, which is what makes
+# KAIROS_TRUSTED_PROXY_CIDRS meaningful.
+
+{
+	email {$ACME_EMAIL}
+	# Uncomment to test against the internal CA instead of Let's Encrypt, which
+	# has strict rate limits and will not issue for a non-resolvable hostname:
+	#   tls internal
+}
+
+{$KAIROS_SITE} {
+	encode zstd gzip
+
+	reverse_proxy kairos:8003 {
+		# Two things Kairos genuinely needs from a proxy, and both are set from the
+		# real request rather than trusted from the client's own headers:
+		#
+		#   X-Forwarded-Proto — the redirect URI Kairos sends to the IdP, and the
+		#     Secure flag on the session cookie. Wrong or absent and sign-in loops
+		#     or the cookie is not Secure.
+		#   X-Forwarded-Host — the same, for KAIROS_PUBLIC_URL-less deployments.
+		#
+		# Caddy also sets X-Forwarded-For itself; Kairos reads that only for rate
+		# limiting, and only when KAIROS_TRUSTED_PROXY_CIDRS names this proxy.
+		header_up X-Forwarded-Proto {scheme}
+		header_up X-Forwarded-Host {host}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "SAMEORIGIN"
+		# Kairos is a single-origin app: no cross-origin XHR, no framing from
+		# elsewhere. `frame-ancestors` covers the CSP equivalent.
+		Content-Security-Policy "frame-ancestors 'self'"
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
+
+# ACME HTTP-01 / TLS-ALPN challenges are served by Caddy automatically. Do not
+# put Kairos in front of this port. The proxy chain is
+#   client -> :443 Caddy -> :8003 kairos
+# and every hop must preserve the real client address, which Kairos's
+# KAIROS_TRUSTED_PROXY_CIDRS check depends on.
+#
+# One thing to know about the OIDC path specifically: Caddy must not rewrite or
+# intercept the IdP round trip. `/oidc/start` answers with a 302 to your
+# provider's authorization endpoint and `/oidc/callback` is where the provider
+# sends the browser back — both are ordinary app routes and must be passed
+# through untouched, redirect and cookie included.

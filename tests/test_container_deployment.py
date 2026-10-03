@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = (ROOT / "Dockerfile").read_text()
 COMPOSE = (ROOT / "compose.yaml").read_text()
 PROXY_COMPOSE = (ROOT / "compose.proxy.yaml").read_text()
+OIDC_COMPOSE = (ROOT / "compose.oidc.yaml").read_text()
 MYSQL_COMPOSE = (ROOT / "compose.mysql.yaml").read_text()
 DOCKERIGNORE = (ROOT / ".dockerignore").read_text().split()
 # Everything from the final stage on — the builder stage is not shipped, so
@@ -124,6 +125,7 @@ def test_no_compose_command_bypasses_the_entrypoint():
     for name, text in (
         ("compose.yaml", COMPOSE),
         ("compose.proxy.yaml", PROXY_COMPOSE),
+        ("compose.oidc.yaml", OIDC_COMPOSE),
         ("compose.mysql.yaml", MYSQL_COMPOSE),
     ):
         live = _commented_out(text)
@@ -170,7 +172,8 @@ def test_container_does_not_run_as_root():
 
 
 def test_compose_drops_capabilities_and_refuses_privilege_escalation():
-    for name, text in (("compose.yaml", COMPOSE), ("compose.proxy.yaml", PROXY_COMPOSE)):
+    for name, text in (("compose.yaml", COMPOSE), ("compose.proxy.yaml", PROXY_COMPOSE),
+                       ("compose.oidc.yaml", OIDC_COMPOSE)):
         live = _commented_out(text)
         assert "no-new-privileges:true" in live, name
         assert "cap_drop" in live and "ALL" in live, name
@@ -188,6 +191,7 @@ def test_healthcheck_probes_slash_health():
     # carry a HEALTHCHECK at all, so an image-only probe silently does not exist.
     assert "/health" in _commented_out(COMPOSE)
     assert "/health" in _commented_out(PROXY_COMPOSE)
+    assert "/health" in _commented_out(OIDC_COMPOSE)
 
 
 def test_kairos_healthcheck_needs_no_package_manager():
@@ -197,7 +201,8 @@ def test_kairos_healthcheck_needs_no_package_manager():
     uses wget, because the caddy image is alpine-based and already has it.
     """
     for name, text in (("Dockerfile", RUNTIME_STAGE), ("compose.yaml", COMPOSE),
-                       ("compose.proxy.yaml", _service(PROXY_COMPOSE, "kairos"))):
+                       ("compose.proxy.yaml", _service(PROXY_COMPOSE, "kairos")),
+                       ("compose.oidc.yaml", _service(OIDC_COMPOSE, "kairos"))):
         key = "HEALTHCHECK" if name == "Dockerfile" else "healthcheck:"
         probe = _healthcheck_block(text, key)
         assert probe, f"{name}: no healthcheck found"
@@ -249,6 +254,24 @@ REQUIRED_VARS = {
         "SESSION_SECRET",
     ),
     "compose.mysql.yaml": ("KAIROS_DB_PASSWORD", "KAIROS_DB_ROOT_PASSWORD"),
+    # The first-party-OIDC topology (#53). The client secret is deliberately NOT
+    # in this list: an unset one makes Kairos a public (PKCE-only) client, which
+    # is a legitimate registration for a self-hosted IdP. The allowlist is not
+    # required here either, because Kairos itself refuses to boot without one --
+    # that check lives in code, where it can read both allowlist variables at once.
+    "compose.oidc.yaml": (
+        "KAIROS_SITE",
+        "ACME_EMAIL",
+        "KAIROS_OIDC_ISSUER",
+        "KAIROS_OIDC_CLIENT_ID",
+        "SESSION_SECRET",
+    ),
+}
+
+_COMPOSE_FILES = {
+    "compose.proxy.yaml": PROXY_COMPOSE,
+    "compose.mysql.yaml": MYSQL_COMPOSE,
+    "compose.oidc.yaml": OIDC_COMPOSE,
 }
 
 
@@ -260,7 +283,7 @@ def test_operator_secrets_are_required_interpolations(name):
     either signs with a known-empty key or, for the MariaDB root password,
     initialises a database with a guessable one.
     """
-    live = _commented_out({"compose.proxy.yaml": PROXY_COMPOSE, "compose.mysql.yaml": MYSQL_COMPOSE}[name])
+    live = _commented_out(_COMPOSE_FILES[name])
     for var in REQUIRED_VARS[name]:
         suffixes = re.findall(r"\$\{" + var + r"([^}]*)\}", live)
         assert suffixes, f"{name}: {var} is never read from the environment"
@@ -324,9 +347,70 @@ def test_kairos_service_is_on_the_network_the_allowlist_names():
     assert networks.group(1) in _commented_out(PROXY_COMPOSE)
 
 
+# -- the first-party-OIDC topology (#53) ------------------------------------
+#
+# The claim this file exists to defend -- the app port is not published -- applies
+# to this topology as much as to the proxy one, and for the same reason: an engine
+# port-forwarder is presented to the app as an in-subnet peer. In OIDC mode the
+# CIDR list is no longer the *identity* boundary (the subject allowlist is), but it
+# still holds the edge, and a stale value still presents as 403 on every page.
+
+
+def test_oidc_topology_never_publishes_the_app_port():
+    kairos = _service(OIDC_COMPOSE, "kairos")
+    assert "ports:" not in kairos, "the app port must not be published"
+    assert "expose:" in kairos
+
+
+def test_oidc_topology_sets_the_allowlist_to_the_pinned_subnet_only():
+    subnets = re.findall(r"- subnet: (\S+)", _commented_out(OIDC_COMPOSE))
+    assert len(subnets) == 1, subnets
+    cidr = re.search(r'KAIROS_TRUSTED_PROXY_CIDRS:\s*"?([0-9./,\s]+)"?', _commented_out(OIDC_COMPOSE))
+    assert cidr, "the OIDC topology must set KAIROS_TRUSTED_PROXY_CIDRS"
+    allowed = [part.strip() for part in cidr.group(1).split(",") if part.strip()]
+    assert allowed == subnets, f"allowlist {allowed} must equal pinned subnet {subnets}"
+    assert not any("127.0.0.1" in entry or "::1" in entry for entry in allowed)
+
+
+def test_oidc_topology_runs_kairos_as_the_client_and_needs_no_auth_proxy():
+    """The whole point of the file: Kairos terminates OIDC, so there is no
+    oauth2-proxy to operate and no identity header to map. An oauth2-proxy here
+    would mean this topology had silently become the other one."""
+    live = _commented_out(OIDC_COMPOSE)
+    assert "oauth2-proxy" not in live, "this topology must not add an auth proxy"
+    assert re.search(r"^\s*KAIROS_AUTH:\s*oidc\s*$", live, re.M)
+    # Header mode's knobs are inert here and would mislead an operator reading the
+    # container's environment.
+    for inert in ("KAIROS_AUTH_UID_HEADER", "KAIROS_AUTH_EMAIL_HEADER", "KAIROS_LOGIN_URL"):
+        assert inert not in live, f"{inert} has no effect in oidc mode"
+    # The subject allowlist must be reachable from .env, even though Kairos (not
+    # compose) is what refuses to boot without one.
+    assert "KAIROS_OIDC_ALLOWED_SUBJECTS" in live
+    assert "KAIROS_OIDC_ALLOWED_EMAIL_DOMAINS" in live
+
+
+def test_the_oidc_caddyfile_proxies_to_kairos_and_leaves_the_idp_round_trip_alone():
+    """Two claims: Caddy talks to the app directly, and the OIDC callback path is
+    not intercepted. A `handle` block or a rewrite that swallowed `/oidc/*` would
+    present as an endless sign-in loop with nothing in either log to explain it."""
+    caddyfile = (ROOT / "deploy" / "Caddyfile.oidc").read_text()
+    assert re.search(r"reverse_proxy\s+kairos:8003", caddyfile)
+    assert "oauth2-proxy" not in caddyfile
+    for directive in ("rewrite", "handle", "redir", "handle_path", "try_files"):
+        assert not re.search(rf"^\s*{directive}\b", caddyfile, re.M), (
+            f"deploy/Caddyfile.oidc must not {directive} -- the IdP round trip is "
+            "ordinary app traffic"
+        )
+    # X-Forwarded-Proto is load-bearing: it decides the redirect URI Kairos sends
+    # to the IdP and the Secure flag on the session cookie.
+    assert "header_up X-Forwarded-Proto {scheme}" in caddyfile
+    assert "header_up X-Forwarded-Host {host}" in caddyfile
+
+
 @pytest.mark.parametrize(
     "name,text",
-    [("compose.yaml", COMPOSE), ("compose.proxy.yaml", PROXY_COMPOSE)],
+    [("compose.yaml", COMPOSE), ("compose.proxy.yaml", PROXY_COMPOSE),
+     ("compose.oidc.yaml", OIDC_COMPOSE)],
 )
 def test_healthcheck_survives_the_proxy_allowlist(name, text):
     """A 403'd healthcheck is a crashloop; /health must be probed on loopback."""
@@ -388,7 +472,8 @@ def test_default_topology_is_read_only():
 @pytest.mark.parametrize(
     "name,text",
     [pytest.param("compose.yaml", COMPOSE, id="compose.yaml"),
-     pytest.param("compose.proxy.yaml", PROXY_COMPOSE, id="compose.proxy.yaml")],
+     pytest.param("compose.proxy.yaml", PROXY_COMPOSE, id="compose.proxy.yaml"),
+     pytest.param("compose.oidc.yaml", OIDC_COMPOSE, id="compose.oidc.yaml")],
 )
 def test_no_service_asks_for_privileged(name, text):
     """`privileged: true` would hand back everything read_only and cap_drop take.
@@ -422,7 +507,8 @@ def test_mysql_overlay_waits_for_a_healthy_database():
 @pytest.mark.parametrize(
     "path",
     ["README.md", ".env.example", "compose.yaml", "compose.mysql.yaml", "compose.proxy.yaml",
-     "deploy/Caddyfile", "docs/design/self-host-hardening.md"],
+     "compose.oidc.yaml", "deploy/Caddyfile", "deploy/Caddyfile.oidc",
+     "docs/design/self-host-hardening.md"],
 )
 def test_no_doc_ships_the_invalid_overlay_merge(path):
     """compose.proxy.yaml must never be layered onto compose.yaml.
@@ -451,6 +537,36 @@ def test_env_example_points_at_the_standalone_proxy_command():
     """The section header in .env.example is what an operator copies."""
     live = (ROOT / ".env.example").read_text()
     assert "-f compose.proxy.yaml up -d" in live
+
+
+def test_the_oidc_client_secret_is_optional_in_every_source_that_mentions_it():
+    """Four places talk about this variable and they must not disagree.
+
+    Kairos supports a public (PKCE-only) client and warns at boot when no secret
+    is configured, so `:?` on it in the compose file would refuse to start the
+    very path its own comment advertises — while `.env.example` told the operator
+    to leave it blank. Holding all four together is cheaper than rediscovering it.
+    """
+    compose = _commented_out(OIDC_COMPOSE)
+    suffixes = re.findall(r"\$\{KAIROS_OIDC_CLIENT_SECRET([^}]*)\}", compose)
+    assert suffixes, "compose.oidc.yaml must read the client secret from the environment"
+    assert all(not s.startswith(":?") for s in suffixes), (
+        "the client secret must be optional — an empty value is a valid public-client "
+        f"registration, got ${{KAIROS_OIDC_CLIENT_SECRET{suffixes[0]}}}"
+    )
+    assert "KAIROS_OIDC_CLIENT_SECRET" not in REQUIRED_VARS["compose.oidc.yaml"]
+    env_example = (ROOT / ".env.example").read_text()
+    assert "KAIROS_OIDC_CLIENT_SECRET" in env_example
+    assert "public" in env_example, ".env.example must keep documenting the public-client path"
+
+
+def test_env_example_points_at_the_standalone_oidc_command():
+    """Same for #53's topology: the operator copies a header comment, not a file."""
+    live = (ROOT / ".env.example").read_text()
+    assert "-f compose.oidc.yaml up -d" in live
+    for var in ("KAIROS_OIDC_ISSUER", "KAIROS_OIDC_CLIENT_ID", "KAIROS_OIDC_CLIENT_SECRET",
+                "KAIROS_OIDC_ALLOWED_SUBJECTS", "KAIROS_OIDC_ALLOWED_EMAIL_DOMAINS"):
+        assert var in live, f".env.example must document {var} for the OIDC topology"
 
 
 def test_domain_list_is_not_given_a_secret_generator():

@@ -26,6 +26,8 @@ def create_app() -> FastAPI:
     from kairos import scoping
     from kairos.api import router as api_router
     from kairos.auth import peer_address, peer_is_trusted
+    from kairos.oidc import boot_warnings, identity_report
+    from kairos.oidc import router as oidc_router
     from kairos.public import router as public_router
     from kairos.ratelimit import install as install_ratelimit
     from kairos.web import router as web_router
@@ -87,6 +89,15 @@ def create_app() -> FastAPI:
 
     logging.getLogger("kairos.mail").info("%s", mail_identity_report())
 
+    # Issue #53: the same statement for the *inbound* identity boundary. Which
+    # control decided "who is the owner" is the one fact an operator cannot
+    # infer from a working page, so say it at every boot — and say it
+    # unconditionally, so "owner auth: header" is what a self-hoster reads on a
+    # deployment that never asked for OIDC.
+    oidc_log = logging.getLogger("kairos.oidc")
+    oidc_log.info("%s", identity_report())
+    for warning in boot_warnings():
+        oidc_log.warning("%s", warning)
     # Issue #51: the API surface's authorisation and budgets, stated once at boot
     # the same way — a scoped keyring an operator believes is in force but is not
     # is the failure this line exists to make visible. Also *validates* it, so a
@@ -114,6 +125,10 @@ def create_app() -> FastAPI:
     app.include_router(api_router)
     app.include_router(web_router, include_in_schema=False)
     app.include_router(public_router, include_in_schema=False)
+    # Registered in every mode and self-404ing when KAIROS_AUTH != oidc, so the
+    # route table — which tests/test_ratelimit.py's route audit reads — does not
+    # change shape with the auth mode.
+    app.include_router(oidc_router, include_in_schema=False)
 
     # Obligation A3 (#37): register the rejection handler for exhausted budgets.
     # Registered unconditionally and inert while KAIROS_RATE_LIMIT is unset, so

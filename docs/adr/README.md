@@ -18,3 +18,4 @@ must appear in the repo `FEATURE-MATRIX.md` (enforced by `guardrails-adr-matrix`
 | [0010](0010-agent-native-by-contract.md) | Agent-native by contract | **Accepted** |
 | [0011](0011-nerdmachines-house-brand.md) | Ship under the nerdmachines house brand (`kairos.nerdmachines.com`) | **Accepted** |
 | [0012](0012-scheduling-primitive-surface-tiers.md) | Scheduling primitive, four shapes, three surface tiers, agent-first | **Proposed** |
+| [0013](0013-first-party-oidc-client.md) | First-party OIDC owner auth, allowlisted by subject (amends 0002) | **Accepted** |

@@ -2,7 +2,7 @@
 
 KAIROS_DB_URL      sqlite:///kairos.db (default) | mysql://user:pass@host:port/db
 KAIROS_PREFIX      URL prefix the app is mounted under (default "", e.g. "/scheduler")
-KAIROS_AUTH        owner-auth mode: demo (default) | header | none
+KAIROS_AUTH        owner-auth mode: demo (default) | header | oidc | none
 KAIROS_AUTH_UID_HEADER    header carrying the user id    (header mode, default X-User)
 KAIROS_AUTH_EMAIL_HEADER  header carrying the email      (default X-Email)
 KAIROS_AUTH_NAME_HEADER   header carrying a display name (default X-Name)
@@ -86,7 +86,10 @@ AUTH_NAME_HEADER = os.environ.get("KAIROS_AUTH_NAME_HEADER", "X-Name")
 ALLOW = {a.strip().lower() for a in os.environ.get("KAIROS_ALLOW", "").split(",") if a.strip()}
 BRAND = os.environ.get("KAIROS_BRAND", "Kairos")
 HOME_URL = os.environ.get("KAIROS_HOME_URL", PREFIX + "/")
-LOGIN_URL = os.environ.get("KAIROS_LOGIN_URL", "")  # owner sign-in page; empty -> 401 message
+# Owner sign-in page; empty -> 401 message. In oidc mode Kairos serves its own
+# sign-in page, so that is the default there — the other modes have no such
+# page, and their operator points this at their proxy's (/oauth2/start).
+LOGIN_URL = os.environ.get("KAIROS_LOGIN_URL") or ((PREFIX + "/login") if AUTH_MODE == "oidc" else "")
 PUBLIC_URL = os.environ.get(
     "KAIROS_PUBLIC_URL", ""
 )  # SSoT base for share links; empty -> derive from request headers
@@ -204,6 +207,11 @@ DEFAULT_RATE_LIMITS = {
     "create": (10, 60),  # POST /new
     "invite": (30, 60),  # POST /polls/<id>/invite — grows the recipient list
     "send": (10, 3600),  # remind / remind-selected / email-decision — actual SMTP
+    # OIDC login. The only two rules here on endpoints that are unauthenticated
+    # *and* make an outbound call to a third party per request (token exchange,
+    # and a JWKS fetch on a cache miss), so they are the cheapest possible
+    # amplification. Inert in every other mode — the routes 404.
+    "login": (30, 60),  # GET /oidc/start, GET /oidc/callback
     # The /api surface, issue #51. Same switch, same override syntax, same
     # limiter and the same `RateLimited` signal as the six above; the only
     # difference is what the budget is charged to — a bearer key rather than a
