@@ -44,16 +44,16 @@ No retries: a retry multiplies the dependency and the latency.
 `off` / `on`; unset means `on` when `KAIROS_HOSTED` is on (the switch that
 already means "a deployment *we* operate") and `off` otherwise, so ADR-0001/0002
 leave self-host and ETH byte-for-byte alone. An **unrecognised value reads as
-`on`**, following `reach.policy()` (#67): `settings.HOSTED` reads unknown as off,
-so `KAIROS_HOSTED=enabled` once selected the permissive policy on the deployment
-that had just asked to be treated as hosted. The costs are not symmetric here
-either — a self-hoster who meant otherwise sets `KAIROS_TURNSTILE=off` and is back
-to exactly the pre-#31 behaviour, and `boot_warnings()` says so by name. And a
-deployment that turns the gate on **without a site key and a secret refuses to
-boot** (the same shape as `capability`'s `SESSION_SECRET` gate, for the same
-reason: a green boot followed by a dead creation path is the worst answer
-available), so "the gate is on" is never something an operator believes rather
-than knows.
+`on`**. That direction is not a convention inherited from #67 — it is the direction
+#67 had to adopt while fixing an incident, in which `KAIROS_HOSTED=enabled` silently
+selected the permissive reach policy (`reach.policy()`); see `parse_mode`. The costs
+are not symmetric here either — a self-hoster who meant otherwise sets
+`KAIROS_TURNSTILE=off` and is back to exactly the pre-#31 behaviour, and
+`boot_warnings()` says so by name. And a deployment that turns the gate on **without
+a site key and a secret refuses to boot** (the same shape as `capability`'s
+`SESSION_SECRET` gate, for the same reason: a green boot followed by a dead creation
+path is the worst answer available), so "the gate is on" is never something an
+operator believes rather than knows.
 
 **Click-to-load, and no flag.** Nothing from Cloudflare is fetched until the
 person presses a button — no script, no widget, no third-party cookie on a page
@@ -193,15 +193,31 @@ def _raw(name: str) -> str:
 def parse_mode(raw: str) -> str:
     """`KAIROS_TURNSTILE` as `on` or `off`. **Unknown is `on`.**
 
-    The fail-closed reading, and it is the one #67's `reach.policy()` established
-    after measuring the alternative: `settings.HOSTED` reads an unrecognised value
-    as *off*, so `KAIROS_HOSTED=enabled` quietly selected `open` reach on the
-    deployment that had just asked to be treated as hosted. A gate that decides
-    whether an anonymous caller may make this deployment send mail must not be
-    switchable by misspelling the knob that turns it on. Unset is not a
-    misspelling and is handled by the caller; here `""` reads as `on`, because
-    `KAIROS_TURNSTILE=` reads as an operator who set the variable and meant
-    something.
+    The fail-closed reading, and it is a direction #67's `reach.policy()` had to
+    choose *because of an incident*, not because it established a convention:
+    `settings.HOSTED` reads an unrecognised value as *off*, so `KAIROS_HOSTED=enabled`
+    quietly selected `open` reach on the deployment that had just asked to be treated
+    as hosted. That is a bug that was fixed, not a precedent to copy — and this
+    docstring should not tell a future reader that a bug is a pattern, because the
+    honest lesson is narrower: *a knob that decides whether an anonymous caller may
+    make this deployment send mail must not be switchable by misspelling the knob that
+    turns it on.* A gate is the case where the costs are least symmetric.
+
+    Unset is not a misspelling and is handled by the caller (`required()`).
+
+    **A blank value is unset, not `on`, and that is deliberate.** `parse_mode("")`
+    does return `on` — it is not in `_FALSE` — but `required()` never routes a
+    set-blank value here: it tests `if raw:` first, so `KAIROS_TURNSTILE=` and
+    `KAIROS_TURNSTILE="   "` are read as *unset* and fall through to
+    `KAIROS_HOSTED`. So on a self-hosted deployment the blank spelling reads **off**,
+    which is the opposite of what the `on` branch of this function would suggest.
+
+    That is still the safe direction, and worth being precise about why rather than
+    asserting it: blanking the variable out of a compose file is overwhelmingly an
+    operator removing the gate, not an operator enabling it under protest, and
+    `required()` returning `False` makes `boot_warnings()` emit the "the human check
+    is OFF" warning by name. The outcome is loud in every spelling. What this
+    docstring must not do is claim a reading the call graph does not implement.
     """
     # Only one spelling is a refusal, and it is the one that has to be spelled
     # exactly. Every other value — a listed true, a typo, a blank — is `on`.
@@ -244,8 +260,13 @@ def required() -> bool:
       * unset → **`on` when `KAIROS_HOSTED` is on or unrecognised, `off`
         otherwise.** Reusing the one switch that already means "a deployment we
         operate" rather than inventing a second notion of hosted-ness that could
-        disagree with it — `reach.policy()`'s argument. Unrecognised counts as
-        hosted here, for the reason `parse_mode` gives.
+        disagree with it. Unrecognised counts as hosted here, for the reason
+        `parse_mode` gives.
+
+      * **set but blank → treated as unset**, not as an opinion. `KAIROS_TURNSTILE=`
+        is what an operator writes when removing the gate from a compose file, so it
+        defers to `KAIROS_HOSTED`; on a self-hosted deployment that means off, loudly
+        (see `parse_mode` and `boot_warnings`).
     """
     if not _capability_mode():
         return False
@@ -431,7 +452,9 @@ def verify(request, form, *, action: str) -> Verdict:
 
       * **the form claims something** — a token is posted to `siteverify` with the
         secret, and only `success: true` plus a matching `action` (and hostname,
-        when configured) passes.
+        when configured) passes. `action` is compared against what siteverify
+        *reports*, never against anything sent in the request: the request has no
+        `action` parameter to send, because Cloudflare reads it from the token.
 
     **Fail closed on every other case**, and specifically on *not knowing*:
     Cloudflare unreachable, DNS failure, a 500, a body that is not JSON. That is a
@@ -461,7 +484,15 @@ def verify(request, form, *, action: str) -> Verdict:
     body = urlencode({
         "secret": secret(),
         "response": token,
-        "action": action,
+        # No `action` here, deliberately. Cloudflare's siteverify *request*
+        # parameters are `secret`, `response`, `remoteip` and `idempotency_key`;
+        # `action` is echoed from the token the widget minted, and sending it is
+        # silently ignored. An earlier version of this file sent it anyway, which
+        # implied the request binds the action when the real binding is entirely
+        # in the token — and a test asserted `sent["action"]`, which cemented the
+        # impression. The check below reads `payload["action"]`, which is the
+        # value that matters, and it is a real one: a token solved on the other
+        # form does not match.
     }).encode()
     headers = {
         "Accept": "application/json",
@@ -492,7 +523,18 @@ def verify(request, form, *, action: str) -> Verdict:
                              "The service that verifies the human check answered something Kairos "
                              "could not read, so")
 
-    if not payload.get("success"):
+    if payload.get("success") is not True:
+        # `is not True`, not a falsiness test, and the strictness is the point: this
+        # is the one predicate whose entire job is deciding whether a human check
+        # passed, and `if not payload.get("success")` accepts the JSON *string*
+        # `"false"` and the integer `1` as success — both truthy. Measured against a
+        # real siteverify socket, a payload of `{"success": "false"}` produced a 200
+        # and a created poll. Not exploitable today (Cloudflare answers a real
+        # boolean, the endpoint is not configurable, and TLS pins it), but the
+        # docstring above promises "only `success: true` passes" and this code did
+        # not keep that promise in the one place where a future upstream change, a
+        # proxy, or a test double would be felt.
+        #
         # Cloudflare's `error-codes` is the operator's diagnostic and is worth a
         # log line; `invalid-input-secret` in particular means the *secret* is
         # wrong, which no amount of retrying fixes.
@@ -542,8 +584,34 @@ def verify(request, form, *, action: str) -> Verdict:
     return Verdict(True, "verified")
 
 
-def disclosure() -> str:
-    """The `/privacy` paragraph for this deployment, or `""` when it needs none.
+class Disclosure(NamedTuple):
+    """The `/privacy` third-party paragraph as *text*, never as markup.
+
+    Two fields rather than one HTML string, and that is the whole design. The
+    paragraph is rendered by an autoescaping template (`select_autoescape` in
+    `kairos.templating`), so a string carrying `<strong>` arrives on the page as
+    literal angle brackets — which is what a browser-found bug in review caught on
+    this exact paragraph. The two available repairs were `|safe` or dropping the
+    emphasis, and `|safe` is the wrong one *here specifically*: this is the one page
+    whose entire purpose is truthfulness, and `|safe` there is a standing
+    invitation for someone to interpolate operator-controlled text into it later
+    (`KAIROS_LEGAL_EXTRA`, rendered escaped a few lines below on purpose).
+
+    So the emphasis is the template's, not this module's: it writes
+    `<strong>{{ turnstile.lead }}</strong> {{ turnstile.body }}` and both halves stay
+    escaped. That keeps the paragraph readable, keeps it honest, and means a future
+    edit that adds a variable here produces escaped punctuation rather than markup.
+    `test_the_disclosure_renders_as_markup_not_as_escaped_text` pins the rendering;
+    a test that greps for substrings that survive escaping is what let the bug
+    through.
+    """
+
+    lead: str
+    body: str
+
+
+def disclosure() -> Disclosure | None:
+    """The `/privacy` paragraph for this deployment, or `None` when it needs none.
 
     Obligation **P4**: "if Turnstile/analytics added, disclose". Rendered from
     `required()` at request time, so the page cannot claim the check is absent
@@ -565,19 +633,29 @@ def disclosure() -> str:
     "no analytics, no advertising" sentence plus "may set a cookie of its own to
     avoid asking twice", which is a statement about behaviour rather than a promise
     about a third party's internals.
+
+    The "may set a cookie of its own" clause and P1's cookie paragraph have to
+    agree, and did not at first: the cookie paragraph made a blanket "no third-party
+    cookies" claim that this sentence contradicts. P1 is now worded as the narrower
+    true thing — nothing loads from a third party until a button is pressed, which
+    is the *reason* no banner is needed — rather than as a promise about a third
+    party's cookie jar, which Kairos cannot observe.
     """
     if not required():
-        return ""
-    return (
-        "<strong>Human check (Cloudflare Turnstile).</strong> Creating a poll, and asking for a "
-        "new management link, are gated by Cloudflare Turnstile so this deployment cannot be used "
-        "to make a machine send mail to strangers. Nothing is loaded from Cloudflare until you "
-        "press the button that starts the check — opening either page contacts no third party at "
-        "all. After you press it your browser talks to "
-        "challenges.cloudflare.com, which necessarily sees your IP address and the page it "
-        "happened on, and the widget may set a cookie of its own to avoid asking twice. There is "
-        "no analytics, no advertising and no cross-site tracking, and because nothing loads "
-        "without your click no consent banner is required."
+        return None
+    return Disclosure(
+        lead="Human check (Cloudflare Turnstile).",
+        body=(
+            "Creating a poll, and asking for a new management link, are gated by Cloudflare "
+            "Turnstile so this deployment cannot be used to make a machine send mail to "
+            "strangers. Nothing is loaded from Cloudflare until you press the button that starts "
+            "the check — opening either page contacts no third party at all. After you press it "
+            "your browser talks to challenges.cloudflare.com, which necessarily sees your IP "
+            "address and the page it happened on, and the widget may set a cookie of its own to "
+            "avoid asking twice. There is no analytics, no advertising and no cross-site "
+            "tracking, and because nothing loads without your click no consent banner is "
+            "required."
+        ),
     )
 
 

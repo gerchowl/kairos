@@ -270,10 +270,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@main
-      - name: ADR gates (adr-matrix + ADR-0004/0007) via the pre-commit definitions
+      - name: ADR gates (adr-matrix + ADR-0004/0007 + static-js-parses) via the pre-commit definitions
         run: |
           nix develop -c bash -euo pipefail -c '
-            for g in adr-matrix adr-0004-stdlib-ics adr-0007-no-3p-shortener; do
+            for g in adr-matrix adr-0004-stdlib-ics adr-0007-no-3p-shortener static-js-parses; do
               echo "== $g =="; prek run "$g" --all-files
             done'
       - name: Secret scan (S4 — full history)

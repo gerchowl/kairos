@@ -13,10 +13,11 @@ and be false:
    when the gate is off — asserted by rendering it with and without the context key
    and comparing the two strings, not by reading the diff.
 2. **The config fails in the strict direction and says so.** An unrecognised
-   `KAIROS_TURNSTILE` reads as `on` (#67's `reach.policy()` precedent), a
+   `KAIROS_TURNSTILE` reads as `on` — the direction #67 was forced into while fixing
+   the `KAIROS_HOSTED=enabled` incident, not a convention it established — a
    `KAIROS_HOSTED` that reads unknown counts as hosted, and a gate that is on
-   without both keys **refuses to boot**. The worst outcome available here is a
-   gate that is off because a knob was misspelled.
+   without both keys **refuses to boot**. The worst outcome available here is a gate
+   that is off because a knob was misspelled.
 3. **The browser's claim is not the fact.** `success: true` from the *form* is
    refused; only a server-side `siteverify` POST decides, and it sends the secret.
    The action must match, so a token cannot cross between the two gated forms.
@@ -80,9 +81,13 @@ class FakeCloudflare:
     wrong secret is refused with `invalid-input-secret`, an unrecognised token with
     `invalid-input-response`, and an accepted token is **spent** — Cloudflare makes
     tokens single-use, and a replay therefore comes back as
-    `timeout-or-duplicate`. `action` and `hostname` are echoed from the request
-    unless pinned, so the action check is exercised by submitting the *other*
-    action rather than by a canned payload.
+    `timeout-or-duplicate`.
+
+    `action` is reported from the **token**, never echoed from the request, because
+    that is where Cloudflare reads it from: `action` is a siteverify *response* field
+    and not a request parameter, so a fake that echoed the request would have kept a
+    test passing for a binding that does not exist (it did, until review). `hostname`
+    is pinned the same way.
     """
 
     def __init__(self, *, accepts=(TOKEN, TOKEN2), secret=SECRET, action=None, hostname=None,
@@ -91,7 +96,9 @@ class FakeCloudflare:
         self.accepts = set(accepts)
         self.spent: set[str] = set()
         self.secret = secret
-        self.action = action
+        # The action the accepted tokens were *minted* for. Defaults to the creation
+        # form, so the common case is a token that legitimately matches.
+        self.action = action or turnstile.ACTION_NEW_POLL
         # `omit_action` reproduces Cloudflare's *testing* keys, which return no
         # action at all rather than echoing one.
         self.omit_action = omit_action
@@ -129,12 +136,33 @@ class FakeCloudflare:
             self.spent.add(form["response"])  # single use, as Cloudflare's is
             payload = {"success": True, "hostname": self.hostname}
             if not self.omit_action:
-                payload["action"] = self.action or form.get("action")
+                payload["action"] = self.action
         return Response(200, {"content-type": "application/json"},
                         json.dumps(payload).encode())
 
     def form(self, index=0) -> dict:
         return dict(parse_qsl(self.calls[index]["data"].decode()))
+
+
+class _Canned:
+    """A siteverify that answers one exact JSON payload, however malformed.
+
+    `FakeCloudflare` cannot express `success: "false"`, because it builds the
+    payload itself and would have to reproduce the very type confusion under test.
+    This one does not interpret anything, which is the point: it stands in for "the
+    verifier's answer is not what we expect", and Kairos must refuse every shape of
+    it rather than decide on truthiness.
+    """
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+        self.calls: list[dict] = []
+
+    def fetch(self, url, *, method="GET", data=None, headers=None, timeout=None):
+        self.calls.append({"url": url, "method": method, "data": data,
+                           "headers": headers or {}, "timeout": timeout})
+        return Response(200, {"content-type": "application/json"},
+                        json.dumps(self.payload).encode())
 
 
 # -- fixtures ---------------------------------------------------------------
@@ -390,6 +418,42 @@ def test_every_spelling_of_on_and_off_is_enumerated_not_guessed(monkeypatch, cap
     assert turnstile.mode_unknown() is False
 
 
+@pytest.mark.parametrize("blank", ["", " ", "   "])
+def test_a_blank_value_is_unset_not_an_opinion(monkeypatch, cap_mode, blank):
+    """The one place `parse_mode`'s `on`-for-everything rule does not apply.
+
+    `parse_mode("")` is `on` — `""` is not in `_FALSE` — but `required()` tests
+    `if raw:` *before* calling it, so a set-but-blank value is unset as far as the
+    call graph is concerned and defers to `KAIROS_HOSTED`. On a self-hosted
+    deployment that reads **off**.
+
+    Pinned because a docstring claimed the opposite, and a docstring that asserts a
+    reading the call graph does not implement is exactly what a future refactor
+    trusts. The *outcome* was never in doubt and is asserted here too: it is loud,
+    because `required()` being False is what makes `boot_warnings()` name the
+    ungated deployment.
+    """
+    monkeypatch.setenv("KAIROS_TURNSTILE", blank)
+    # `settings.HOSTED` is resolved at import, so it is patched rather than set in
+    # the environment — the pattern the hosted-matrix tests above already use.
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", False)
+    monkeypatch.delenv("KAIROS_TURNSTILE_SITE_KEY", raising=False)
+    monkeypatch.delenv("KAIROS_TURNSTILE_SECRET", raising=False)
+    assert turnstile.parse_mode(blank) == "on", "the pure function still says on"
+    assert turnstile.required() is False, "but the caller never asks it"
+    assert turnstile.mode_unknown() is False, "blank is not a misspelling"
+    warning = "\n".join(turnstile.boot_warnings())
+    assert "human check OFF" in warning, "so the ungated state must be named at boot"
+
+    # ...and the other way round, which is the direction that matters: blank on a
+    # deployment that *has* opted into being hosted still gets the gate.
+    monkeypatch.setattr(settings, "HOSTED", True)
+    monkeypatch.setenv("KAIROS_TURNSTILE_SITE_KEY", SITE_KEY)
+    monkeypatch.setenv("KAIROS_TURNSTILE_SECRET", SECRET)
+    assert turnstile.required() is True
+
+
 def test_a_gate_that_is_on_without_its_keys_refuses_to_boot(cap_mode, monkeypatch):
     """The `SESSION_SECRET` gate's shape, for the same reason.
 
@@ -508,7 +572,29 @@ def test_a_verified_token_is_the_only_thing_that_passes(cap_mode, gated):
     sent = gated.form()
     assert sent["secret"] == SECRET, "the siteverify POST must carry the secret"
     assert sent["response"] == TOKEN
-    assert sent["action"] == turnstile.ACTION_NEW_POLL
+
+
+def test_the_request_carries_no_action_parameter(cap_mode, gated):
+    """The binding is in the token, so the request must not pretend otherwise.
+
+    `action` is a siteverify *response* field: Cloudflare's documented request
+    parameters are `secret`, `response`, `remoteip` and `idempotency_key`. An earlier
+    version of this file sent `action` anyway and this module's test asserted it,
+    which read as "the request binds the action" — a claim that is not true, on the
+    one control whose soundness is entirely about binding.
+
+    Asserted as an absence on purpose. The positive property it replaced (that the
+    right action was sent) was not a property at all.
+    """
+    turnstile.verify(_request(), {turnstile.RESPONSE_FIELD: TOKEN},
+                     action=turnstile.ACTION_NEW_POLL)
+    sent = gated.form()
+    assert "action" not in sent, "action is response-only; sending it is dead input"
+    # ...and the check is nonetheless real, because the token carries the action and
+    # the answer is compared against it.
+    gated.action = turnstile.ACTION_MANAGE_LINK
+    assert turnstile.verify(_request(), {turnstile.RESPONSE_FIELD: TOKEN2},
+                            action=turnstile.ACTION_NEW_POLL).reason == "action-mismatch"
 
 
 def test_remoteip_is_deliberately_not_sent(cap_mode, gated):
@@ -554,6 +640,35 @@ def test_a_token_that_has_been_spent_is_refused(monkeypatch, cap_mode, gated):
     second = turnstile.verify(_request(), form, action=turnstile.ACTION_NEW_POLL)
     assert second.ok is False
     assert "timeout-or-duplicate" in second.reason
+
+
+@pytest.mark.parametrize("success", ["false", "no", "False", 1, "true", 0, [], {}, None])
+def test_only_a_real_boolean_true_is_a_success(monkeypatch, cap_mode, success):
+    """The gate's one predicate, tested for *type* as well as for value.
+
+    `verify()`'s docstring says it accepts only `success: true`, and until review
+    the code did not: `if not payload.get("success")` is a falsiness test, so the
+    JSON string `"false"` — and `"no"`, and the integer `1` — all read as a passed
+    human check. Measured against a real siteverify socket, `{"success": "false"}`
+    produced a 200 and a created poll.
+
+    Not exploitable today: Cloudflare answers a real boolean, `SITEVERIFY_URL` is
+    deliberately not configurable, and TLS pins the endpoint. It is still the one
+    predicate whose entire job is strictness, and this is the shape a future upstream
+    change, an intercepting proxy, or a hand-written test double would take. The
+    trailing `1` is the nastier half — it is truthy *and* reads as "yes" to a human
+    skimming the code, which is why `is not True` is the fix and not a cast.
+    """
+    monkeypatch.setenv("KAIROS_TURNSTILE", "on")
+    monkeypatch.setenv("KAIROS_TURNSTILE_SITE_KEY", SITE_KEY)
+    monkeypatch.setenv("KAIROS_TURNSTILE_SECRET", SECRET)
+    payload = {"success": success, "action": turnstile.ACTION_NEW_POLL,
+               "hostname": "kairos.example.org"}
+    monkeypatch.setattr(turnstile, "http", _Canned(payload))
+    verdict = turnstile.verify(_request(), {turnstile.RESPONSE_FIELD: TOKEN},
+                               action=turnstile.ACTION_NEW_POLL)
+    assert verdict.ok is False, f"success={success!r} was accepted as a human check"
+    assert verdict.detail, "and it refused with a sentence a creator can act on"
 
 
 def test_a_token_that_carries_no_action_is_refused(monkeypatch, cap_mode, gated):
@@ -789,9 +904,34 @@ def test_the_re_link_form_mails_once_the_check_passes(live, gated):
     assert _new(live, **{turnstile.RESPONSE_FIELD: TOKEN}).status_code == 200
     live.reset_mail()
 
+    # A token minted for the *creation* form does not pass here, which is the whole
+    # point of the two actions — so the visitor solves the check again on this form and
+    # Cloudflare mints a token carrying this form's action.
+    gated.action = turnstile.ACTION_MANAGE_LINK
     assert _link(live, "ada@example.org",
                  **{turnstile.RESPONSE_FIELD: TOKEN2}).status_code == 200
     assert len(live.relay.sent) == 1
+
+
+def test_a_creation_token_cannot_be_replayed_at_the_re_link_form(live, gated):
+    """The property the two actions buy, asserted through the *route* rather than
+    through `verify()`.
+
+    This is not hypothetical and it is not new: the test fake used to echo `action`
+    out of the request, so it answered whatever action the route asked for and this
+    cross-form replay passed. With `action` read from the token — as Cloudflare reads
+    it — the route refuses it. The binding is real; the fake had been agreeing with
+    the route instead of with Cloudflare.
+    """
+    assert _new(live, **{turnstile.RESPONSE_FIELD: TOKEN}).status_code == 200
+    live.reset_mail()
+
+    # `gated.action` is still the creation form: TOKEN was minted for it.
+    assert gated.action == turnstile.ACTION_NEW_POLL
+    refused = _link(live, "ada@example.org", **{turnstile.RESPONSE_FIELD: TOKEN2})
+    assert refused.status_code == 400
+    assert live.relay.sent == [], "no mail on a cross-form replay"
+    assert "different form" in refused.text
 
 
 def test_a_verified_creator_is_not_asked_to_prove_it_again(live, gated):
@@ -1053,10 +1193,59 @@ def test_privacy_names_the_third_party_only_where_there_is_one(monkeypatch, cap_
         gated_privacy = client.get("/scheduler/privacy").text
     assert "challenges.cloudflare.com" in gated_privacy
     assert "Nothing is loaded from Cloudflare until you press the button" in gated_privacy
-    # P1 survives because the facade is unconditional: the sentence is the same one
-    # the page has always carried, not a weakened version of it.
-    assert "No tracking, no analytics, no third-party cookies; therefore no consent " \
-           "banner is required." in gated_privacy
+    # P1 survives because the facade is unconditional. The sentence is now the
+    # narrower true claim (nothing loads from a third party until a button is
+    # pressed) rather than a blanket "no third-party cookies", which the paragraph
+    # below it contradicts: it says the widget *may* set one. P1's no-consent
+    # conclusion is unchanged and keeps its reason — the wording changed so the page
+    # stops making two adjacent claims that cannot both be true.
+    assert "no third-party cookie is set unless you press a button" in gated_privacy
+    assert "which is why no consent banner is required." in gated_privacy
+    assert "no third-party cookies" not in gated_privacy, \
+        "the blanket claim contradicts the widget paragraph below it"
+
+
+def test_the_disclosure_renders_as_markup_not_as_escaped_text(monkeypatch, cap_mode):
+    """The rendered paragraph, asserted as HTML — the thing the old test could not see.
+
+    Every other assertion about this paragraph greps for substrings that survive
+    escaping, which is precisely why a browser-found bug went unnoticed: with
+    `{{ turnstile }}` under `select_autoescape`, every one of them still passed
+    while the page showed visitors literal `&lt;strong&gt;` inside the legal text.
+
+    So this asserts the *tags*: real `<strong>` around the lead, the whole sentence
+    in one `<p>`, and not one escaped angle bracket anywhere in the paragraph.
+    """
+    monkeypatch.setattr(settings, "OPERATOR", "Example Lab")
+    monkeypatch.setenv("KAIROS_TURNSTILE", "on")
+    monkeypatch.setenv("KAIROS_TURNSTILE_SITE_KEY", SITE_KEY)
+    monkeypatch.setenv("KAIROS_TURNSTILE_SECRET", SECRET)
+    with TestClient(main.create_app(), base_url="https://testserver") as client:
+        page = client.get("/scheduler/privacy").text
+
+    paragraph = re.search(r"<p><strong>Human check \(Cloudflare Turnstile\)\.</strong>(.*?)</p>",
+                          page, re.S)
+    assert paragraph, "the disclosure paragraph is missing or its emphasis is not real markup"
+
+    # The whole disclosure, as one rendered paragraph: lead in tags, body as text.
+    assert "&lt;" not in paragraph.group(0) and "&gt;" not in paragraph.group(0), \
+        "the paragraph is escaped — visitors are reading angle brackets"
+    assert "&amp;" not in paragraph.group(0)
+    assert paragraph.group(1).startswith(" Creating a poll")
+    for fragment in ("gated by Cloudflare Turnstile",
+                     "Nothing is loaded from Cloudflare until you press the button",
+                     "may set a cookie of its own",
+                     "no consent banner is required"):
+        assert fragment in paragraph.group(0), f"missing from the rendered paragraph: {fragment}"
+    # And no `|safe` was the answer: the page must still carry no unescaped
+    # operator-supplied text, so the filter is checked for by name rather than
+    # trusted. Jinja comments are stripped first — this file's own comment in the
+    # template explains *why* there is no `|safe`, and a check that could not tell a
+    # mention from a use would have to be deleted instead of fixed.
+    template = (SRC / "templates" / "legal_privacy.html").read_text()
+    without_comments = re.sub(r"{#.*?#}", "", template, flags=re.S)
+    assert "|safe" not in without_comments
+    assert "|safe" in template, "the reasoning for its absence belongs next to it"
 
 
 def test_the_facade_loads_nothing_until_it_is_asked(live, gated):

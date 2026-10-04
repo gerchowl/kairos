@@ -527,20 +527,60 @@ not send.**
     budget measured at a 1.11× effect elsewhere in this repo, and eviction by address
     rotation is not the axis that matters — the axis is one attacker aiming many
     requests at *one* victim.
-14. **A per-address cooldown was considered and rejected**, because it is the
-    control that actually matches the threat and it fails *silently*: a creator with
-    ten polls asking twice in a day would be mailed nothing, and the response body
-    may not differ from a miss. Trading a visible failure for an invisible one on the
-    recovery path is the wrong trade; a ceiling the attacker cannot pass and the
-    owner can is better than a quota that protects both by punishing the second.
-15. **A verified creator is exempt** (`session_verifies_creator`, read off the live
-    capability cookie). They are already proof-of-human for this deployment and the
-    recovery path is where a stressed person is. Note what it does *not* allow: the
-    exemption cannot be obtained without having received a manage mail, so a
-    first-time attacker still faces the check; what it does allow is a *verified*
-    creator posting a victim's address, which is one nuisance mail per `send`-budget
-    window, bounded and rate-limited. That is the price of not making a creator
-    re-prove themselves to recover a link they legitimately lost.
+14. **A per-address cooldown ships, and it answers.** It was rejected in the first
+    review round and that rejection was **half right**: it is the control that
+    actually matches the threat, and the objection to it — that it fails *silently* —
+    is correct. A creator with ten polls asking twice in a day would be mailed
+    nothing, and because the body may not differ from a miss, they would be told
+    nothing either. On a recovery path that is indistinguishable from a broken
+    deployment. So the conclusion was wrong and the reasoning was the fix: the
+    cooldown now returns **its own visible answer** ("you already asked for a link
+    for this address in the last hour… check your inbox"), which preserves the
+    anti-timing property, never fails invisibly on a real creator's recovery path,
+    and still stops the 200-mail case. `LINK_REQUEST_COOLDOWN_SECONDS` is an hour.
+
+    Two design points make that answer safe to give:
+
+    * **It is recorded on every named request, hit or miss.** Recording only on send
+      would turn two requests into a membership test for "does this person poll
+      here" — a strictly worse leak than the one #30's identical answer exists to
+      prevent. Recorded unconditionally, the second ask reads the same either way,
+      so the oracle property survives the control added to protect it. The cost is
+      that the message cannot claim a link *was* sent (for a miss none was), so it
+      says a request was handled and tells the reader to check their inbox — a
+      message claiming "already sent" would be false to a creator who mistyped.
+    * **It is checked after the human check, and applies to verified creators.**
+      Before the check, "post the victim's address and fail Turnstile" would lock a
+      real creator out of their own recovery path for an hour, needing no solve and
+      no account — the cheapest denial of service on the surface. After the check,
+      only a request allowed to send at all can consume the window.
+
+15. **A verified creator is exempt from the check** (`session_verifies_creator`, read
+    off the live capability cookie). They are already proof-of-human for this
+    deployment and the recovery path is where a stressed person is. Note what it does
+    *not* allow: the exemption cannot be obtained without having received a manage
+    mail, so a first-time attacker still faces the check.
+
+    **What it does allow is the case item 14 exists for.** Measured, before the
+    cooldown: a verified creator posting a victim's address produced
+
+    | posts | siteverify solves | nuisance mails at the victim |
+    |---|---|---|
+    | 1 | 0 | 10 |
+    | 5 | 0 | 50 |
+    | 20 | 0 | 200 |
+
+    Zero solves, because the gate that would have charged one per request is exactly
+    the gate a verified creator skips — so the cooldown is placed *after* the
+    exemption, not behind it, and covers everyone. **The residual, stated where the
+    rest of this file's residual risk lives: the fan-out is
+    `MAX_LINKS_PER_REQUEST` (10) mails per request, so the bound is 10 nuisance mails
+    per victim address per hour, not one** — and the ten polls that make it 10 can be
+    planted for a victim address through `POST /api/polls` with no human check at all,
+    by design (agent-first, ADR-0010), so an attacker's real cost is one solve per ten
+    mails at one inbox. That multiplier is the honest shape of what is left, and it is
+    why the next thing worth building is a two-step confirmation on this route rather
+    than a stricter gate on the requester.
 
 ### Still not established
 

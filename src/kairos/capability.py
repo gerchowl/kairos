@@ -130,6 +130,7 @@ refuses to boot and lands nowhere else.
 import logging
 import os
 import secrets
+import threading
 import time
 from itertools import islice
 
@@ -250,6 +251,125 @@ MAX_LINKS_PER_REQUEST = 10
 # than by the attacker, and `KAIROS_RATE_LIMIT=on` — which boot already insists on
 # for this mode — puts a ceiling on it.
 LINK_REQUEST_FLOOR_SECONDS = 0.3
+
+# How long one address is left alone after asking for a link — the per-address
+# cooldown #31's review asked for, and the control that covers the exemption below.
+#
+# **The measurement that produced it.** A *verified* creator never reaches the
+# Turnstile gate (`session_verifies_creator`), so with shipped defaults — and
+# `KAIROS_RATE_LIMIT` defaults off — nothing bounded repetition on this route:
+#
+#     attacker is a verified creator; manage_verified_at = set
+#       1 POST /manage/link -> siteverify solves=0  nuisance mails to the victim=10
+#       5 POST /manage/link -> siteverify solves=0  nuisance mails to the victim=50
+#      20 POST /manage/link -> siteverify solves=0  nuisance mails to the victim=200
+#
+# Zero solves, because the gate that would have charged one per request is exactly
+# the gate a verified creator skips. The `10` is `MAX_LINKS_PER_REQUEST` — one post
+# fans out to ten polls on the address, so the multiplier is *ten nuisance mails per
+# request*, not one. And the ten polls can be planted for a victim address through
+# `POST /api/polls` with no human check at all, by design (agent-first, ADR-0010), so
+# the real cost to an attacker is one solve per ten mails at one inbox. **So the
+# residual after this cooldown is a 10x fan-out, once per hour per victim address** —
+# stated here, and in `docs/design/multitenancy-hosting.md` where the rest of the
+# residual risk is recorded, because a multiplier that lives only in a code comment
+# is a multiplier nobody plans around.
+#
+# **Why an hour.** Long enough that a creator who lost a link has their inbox back
+# before the page tells them to wait, and short enough that it is not a quota: the
+# legitimate pattern is one lost link, not ten requests in a minute.
+#
+# **Why it is keyed on the *target address*, not the caller.** The threat is one
+# attacker aiming many requests at one victim, so a caller-keyed budget is exactly
+# the wrong axis — it would bound the attacker's own throughput without bounding
+# anything the victim receives. Keying on the victim is what turns "unbounded" into
+# "10 an hour". A per-caller budget is still the right thing and is still
+# `KAIROS_RATE_LIMIT`'s `send` rule; this is the axis that rule does not cover.
+LINK_REQUEST_COOLDOWN_SECONDS = 3600
+
+# Cap on distinct addresses held in the cooldown map, for the reason
+# `ratelimit.MAX_BUCKETS` exists: the keyspace is attacker-chosen, so an unbounded
+# dict is a memory target. Eviction is oldest-first, which is the right victim — the
+# entries nearest expiry are the ones whose loss costs nothing.
+LINK_COOLDOWN_BUCKETS = 50_000
+
+# In-process on purpose, and for the same stated reason as `ratelimit`: SQLite is
+# one writer (#36) and a row written per re-link request would contend with poll
+# writes for the thing that is already the bottleneck. The honest costs, which are
+# `ratelimit`'s costs and are restated rather than inherited silently:
+#
+#   * **per-process**, so N app instances give an attacker N x the budget;
+#   * **lost on restart**, so a redeploy resets every victim's window;
+#   * **not shared** across instances, so the same address can be asked once per
+#     instance per hour rather than once per hour.
+#
+# #36's revisit trigger ("more than one app instance") is the trigger for moving
+# this next to the limiter's counter store. The seam is these three functions.
+_link_cooldowns: dict[str, float] = {}
+_link_cooldown_lock = threading.Lock()
+
+
+def link_cooldown_left(email: str) -> int:
+    """Seconds left on `email`'s re-link cooldown; 0 when it may send now.
+
+    The key is the *normalised* address (`valid_email`) — deliberately the same string
+    `list_polls_by_creator_email` matches on, and the same one `db.create_poll` stores,
+    because that identity is the property that matters: **a cooldown can never be
+    evaded for any set of rows the lookup would return.** A key derived any other way
+    would leave a spelling that reaches a victim's polls without reaching their
+    cooldown.
+
+    What normalisation does *not* fold is stated rather than glossed, because "one
+    cooldown per mailbox" is a claim this layer cannot make:
+
+      * the **local part's case** survives (`Victim@example.org` is a distinct key), and
+      * **plus-addressing** survives (`victim+1@example.org` is a distinct key).
+
+    Neither is a bypass here, and the reason is worth being explicit about: those
+    spellings are also distinct keys at the *lookup*, so they match no polls and mail
+    nothing at all. The residual is the reverse of an attack — a creator who has two
+    poll sets under two spellings waits one window per spelling. Closing the gap would
+    mean a confirmation step on the mailbox, which is #68's to own.
+    """
+    now = time.monotonic()
+    with _link_cooldown_lock:
+        until = _link_cooldowns.get(email)
+        if until is None:
+            return 0
+        remaining = until - now
+        if remaining <= 0:
+            del _link_cooldowns[email]
+            return 0
+        return int(remaining)
+
+
+def record_link_request(email: str) -> None:
+    """Note that `email` was asked for, starting its cooldown. **Hit or miss.**
+
+    Recording unconditionally is the whole trick, and it is what keeps this from
+    becoming an address oracle — the property #30 built this route's answer around.
+
+    If the cooldown were recorded only when a link actually went out, then asking
+    twice would distinguish the two cases exactly: "a link was already sent" for an
+    address with polls, and the ordinary page for one without, which is a membership
+    test for "does this person poll here". Recorded on *every* named request, the
+    second ask gets the same cooldown answer whether or not anything matched, so the
+    anti-enumeration property survives the control that was added to protect it.
+
+    The cost is that the cooldown message cannot claim a link was sent, because for a
+    miss none was. So it says what is true in both cases — *we already handled a
+    request for this address* — and tells the reader to check their inbox. A message
+    that said "already sent" would be false to a creator who mistyped their address,
+    and this page is the wrong place for that.
+    """
+    now = time.monotonic()
+    with _link_cooldown_lock:
+        if len(_link_cooldowns) >= LINK_COOLDOWN_BUCKETS:
+            for key, until in sorted(_link_cooldowns.items(), key=lambda kv: kv[1])[
+                    :len(_link_cooldowns) // 2]:
+                if until > now:
+                    del _link_cooldowns[key]
+        _link_cooldowns[email] = now + LINK_REQUEST_COOLDOWN_SECONDS
 
 # Slots one anonymous accountless creation may insert. Sized above any real
 # meeting (a full week of 15-minute slots over a 12-hour day is ~576) and below
@@ -630,13 +750,51 @@ def _hold_for(floor_seconds: float, started: float) -> None:
 # -- Pages ------------------------------------------------------------------
 
 
+LINK_COOLDOWN_HEADING = "Already asked in the last hour"
+
+LINK_COOLDOWN_DETAIL = (
+    "You already asked for a link for this address in the last hour, so nothing was sent this "
+    "time. If that address created a poll here, the link from that earlier request is on its way "
+    "— it works once, so open it and keep it. You can ask again once an hour has passed. Asking "
+    "again sooner cannot make it arrive sooner."
+)
+
+
+def _link_cooldown_page(request: Request):
+    """The visible answer to a second request inside `LINK_REQUEST_COOLDOWN_SECONDS`.
+
+    **This is the fix #31's review asked for, and its whole point is that it is not
+    silent.** A per-address cooldown was rejected in the first review round because it
+    fails *quietly*: a creator who asks twice is mailed nothing and told nothing, which on
+    a recovery path is indistinguishable from a broken deployment. So the second ask gets
+    its own heading and its own sentence, saying what happened and what to do.
+
+    Three properties, each of which is a test:
+
+      * **It is not an address oracle.** The answer is the same whether or not the address
+        matched, because `record_link_request` notes every named request
+        (`LINK_REQUEST_COOLDOWN_SECONDS` explains why that matters more than the phrasing
+        does). Two asks still cannot tell you who polls here.
+      * **It is not an error.** 200, not 429 or 400: asking twice is a thing people do, and
+        a red page for it would read as a fault rather than as an answer.
+      * **It is true for a miss too.** It says a request was handled, not that a link was
+        sent — `record_link_request`'s docstring is the reason, and the difference is the
+        difference between a cooldown and a false statement to a creator who mistyped.
+
+    It is held to `LINK_REQUEST_FLOOR_SECONDS` like every other answer on this route, so
+    taking this branch is not itself a timing oracle: the fast path here is fast for a hit
+    and for a miss alike.
+    """
+    return _link_page(request, LINK_COOLDOWN_HEADING, LINK_COOLDOWN_DETAIL)
+
+
 def _mail_note() -> str:
     """Why outbound mail is unusable here, in the operator's terms.
 
      `sender_refusal()` rather than a generic "mail is off", because the two
      problems have different fixes (#48's M1 identity gate versus a missing SMTP
-    _HOST) and an operator sent to the wrong knob wastes an afternoon.
-    """
+     _HOST) and an operator sent to the wrong knob wastes an afternoon.
+     """
     if is_configured():
         return ""
     refusal = sender_refusal()
@@ -848,11 +1006,24 @@ def request_link(request: Request, form=Depends(form_data)):
     Turnstile is the answer for the same reason it is the answer on `/new`: the
     per-IP budget was measured at a 1.11x effect elsewhere in this repo, and
     evasion by address rotation is not the problem here anyway — the axis that
-    matters is one attacker aiming many requests at *one* victim, which an
-    address-keyed budget stops at the cost of silently mailing nothing to a real
-    creator who asks twice (and saying so nowhere, because the body may not
-    differ). A per-address cooldown was considered and rejected for exactly that
-    reason.
+    matters is one attacker aiming many requests at *one* victim, which is what
+    `LINK_REQUEST_COOLDOWN_SECONDS` is keyed on.
+
+    **And the cooldown that was rejected is now here, because the objection to it was
+    right and the conclusion was not.** A per-address cooldown does stop the fan-out,
+    and it was rejected for failing *silently*: a creator who asks twice was mailed
+    nothing and told nothing, which on a recovery path is indistinguishable from a
+    broken deployment. So it ships **answering** — a distinct heading and a sentence
+    saying a request for that address was already handled in the last hour and to
+    check the inbox (`_link_cooldown_page`). It is recorded on every named request so
+    the cooldown answer is identical whether or not anything matched, which keeps this
+    route's anti-enumeration property intact; and it sits *after* the human check, so a
+    refused request cannot lock a real creator out of their own recovery path.
+
+    **The exemption below is the reason it exists.** A verified creator never reaches
+    the gate, so nothing bounded repetition here: measured, 1/5/20 posts from a verified
+    creator produced 10/50/200 nuisance mails at one victim inbox with zero siteverify
+    solves. The cooldown applies to everyone, checked after the exemption.
 
     The price, stated because it is real: the recovery path now depends on a third
     party being reachable. That is the same trade the creation path makes, it is
@@ -864,11 +1035,12 @@ def request_link(request: Request, form=Depends(form_data)):
     already proof-of-human for this deployment, and asking again is friction with
     no security gain. Note what that does *not* allow: the exemption is read off a
     live capability, and one cannot be obtained without having received a manage
-    mail — so an attacker's first request still faces the check. What it does
-    allow is a *verified* creator posting a victim's address, which is one nuisance
-    mail per `send`-budget window, bounded and rate-limited, and is the price of
-    not making a creator re-prove themselves to recover a link they legitimately
-    lost.
+    mail — so an attacker's first request still faces the check. What it *does* allow
+    is a verified creator posting a victim's address, and that is precisely what the
+    cooldown above bounds: it applies *after* this exemption, so the answer is
+    `LINK_REQUEST_COOLDOWN_SECONDS` of `MAX_LINKS_PER_REQUEST` nuisance mails per
+    victim address per hour, rather than one per request — the price of not making a
+    creator re-prove themselves to recover a link they legitimately lost.
     """
     _require_enabled()
     if not is_configured():
@@ -889,6 +1061,26 @@ def request_link(request: Request, form=Depends(form_data)):
     started = time.monotonic()
     email = valid_email(form.get("email", ""))
     if email:
+        # The per-address cooldown, and it sits **after** the human check for a
+        # reason worth stating: a request that never passed the check must not be
+        # able to start a victim's cooldown, or "fail Turnstile for an hour" becomes a
+        # denial of service against a real creator's recovery path — an attacker
+        # would not need a solve, an account or even a matching address to lock a
+        # victim out for the window. Placing it after `verify` means only a request
+        # that was allowed to send at all can consume the window.
+        #
+        # It is here, and not behind `session_verifies_creator`, because the
+        # exemption is the gap: a verified creator skips the check entirely, so a
+        # cooldown that only applied to the checked path would not have bounded the
+        # measured case at all. It applies to everyone, which is what makes it the
+        # control for the exemption rather than a companion to the check.
+        left = link_cooldown_left(email)
+        if left:
+            log.info("re-link request suppressed by the per-address cooldown "
+                     "(%ss left, address not logged)", left)
+            _hold_for(LINK_REQUEST_FLOOR_SECONDS, started)
+            return _link_cooldown_page(request)
+        record_link_request(email)
         # Filter, then cap — never cap, then filter. `list_polls_by_creator_email`
         # is newest-first and every poll minted after #29 has a token, so slicing
         # first meant a creator with ten recent polls and one older poll (a pre-#29

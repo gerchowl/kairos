@@ -178,6 +178,16 @@ and a deployment that turns it on without both keys **refuses to boot**.
 > **Do not use Cloudflare's public *testing* keys here.** They are the obvious way to
 > try this locally, and they cannot work: `1x…AA` verifies *any* token string and
 > reports no `action`, so the check is decorative *and* every submission is refused.
+
+> **These variables must be added to the container, not just to `.env`.** The shipped
+> `compose.yaml` passes exactly four `KAIROS_*` variables and has no `env_file:`, so
+> `KAIROS_TURNSTILE`, its two keys, `KAIROS_HOSTED` and `KAIROS_AUTH` do **not** reach
+> the app unless you put them in the `kairos` service's `environment:` yourself — the
+> same way `compose.proxy.yaml` and `compose.oidc.yaml` add theirs. The trap is that
+> `podman compose` reads `.env` for *interpolation* (`${KAIROS_TURNSTILE:-}`), which
+> only substitutes values already listed under `environment:`; a key that exists in
+> `.env` and nowhere else is silently dropped. If you would rather pass everything
+> through, add `env_file: .env` to the service instead.
 > Boot says so explicitly if it sees one.
 
 **No mail to strangers before the creator has opened their link (A2).** Nobody may
@@ -236,9 +246,9 @@ it is about to send as. **[`docs/design/mail-auth.md`](docs/design/mail-auth.md)
 exact records, the staged `p=none` → `quarantine` → `reject` plan, and how to verify
 them.**
 
-> **Cookie note for operators:** Kairos sets only strictly-necessary cookies (session, signed response-edit token, theme preference) — disclosed on `/privacy`, no consent banner required (ePrivacy Art. 5(3) / Swiss TCA 45c exemptions). If you add analytics or any third-party embeds to your deployment, that changes — you'll need consent management.
+> **Cookie note for operators:** Kairos itself sets only strictly-necessary cookies (session, signed response-edit token, theme preference) — disclosed on `/privacy`, no consent banner required (ePrivacy Art. 5(3) / Swiss TCA 45c exemptions). If you add analytics or any third-party embeds to your deployment, that changes — you'll need consent management.
 >
-> **If you turn on `KAIROS_TURNSTILE`:** `/privacy` gains a third-party paragraph naming Cloudflare, and it is still true that no consent banner is required — because Kairos embeds the widget **behind a click-to-load facade**, so nothing is fetched from Cloudflare until the visitor presses the button. There is deliberately no setting to load it eagerly; if you proxy or rewrite Kairos to do that yourself, this exemption no longer applies to you and you need consent management.
+> **If you turn on `KAIROS_TURNSTILE`:** `/privacy` gains a third-party paragraph naming Cloudflare, and it is still true that no consent banner is required — because Kairos embeds the widget **behind a click-to-load facade**, so nothing is fetched from Cloudflare until the visitor presses the button. After that click the widget may set a cookie of its own, which is why `/privacy` says "no third-party cookie is set unless you press a button that says so" rather than claiming Kairos sets none. There is deliberately no setting to load it eagerly; if you proxy or rewrite Kairos to do that yourself, this exemption no longer applies to you and you need consent management.
 
 ## Rate limiting (optional)
 

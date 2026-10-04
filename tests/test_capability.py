@@ -1147,6 +1147,196 @@ def test_the_re_link_request_is_capped_per_post(console):
     assert len(live.relay.sent) == capability.MAX_LINKS_PER_REQUEST
 
 
+# -- the per-address re-link cooldown (#31 review) ---------------------------
+
+
+class _OffsetClock:
+    """A `time` stand-in for the `capability` module, offset rather than replaced.
+
+    `monkeypatch.setattr(time, "monotonic", ...)` would move every window in the
+    process — the rate limiter's, the link floor's, this cooldown's — because the `time`
+    module is one shared object. Shimming the name `capability` actually binds keeps the
+    offset local to the code under test. `sleep` passes through, so `_hold_for` still
+    really holds.
+    """
+
+    def __init__(self, offset: float):
+        self.offset = offset
+
+    def monotonic(self) -> float:
+        return time.monotonic() + self.offset
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+def test_a_second_request_in_the_window_is_answered_not_silently_dropped(console):
+    """The fix, stated as the failure it removes: the second ask must *say* something.
+
+    A per-address cooldown was rejected in the first review round because it fails
+    silently — a creator who asks twice is mailed nothing and told nothing, and on a
+    recovery path that is indistinguishable from a broken deployment. So this asserts
+    both halves of the contract: nothing is sent, and the page says so in its own
+    heading rather than repeating "check your inbox" over an empty inbox.
+    """
+    live = console
+    live.client.cookies.clear()
+    live.reset_mail()
+
+    first = live.link("ada@example.org")
+    assert first.status_code == 200
+    assert "Check your inbox" in first.text
+    assert len(live.relay.sent) == 1
+
+    live.reset_mail()
+    second = live.link("ada@example.org")
+    assert live.relay.sent == [], "the cooldown must actually suppress the mail"
+    assert second.status_code == 200, "not an error: asking twice is a thing people do"
+    assert capability.LINK_COOLDOWN_HEADING in second.text, "and it must be visible"
+    assert "Already asked" in second.text
+    assert "in the last hour" in second.text
+    assert "Check your inbox" not in second.text, "and distinct from the ordinary answer"
+
+
+def test_the_cooldown_covers_the_verified_creator_exemption(live):
+    """The measured attack, asserted as the control that stops it.
+
+    A verified creator skips Turnstile entirely, so a cooldown placed behind the check
+    would not bound this case at all. Measured before it existed: 1/5/20 posts from a
+    verified creator produced 10/50/200 nuisance mails at one victim inbox with **zero**
+    siteverify solves, because the gate that would have charged one per request is exactly
+    the gate a verified creator skips.
+    """
+    live.create()
+    poll = live.poll()
+    _open(live, poll["admin_token"])
+    assert db.get_poll(poll["id"])["manage_verified_at"] is not None, \
+        "precondition: the exchange verified this poll, so its creator is exempt"
+
+    for i in range(3):
+        db.create_poll(
+            capability.anonymous_creator_id(), f"V{i}", None, "full_day", "UTC",
+            [{"date": "2026-12-01"}], creator_email="victim@example.org",
+        )
+    live.reset_mail()
+
+    first = live.link("victim@example.org")
+    assert "Check your inbox" in first.text
+    assert len(live.relay.sent) == 3, "the fan-out is still MAX_LINKS_PER_REQUEST"
+
+    live.reset_mail()
+    for _ in range(2):
+        assert capability.LINK_COOLDOWN_HEADING in live.link("victim@example.org").text
+    assert live.relay.sent == [], "the window stops the next two posts entirely"
+
+
+def test_the_cooldown_is_not_an_address_oracle(console):
+    """The property #30 built this route's answer around, surviving the control added
+    to protect it.
+
+    Recorded on *every* named request rather than only on one that matched, so the
+    second ask cannot distinguish an address with polls from one without. The obvious
+    implementation — record on send — would turn two requests into a membership test for
+    "does this person poll here", which is a strictly worse leak than the one the
+    identical answer was built to prevent.
+    """
+    live = console
+    live.client.cookies.clear()
+
+    live.link("ada@example.org")          # matches: polls exist
+    live.link("nobody@example.org")       # matches nothing
+    hit_second = live.link("ada@example.org")
+    miss_second = live.link("nobody@example.org")
+
+    assert hit_second.status_code == miss_second.status_code == 200
+    assert _without_csrf_tokens(hit_second.text) == _without_csrf_tokens(miss_second.text), \
+        "the cooldown answer must not depend on whether the address matched"
+
+
+def test_a_request_that_fails_the_human_check_cannot_start_someone_elses_cooldown(live,
+                                                                                 monkeypatch):
+    """Placement, as a denial-of-service property.
+
+    The cooldown is checked *after* Turnstile, so a request that was never allowed to
+    send cannot consume a real creator's window. If it were checked first, "post the
+    victim's address and fail the check" would lock a legitimate creator out of their
+    own recovery path for an hour — needing no solve, no account, and no matching
+    address, which would be the cheapest denial of service on the whole surface.
+
+    `live`, not `console`: the console fixture is a *verified* creator, who is exempt
+    from the check entirely, so it would never reach the branch this is about.
+    """
+    from kairos import turnstile
+
+    refused = turnstile.Verdict(False, "absent", "Human check missing", "no token")
+    monkeypatch.setattr(turnstile, "required", lambda: True)
+    monkeypatch.setattr(capability, "verify_human", lambda request, form, *, action: refused)
+
+    response = live.link("ada@example.org")
+    assert response.status_code == 400
+    assert "Human check missing" in response.text
+    assert capability.link_cooldown_left("ada@example.org") == 0, \
+        "a refused request must not have started the window"
+
+
+def test_the_cooldown_is_per_address_and_expires(console, monkeypatch):
+    """Two properties in one, because they are the same mechanism: the window is keyed
+    on the address (so one creator's second ask cannot delay another's first) and it is
+    a window rather than a lockout (so the control is not a quota on recovery)."""
+    live = console
+    live.client.cookies.clear()
+
+    assert live.link("ada@example.org").status_code == 200
+    assert live.link("ada@example.org").status_code == 200
+    assert capability.LINK_COOLDOWN_HEADING in live.link("ada@example.org").text
+
+    # A different address is untouched by the first one's window.
+    assert "Check your inbox" in live.link("grace@example.org").text
+
+    left = capability.link_cooldown_left("ada@example.org")
+    assert 0 < left <= capability.LINK_REQUEST_COOLDOWN_SECONDS
+
+    # ...and time passing reopens it. The clock is offset, not slept through — this test
+    # must not cost an hour, and the production value is 3600. `capability.time` is
+    # shimmed rather than `time.monotonic` patched, because the `time` module is shared:
+    # patching through it would move the rate limiter's windows and the link floor too.
+    monkeypatch.setattr(capability, "time", _OffsetClock(left + 1))
+    assert capability.link_cooldown_left("ada@example.org") == 0
+    assert "Check your inbox" in live.link("ada@example.org").text
+
+
+def test_the_cooldown_key_is_the_same_address_the_poll_lookup_uses(live):
+    """The property that makes the key correct: identity with the *lookup* key.
+
+    `db.create_poll` stores the normalised address and `list_polls_by_creator_email`
+    matches on it exactly, so a cooldown keyed any other way would leave a spelling
+    that reaches a victim's polls without reaching their cooldown. Asserted against the
+    real functions rather than against a list of expected strings.
+    """
+    from kairos.http import valid_email
+
+    victim = valid_email("victim@example.org")
+    db.create_poll(
+        capability.anonymous_creator_id(), "V", None, "full_day", "UTC",
+        [{"date": "2026-12-01"}], creator_email=victim,
+    )
+
+    # Whatever spelling normalises to the stored key shares one cooldown — domain case
+    # and surrounding whitespace are folded...
+    for spelling in ("victim@example.org", "victim@EXAMPLE.ORG", "  victim@example.org  "):
+        assert valid_email(spelling) == victim
+        capability.record_link_request(valid_email(spelling))
+    assert capability.link_cooldown_left(victim) > 0
+
+    # ...and what normalisation does not fold is documented rather than claimed away: a
+    # local part's case and plus-addressing are distinct keys. Neither is a bypass,
+    # because each is *also* a distinct key at the lookup — so it reaches no polls and
+    # mails nothing at all, with or without a cooldown.
+    for distinct in ("VICTIM@example.org", "victim+1@example.org", "other@example.org"):
+        assert valid_email(distinct) != victim
+        assert db.list_polls_by_creator_email(valid_email(distinct)) == []
+
+
 def test_the_re_link_request_is_rate_limited(console, monkeypatch):
     """It opens SMTP connections for an address the caller supplies, so it draws
     `send` — the same budget as every other send route."""

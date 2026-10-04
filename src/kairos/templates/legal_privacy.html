@@ -10,15 +10,23 @@
 <li><strong>Account data</strong> (poll owners): identity provided by the operator's sign-in system.</li>
 </ul>
 <h2 class="text-lg font-bold mt-4">Cookies</h2>
-<p>Only strictly-necessary cookies are used — sign-in session, CSRF protection, and an optional signed token so you can edit your own response later (180 days). A local browser preference stores your dark/light theme choice. No tracking, no analytics, no third-party cookies; therefore no consent banner is required.</p>
+<p>Only strictly-necessary cookies are used — sign-in session, CSRF protection, and an optional signed token so you can edit your own response later (180 days). A local browser preference stores your dark/light theme choice. No tracking and no analytics, and no third-party cookie is set unless you press a button that says so — which is why no consent banner is required.</p>
 <h2 class="text-lg font-bold mt-4">Your rights</h2>
 <p>To access, correct, or delete your data, contact the controller above. Respondents can edit their response at any time via their poll link while the poll is open.</p>
 {#- #31: the Turnstile disclosure, rendered only on a deployment that runs the
      check, from `turnstile.disclosure()` at request time. See that function for
-     why the "no consent banner" sentence above survives it. -#}
+     why the "no consent banner" sentence above survives it.
+
+     `turnstile` is a `Disclosure` (lead, body) — two pieces of TEXT, so the
+     `<strong>` below is written here rather than arriving inside the string, where
+     this autoescaping template would render it as literal angle brackets. That was
+     a real bug: `{{ turnstile }}` on one HTML string printed
+     `&lt;strong&gt;Human check…` to every visitor. So there is deliberately no
+     `|safe` anywhere on this page, and `{{ turnstile.lead }}` is escaped like
+     every other value. -#}
 {% if turnstile %}
 <h2 class="text-lg font-bold mt-4">Third parties</h2>
-<p>{{ turnstile }}</p>
+<p><strong>{{ turnstile.lead }}</strong> {{ turnstile.body }}</p>
 {% endif %}
 {% if extra %}<p>{{ extra }}</p>{% endif %}
 </div></div>
