@@ -306,6 +306,40 @@ build on it rather than re-derive it:
    the work**, and neither is a bound on one factor of a product. `tracemalloc` in
    the test suite is what holds the placement — the same 400 comes back either way,
    so only the allocation distinguishes them.
+
+   *(Exact for a forward window. For a reversed one the floor division of a negative
+   timedelta is negative where the loop builds nothing, so the prediction sits below
+   the output — checked across all 12.4M reversed combinations and never above it.
+   That direction cannot over- or under-refuse anything dangerous: a reversed window
+   is accepted, builds zero slots, and is answered "At least one date is required.")*
+10. **The console's `edit` action is the same defect class, on the one surface of this
+    issue that writes to shared state — so it is bounded by the same number.** Three
+    reviews, three surfaces, one mistake each time: a `while` that could not
+    terminate, then a product that was never multiplied out, and now this. The edit
+    form is a single comma-separated `dates` text box, so `_parse_dates` splits it and
+    **Starlette's `max_fields` never sees the dates at all** — one ~1 MB field is
+    95,000 valid dates. Those dates then multiply by *the poll's own time grid*, which
+    grows by up to a full edit's worth of slots every time anyone edits, so the second
+    factor is attacker-influenced over time even when it starts small.
+
+    Measured with only the credential the app itself mails (create → read the link →
+    exchange it for the console cookie), a 215 KB body of 20,000 dates against a
+    125-pair poll is 2,500,000 slots: **+1.8 GB in 20.7 s and 2,470,375 rows written
+    to the database**, status 302, no refusal on the path at all. The first two
+    versions of this bug cost one request's memory; this one costs the deployment a
+    poll that every later page view has to read.
+
+    Two bounds, one number, and they are complementary rather than redundant:
+    `capability._parse_dates` refuses **inside its own loop** once the parsed list
+    would pass the ceiling — bounding the *input*, before 95,000 dates exist — and
+    `web.expand_new_dates(poll, dates, cap=…)` refuses the **product** before the
+    comprehension, which is what catches the slow axis, where a creator adds eight
+    dates to a poll whose grid has grown to a thousand pairs. `expand_new_dates` takes
+    the ceiling as a parameter rather than testing the mode itself, so the owner's
+    edit form and the API's slots endpoint keep exactly the behaviour they had —
+    a mode check inside that shared helper would have silently capped two surfaces
+    this branch does not own, one of which (#51/#63/#64) has the same unbounded
+    `dates × grid` product and should be given a ceiling of its own.
 10. **A capability in a URL is in the access log, and that is an operator's
     problem.** `GET /manage/<token>` puts the live token in whatever the front end
     writes down — `INFO: 127.0.0.1:48348 - "GET /manage/6YBiM6… HTTP/1.1" 200 OK`

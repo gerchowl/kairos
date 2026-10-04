@@ -279,7 +279,7 @@ def slot_cap_refusal(n_slots: int, n_dates: int = 0) -> str | None:
     """
     if not enabled() or n_slots <= MAX_SLOTS_PER_ACCOUNTLESS_POLL:
         return None
-    shape = f" {n_dates} dates over that window would create" if n_dates else " That would create"
+    shape = f" {n_dates:,} dates over that window would create" if n_dates else " That would create"
     return (
         f"That poll is too large.{shape} {n_slots:,} slots, and this deployment creates "
         f"accountless polls with up to {MAX_SLOTS_PER_ACCOUNTLESS_POLL:,}. Use fewer dates "
@@ -1008,7 +1008,17 @@ def _edit(request, form, poll, web):
         raise HTTPException(400, "Unknown timezone")
     # web.edit_poll_submit's semantics: additive, so a response to an existing date
     # survives a later edit.
-    slots = web.expand_new_dates(poll, _parse_dates(form.getlist("dates")))
+    #
+    # `cap=` is this console's own ceiling on `new dates × the poll's time grid`, and
+    # it is the same number and the same sentence as accountless *creation* — one
+    # bound, asked twice, which is the discipline that caught the previous two
+    # versions of this defect on the creation path. It is needed here because this
+    # form is a single comma-separated field (so `max_fields` never sees the dates)
+    # multiplied by a grid that grows with every edit. The owner form and the API pass
+    # no cap and are unchanged.
+    slots = web.expand_new_dates(
+        poll, _parse_dates(form.getlist("dates")), cap=MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    )
 
     update_poll(
         poll["id"],
@@ -1030,6 +1040,23 @@ def _parse_dates(values) -> list[str]:
     converter: an unparseable date is stored happily and then raises on the *next*
     read of the poll, which is a 500 on an ordinary page view rather than a 400 at
     the keystroke that caused it.
+
+    **The split is also why this function needs its own ceiling.** Splitting on commas
+    means `max_fields` counts *fields*, not dates, so one field is unbounded input: a
+    ~1 MB `dates` value is 95,000 valid dates, parsed and held in a list before any
+    cap downstream gets a say. Bounded here rather than downstream because a check
+    that runs after the list exists cannot bound what building it cost — the same
+    lesson as the creation path, applied to the one function that manufactures the
+    input.
+
+    The ceiling is the slot cap, not a second number: every date named here becomes at
+    least one slot, so a request naming more dates than the deployment's slot ceiling
+    could never be accepted anyway, and the refusal in `expand_new_dates` would catch
+    it a step later. Stated as one ceiling on one request. The trade-off, stated
+    rather than hidden: a creator who pastes more than the ceiling's worth of dates —
+    including dates already on the poll, which `expand_new_dates` would deduplicate —
+    is refused rather than trimmed. The field is empty by default and labelled "Add
+    dates", so that is a paste, not the normal path.
     """
     from datetime import date
 
@@ -1044,6 +1071,16 @@ def _parse_dates(values) -> list[str]:
             except ValueError:
                 raise HTTPException(400, f"{part!r} is not a date (expected YYYY-MM-DD)") from None
             parsed.append(part)
+            if len(parsed) > MAX_SLOTS_PER_ACCOUNTLESS_POLL:
+                # Refused *here*, so the 95,000th date is never appended and never
+                # validated: the loop stops one past the ceiling, not one short of it
+                # after the work.
+                raise HTTPException(
+                    400,
+                    f"That edit names more than {MAX_SLOTS_PER_ACCOUNTLESS_POLL:,} dates, "
+                    f"and this deployment adds at most {MAX_SLOTS_PER_ACCOUNTLESS_POLL:,} "
+                    f"slots per request. Add them in batches.",
+                )
     return parsed
 
 

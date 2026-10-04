@@ -40,6 +40,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from itsdangerous import URLSafeTimedSerializer
 from starlette.requests import Request
@@ -1978,3 +1979,207 @@ def test_the_creator_address_is_not_written_to_the_log(live, caplog):
     assert "ada@example.org" not in caplog.text
     # The poll id is still there, so this is a redaction and not a silence.
     assert live.poll()["id"] in caplog.text
+
+
+# -- 10. the console edit: the same defect class, third surface ----------------
+
+
+def _grid_poll(n_pairs: int, mode: str = "time_slot") -> dict:
+    """A poll whose own time grid carries `n_pairs` distinct (start, end) pairs.
+
+    A hand-built row, because the multiplier under test is the *poll's* grid and a
+    real one only reaches 125 pairs after an owner has already built it by hand.
+    `fmt_time` reads a `TIME` column as a string or a timedelta, so "HH:MM" is a
+    faithful stand-in for what `db.get_poll` returns.
+    """
+    # A date no test below submits, so `expand_new_dates`'s existing-date filter never
+    # quietly changes the arithmetic being asserted.
+    slots = [{"id": f"s{i}", "date": "2025-06-01", "start_time": f"{9 + i // 60:02d}:{i % 60:02d}",
+              "end_time": f"{9 + (i + 1) // 60:02d}:{(i + 1) % 60:02d}"} for i in range(n_pairs)]
+    if mode == "full_day":
+        slots = [{"id": f"s{i}", "date": "2025-06-01", "start_time": None, "end_time": None}
+                 for i in range(n_pairs)]
+    return {"id": "p1", "mode": mode, "slots": slots}
+
+
+def test_the_console_edit_refuses_the_product_of_dates_and_the_polls_own_grid(cap_mode):
+    """**The third version of this defect, and the first one that writes.**
+
+    Bounding `increment` bounded one date on the creation path. Bounding that product
+    bounded nothing here: the console's edit form is ONE comma-separated `dates`
+    field, so `max_fields` counts fields rather than dates and one ~1 MB value is
+    95,000 valid dates, and those dates multiply by **the poll's own time grid** —
+    which grows by up to a full edit's worth of slots every time anyone edits. Neither
+    factor was capped, so the product was never looked at.
+
+    Measured on the pre-fix tree against a real uvicorn, using only the credential the
+    app itself mails (create → read the link → exchange it for the console cookie):
+    a 215 KB body of 20,000 dates against a 125-pair poll is 2,500,000 slots —
+    **+1.8 GB in 20.7 s and 2,470,375 rows written into the database**, status 302,
+    no refusal anywhere. Unlike the two before it, this one lands on *shared state*:
+    every later page view of that poll reads those rows.
+
+    The fix caps `len(new_dates) × len(time_pairs)` with the same
+    `capability.slot_cap_refusal` the creation path uses, before the comprehension.
+    One ceiling, asked a third time — and the *same sentence*, which is what makes it
+    one policy rather than three that happen to share a number.
+    """
+    poll = _grid_poll(125)
+    dates = [f"2026-01-{day:02d}" for day in range(1, 29)] * 700  # 19,600 dates
+
+    with pytest.raises(HTTPException) as caught:
+        web.expand_new_dates(poll, dates, cap=capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL)
+    assert caught.value.status_code == 400
+    assert "too large" in caught.value.detail, "the creation path's sentence, reused"
+    assert "19,600 dates" in caught.value.detail, "the refusal should say which field to change"
+    assert f"{19_600 * 125:,}" in caught.value.detail
+
+    # A cap honoured outside capability mode — where `slot_cap_refusal` deliberately has
+    # no opinion — still refuses, and still says something. Pinned because the
+    # alternative is `HTTPException(400, None)`, which reaches the creator as a blank
+    # reason.
+    monkey_free = settings.AUTH_MODE
+    try:
+        settings.AUTH_MODE = "header"
+        with pytest.raises(HTTPException) as blunt:
+            web.expand_new_dates(poll, dates, cap=capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL)
+        assert blunt.value.status_code == 400
+        assert blunt.value.detail and "1,000" in blunt.value.detail
+    finally:
+        settings.AUTH_MODE = monkey_free
+
+
+def test_the_console_edit_bound_is_checked_before_the_slots_are_built():
+    """The placement test, in the same `tracemalloc` style as the creation path.
+
+    Same reason it is needed there: a check after the comprehension produces the same
+    400 and the same message, and costs half a gigabyte finding out. Only the
+    allocation distinguishes them, so only the allocation is asserted.
+
+    Verified by mutation: moving the check below the comprehension allocates ~500 MB
+    here and fails, while the status, the message and the row count all stay correct.
+    """
+    poll = _grid_poll(125)
+    dates = [f"2026-01-{day:02d}" for day in range(1, 29)] * 700
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(HTTPException):
+            web.expand_new_dates(poll, dates, cap=capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 10 * 1024 * 1024, (
+        f"the refusal allocated {peak / 1024 / 1024:.0f} MB — the cap is being applied "
+        f"after the comprehension, not before it"
+    )
+
+
+def test_the_console_edit_cap_boundary_is_exact():
+    """1,000 accepted, 1,001 refused — and a full_day poll, where the grid is empty.
+
+    The full_day half matters: with no time pairs the product is one slot per date, so
+    this is the same ceiling on a different shape rather than a special case. It is
+    also the case where a wrong `per_date` would silently refuse every edit.
+    """
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    grid = _grid_poll(125)
+
+    at_cap = web.expand_new_dates(grid, [f"2026-02-{day:02d}" for day in range(1, 9)], cap=cap)
+    assert len(at_cap) == cap
+    over = [f"2026-03-{day:02d}" for day in range(1, 10)]
+    with pytest.raises(HTTPException):
+        web.expand_new_dates(grid, over, cap=cap)
+
+    full_day = _grid_poll(125, mode="full_day")
+    assert len(web.expand_new_dates(full_day, [f"2026-04-{day:02d}" for day in range(1, 26)] * 40,
+                                    cap=cap)) == cap, \
+        "a full_day poll yields one slot per date, so the ceiling is the same number"
+    with pytest.raises(HTTPException):
+        web.expand_new_dates(full_day, [f"2026-05-{day:02d}" for day in range(1, 27)] * 40,
+                             cap=cap)
+
+
+def test_the_console_edit_dates_field_cannot_smuggle_past_the_field_ceiling():
+    """Why `_parse_dates` needs its own ceiling, which is not the same defect.
+
+    The comma-split means Starlette's `max_fields` never sees the dates: one field is
+    unbounded input, and a ~1 MB value is 95,000 valid dates, each one parsed and
+    appended *before* any downstream cap gets a say. The ceiling is the slot cap
+    rather than a second number — every date named becomes at least one slot, so a
+    request naming more than the slot ceiling could never be accepted anyway — and it
+    is enforced *inside* the loop, so the 95,000th date is never appended.
+
+    A separate test from the product one because it is a different placement: this
+    bounds the input, the other bounds the output, and a creator can trip either.
+    """
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    assert len(capability._parse_dates([",".join(["2026-01-05"] * cap)])) == cap
+    with pytest.raises(HTTPException) as caught:
+        capability._parse_dates([",".join(["2026-01-05"] * (cap + 1))])
+    assert caught.value.status_code == 400
+    assert f"{cap:,}" in caught.value.detail
+
+    # Split across many fields too — `max_fields` allows 1000 of them, and the ceiling
+    # is on the total parsed, not per field.
+    with pytest.raises(HTTPException):
+        capability._parse_dates([",".join(["2026-01-05"] * 10)] * 200)
+    # Empty parts are still skipped, and a genuine bad date is still a 400 about the date.
+    assert capability._parse_dates(["2026-01-05, ,2026-01-06,"]) == ["2026-01-05", "2026-01-06"]
+    with pytest.raises(HTTPException, match="not a date"):
+        capability._parse_dates(["2026-01-05,nope"])
+
+
+def test_the_owner_form_and_the_api_are_not_given_a_cap_they_never_had():
+    """`cap=None` means today's behaviour, and that has to stay true.
+
+    `expand_new_dates` has three callers: this console (capped), the owner's edit form
+    and the REST API's slots endpoint (both uncapped, and both owned elsewhere —
+    #51/#63/#64). A mode check inside the shared helper would have silently capped the
+    other two in capability mode, which is not this branch's call to make. So the cap
+    is a parameter, passed only where the ceiling belongs.
+    """
+    poll = _grid_poll(125)
+    dates = [f"2026-06-{day:02d}" for day in range(1, 29)] * 100  # 2,800 dates
+    assert len(web.expand_new_dates(poll, dates)) == 2_800 * 125, "the uncapped path is unchanged"
+    with pytest.raises(HTTPException):
+        web.expand_new_dates(poll, dates, cap=capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL)
+    # And the signature stays backward compatible for the two callers that never pass it.
+    assert "cap" in inspect.signature(web.expand_new_dates).parameters
+    assert inspect.signature(web.expand_new_dates).parameters["cap"].default is None
+
+
+def test_the_console_edit_route_refuses_an_over_wide_edit_and_writes_nothing(console):
+    """The route, with the credential, and the part that matters most: the database.
+
+    A refused edit must leave the poll exactly as it was. `expand_new_dates` raises
+    before `update_poll` runs, so the title change in the same request is discarded
+    too — asserted here rather than assumed, because "everything validated before
+    anything written" is a claim `_edit` makes in a comment.
+    """
+    live = console
+    poll_id = live.poll()["id"]
+    live.reset_mail()
+    before = len(db.get_poll(poll_id)["slots"])
+
+    huge = ",".join(f"2026-12-{day:02d}" for day in range(1, 29)) * 100  # 2,800 dates, 1 slot each
+    response = live.client.post(
+        f"/scheduler/manage/{poll_id}/edit",
+        data={"csrf": live.csrf, "title": "Renamed by a refused edit", "timezone": "UTC",
+              "dates": huge},
+    )
+    assert response.status_code == 400
+    after = db.get_poll(poll_id)
+    assert after["title"] == "Retreat", "a refused edit still renamed the poll"
+    assert len(after["slots"]) == before, "a refused edit still wrote slots"
+    assert live.relay.sent == [], "a refused edit still mailed anybody"
+
+    # And a modest edit on the same form still saves.
+    ok = live.client.post(
+        f"/scheduler/manage/{poll_id}/edit",
+        data={"csrf": live.csrf, "title": "Retreat (moved)", "timezone": "UTC",
+              "dates": "2027-01-04, 2027-01-05"},
+    )
+    assert ok.status_code == 302
+    assert db.get_poll(poll_id)["title"] == "Retreat (moved)"
+    assert len(db.get_poll(poll_id)["slots"]) == before + 2

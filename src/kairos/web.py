@@ -241,10 +241,19 @@ def _expand_time_slots(form, dates) -> tuple[list[dict], str | None]:
     #     contained: the loop skips empty fields, so counting those would refuse a
     #     submission the loop was going to answer "At least one date is required".
     #
-    # So `n_dates * per_date` is not an upper bound on the slots, it *is* the slot
-    # count this input produces, and asking `capability` whether that is allowed
-    # costs one integer multiplication. That is the entire fix: the grid below is
-    # only ever built when its size is already known to be acceptable.
+    # So `n_dates * per_date` is the slot count this input produces, and asking
+    # `capability` whether that is allowed costs one integer multiplication. That is
+    # the entire fix: the grid below is only ever built when its size is already known
+    # to be acceptable.
+    #
+    # Exact for a forward window. For a *reversed* one (`end` before `start`) the
+    # floor division of a negative timedelta is negative — `12:00→00:00` at one minute
+    # predicts −720 — where the loop builds nothing, so the prediction is below the
+    # output rather than equal to it. That direction is the safe one and always is:
+    # a negative count is never over the ceiling, so the request is accepted, builds
+    # zero slots, and is answered "At least one date is required" by the caller.
+    # Checked over all 12.4M reversed (start, end, increment) combinations: the
+    # prediction is never above the loop's output.
     n_dates = sum(1 for date in dates if date)
     per_date = (t_end - t_start) // timedelta(minutes=increment)
     refusal = capability.slot_cap_refusal(n_dates * per_date, n_dates)
@@ -289,13 +298,48 @@ def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
     return user, require_manage(poll, request, user=user)
 
 
-def expand_new_dates(poll: dict, dates: list[str]) -> list[dict]:
-    """Slots for genuinely-new dates; time_slot polls reuse the poll's time grid."""
+def expand_new_dates(poll: dict, dates: list[str], *, cap: int | None = None) -> list[dict]:
+    """Slots for genuinely-new dates; time_slot polls reuse the poll's time grid.
+
+    **`cap` is the ceiling on `new_dates × time-pairs`, and it is checked before the
+    comprehension rather than after it.** Both factors come from the request or from
+    the poll, and the product is what actually lands in the database:
+
+      * `dates` — on the capability console this arrives as ONE comma-separated field
+        that `_parse_dates` splits, so Starlette's `max_fields` ceiling never sees the
+        dates at all. One ~1 MB field is 95,000 valid dates; the review that found
+        this measured a 220 KB body with 20,000 dates against a poll carrying 125
+        distinct time pairs — **2,500,000 slot rows, 2,501,000 written, +1.1 GB,
+        14 s, status 302**. Not refused, because nothing here looked.
+      * `time_pairs` — the poll's *own* grid, which grows by up to one edit's worth
+        of slots every time. So even a single new date becomes expensive eventually,
+        and only the product says so.
+
+    The owner form and the REST API pass no `cap` and keep their existing behaviour:
+    the owner path is bounded by `max_fields` (about 90x lower per request) and the
+    API is #51/#63/#64's surface with its own budget. This parameter exists so the
+    capability console can ask for the ceiling at its own call site rather than
+    having a mode check reach into a shared helper and silently change two other
+    surfaces.
+    """
     existing = {str(s["date"]) for s in poll["slots"]}
     new_dates = [d for d in dates if d and d not in existing]
     time_pairs = sorted({(fmt_time(s["start_time"]), fmt_time(s["end_time"]))
                          for s in poll["slots"] if s.get("start_time")})
-    if poll["mode"] == "time_slot" and time_pairs:
+    on_grid = poll["mode"] == "time_slot" and time_pairs
+    # Every date yields at least one slot, so this is the minimum the comprehension
+    # below can produce and never an over-estimate of it.
+    per_date = len(time_pairs) if on_grid else 1
+    product = len(new_dates) * per_date
+    if cap is not None and product > cap:
+        raise HTTPException(
+            400,
+            # `slot_cap_refusal` words it and knows the mode; the `or` is for a caller
+            # that passes a cap outside this mode, where it deliberately has no opinion.
+            capability.slot_cap_refusal(product, len(new_dates))
+            or f"That edit would add {product:,} slots, over the limit of {cap:,}.",
+        )
+    if on_grid:
         return [{"date": d, "start_time": st, "end_time": et}
                 for d in new_dates for st, et in time_pairs]
     return [{"date": d} for d in new_dates]
