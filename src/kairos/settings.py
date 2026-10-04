@@ -2,7 +2,9 @@
 
 KAIROS_DB_URL      sqlite:///kairos.db (default) | mysql://user:pass@host:port/db
 KAIROS_PREFIX      URL prefix the app is mounted under (default "", e.g. "/scheduler")
-KAIROS_AUTH        owner-auth mode: demo (default) | header | oidc | none
+KAIROS_AUTH        owner-auth mode: demo (default) | header | oidc |
+                   capability | none. An unrecognised value refuses to boot
+                   (it would otherwise silently disable owner auth).
 KAIROS_AUTH_UID_HEADER    header carrying the user id    (header mode, default X-User)
 KAIROS_AUTH_EMAIL_HEADER  header carrying the email      (default X-Email)
 KAIROS_AUTH_NAME_HEADER   header carrying a display name (default X-Name)
@@ -79,7 +81,38 @@ def _parse_networks(raw: str, var: str) -> tuple:
 
 DB_URL = os.environ.get("KAIROS_DB_URL", "sqlite:///kairos.db")
 PREFIX = os.environ.get("KAIROS_PREFIX", "").rstrip("/")
-AUTH_MODE = os.environ.get("KAIROS_AUTH", "demo")
+
+# The owner-auth mode, validated at import rather than merely read. Every mode is
+# a string-dispatch in `auth.get_user`, so an unrecognised value is a mode that
+# resolves nobody: `get_user` returns None, every owner page 401s, and a deployment
+# whose owner auth silently stopped existing looks exactly like a deployment whose
+# users are all logged out. That is the "a control the operator believes is in
+# force and is not" failure, which this repo answers by refusing to boot --
+# `_parse_networks` (#47) for an allowlist entry, `_parse_rate_limit` (#37) for a
+# budget, `parse_keyring` (#51) for a key, `_validate_config` (#53) for OIDC.
+#
+# A recognised-value set rather than "anything else is false": a typo must not be
+# able to silently disarm owner auth, which is what an `in (...)` check would let
+# it do. An *empty* value is not a synonym for the default either -- `KAIROS_AUTH=`
+# in a compose file would otherwise resolve nobody instead of falling back to
+# `demo`, and quietly resolving nobody is the worse answer of the two, but falling
+# back to `demo` means "everybody is the same owner", which is the one direction
+# that fails open. Refusing to boot is the honest third option. Every mode that existed before #30 is in the set, so header mode (ETH),
+# self-host and demo are byte-for-byte unchanged; only a value that was never a
+# mode now fails, and it fails loudly instead of quietly.
+AUTH_MODES = ("demo", "header", "oidc", "capability", "none")
+# NOT stripped: `KAIROS_AUTH=" demo"` must be refused like any other unrecognised
+# value rather than quietly resolving to the mode where everybody is the same
+# owner. A strip here would make one stray space in a compose file the
+# fail-open, which is precisely what the check above exists to prevent.
+AUTH_MODE_RAW = os.environ.get("KAIROS_AUTH", "demo")
+if AUTH_MODE_RAW not in AUTH_MODES:
+    raise RuntimeError(
+        f"KAIROS_AUTH: {AUTH_MODE_RAW!r} is not an owner-auth mode "
+        f"({', '.join(AUTH_MODES)}). Kairos refuses to boot rather than run with no "
+        f"owner auth at all — see README.md."
+    )
+AUTH_MODE = AUTH_MODE_RAW
 AUTH_UID_HEADER = os.environ.get("KAIROS_AUTH_UID_HEADER", "X-User")
 AUTH_EMAIL_HEADER = os.environ.get("KAIROS_AUTH_EMAIL_HEADER", "X-Email")
 AUTH_NAME_HEADER = os.environ.get("KAIROS_AUTH_NAME_HEADER", "X-Name")

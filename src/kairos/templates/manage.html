@@ -1,0 +1,149 @@
+{% extends "scheduler_base.html" %}
+{% from "_macros.html" import page_hero, section_card, status_badge, text_field %}
+{% block head %}{% if noindex %}<meta name="robots" content="noindex,nofollow">{% endif %}{% endblock %}
+
+{# The accountless management console (issue #30, KAIROS_AUTH=capability).
+
+   Three stages in one template, because they differ only in what they have to
+   say: `open` is the interstitial the emailed link lands on, `signed_out` is
+   every "you have no usable capability" page, and the default is the console
+   itself. The credential is never rendered into this page -- it lives in the
+   HttpOnly cookie, and the only URL that carries one is the emailed link
+   itself. #}
+{% block content %}
+{% if stage == "open" %}
+{% call page_hero("Open your poll", "This link is your credential for this poll. It works once.") %}
+<form method="post" action="{{ manage_path }}">
+<button type="submit" class="btn btn-primary">Open “{{ poll.title }}”</button>
+</form>
+{% endcall %}
+{% call section_card("What happens next") %}
+<p class="text-sm">Opening the link trades it for a private session in this browser ({{ session_hours | default(12) }} hours) and the link stops working — so a copy left in a mailbox, a proxy log or a forwarded message is worthless.</p>
+{% if not mail_ok %}<p class="text-sm text-warning">Note: outbound mail is not available on this deployment{% if mail_note %} ({{ mail_note }}){% endif %}, so reminders and the final date cannot be sent.</p>{% endif %}
+{% endcall %}
+
+{% elif stage == "signed_out" %}
+{% call page_hero(heading, detail) %}{% endcall %}
+{#- The flash has to render HERE, not only on the console: `delete` redirects back
+     to a poll that no longer exists, so this is where its "Poll deleted." lands. -#}
+{% if msg %}<div class="alert alert-info my-4" role="status">{{ msg }}</div>{% endif %}
+{% call section_card("Get a new manage link") %}
+{% if mail_ok %}
+<p class="text-sm">We mail a fresh link to an address that already created a poll on this deployment. Nothing else is sent, and asking does not reveal whether a poll exists.</p>
+<form method="post" action="{{ P }}/manage/link" class="flex flex-wrap items-end gap-2">
+{{ text_field('email', 'Email address', type='email', required=True, input_class='w-72') }}
+<button type="submit" class="btn btn-primary">Email me a link</button>
+</form>
+{% else %}
+<p class="text-sm text-error">{{ mail_note }}</p>
+<p class="text-sm">Without working outbound mail there is no way to deliver a manage link, so this deployment cannot run the accountless flow at all. The operator has to fix SMTP.</p>
+{% endif %}
+{% endcall %}
+
+{% else %}
+{% call page_hero(poll.title, 'Managed by link — no account. This session lasts ' ~ session_hours ~ ' hours.', badge=poll.status) %}{% endcall %}
+
+{% if msg %}<div class="alert alert-info my-4" role="status">{{ msg }}</div>{% endif %}
+
+{% call section_card("Share this poll") %}
+<div class="flex flex-wrap items-center gap-2">
+<input type="text" class="input w-full font-mono text-sm" readonly value="{{ share_url }}" onclick="this.select()" aria-label="Share link">
+</div>
+<p class="text-sm opacity-70">{{ total - pending_n }} of {{ total }} expected {{ 'person has' if total - pending_n == 1 else 'people have' }} answered{% if decided_label %} · decided: <strong>{{ decided_label }}</strong>{% endif %}</p>
+{% if conv.state == 'ready' and poll.status == 'open' %}
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/decide" class="flex flex-wrap items-end gap-2">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<label class="sr-only" for="decide-select">Final date</label>
+<select name="slot_id" id="decide-select" class="select w-auto">
+{% for s in slots %}<option value="{{ s.id }}"{% if s.id == conv.best_slot_id %} selected{% endif %}>{{ format_slot(s, poll.mode) }}</option>{% endfor %}
+</select>
+<button type="submit" class="btn btn-primary">Decide this date</button>
+</form>
+{% endif %}
+<div class="flex flex-wrap gap-2">
+{% if poll.status == 'open' %}
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/close" class="p-0">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<button type="submit" class="btn btn-ghost btn-sm" onclick="return confirm('Close this poll?')">Close poll</button>
+</form>
+{% else %}
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/reopen" class="p-0">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<button type="submit" class="btn btn-ghost btn-sm">Reopen</button>
+</form>
+{% endif %}
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/remind" class="p-0" onsubmit="return confirm('Send reminders to everyone who still has to answer?')">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<button type="submit" class="btn btn-sm"{% if poll.status != 'open' %} disabled{% endif %}>Remind everyone</button>
+</form>
+</div>
+{% endcall %}
+
+{% call section_card("Participants") %}
+{% if not invites and not responses %}<p class="text-sm opacity-70">Nobody yet. Add someone below, or share the link above.</p>{% endif %}
+<ul class="text-sm">
+{% for r in responses %}
+<li><strong>{{ r.respondent_name }}</strong>{% if r.respondent_email %} — {{ r.respondent_email }}{% endif %}<span class="opacity-60"> · answered</span></li>
+{% endfor %}
+{% for i in invites %}
+<li>{{ i.name or i.email }}{% if i.name %} <span class="opacity-60">— {{ i.email }}</span>{% endif %}<span class="opacity-60"> · {% if i.responded %}answered{% else %}{{ 'optional' if not i.required else 'awaiting an answer' }}{% endif %}</span></li>
+{% endfor %}
+</ul>
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/invite" class="flex flex-wrap items-end gap-2 mt-4">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+{{ text_field('email', 'Invite by email', type='email', required=True, input_class='w-72') }}
+<label class="label cursor-pointer gap-2 pb-3"><input type="checkbox" name="optional" class="checkbox checkbox-sm"> optional</label>
+<button type="submit" class="btn btn-sm">Add to list</button>
+</form>
+{% endcall %}
+
+{% call section_card("Send the final date") %}
+{% if not decided_label %}<p class="text-sm opacity-70">Decide a date first — pick one above.</p>
+{% else %}
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/email-decision" class="flex flex-wrap items-end gap-2">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<label class="sr-only" for="note">Note</label>
+<input type="text" id="note" name="note" class="input w-72" placeholder="Optional note">
+<button type="submit" class="btn btn-primary btn-sm">Email it to everyone</button>
+</form>
+{% endif %}
+{% endcall %}
+
+{% call section_card("Edit") %}
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/edit" class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+{{ text_field('title', 'Title', value=poll.title, required=True) }}
+<fieldset class="fieldset">
+<legend class="fieldset-legend">Timezone</legend>
+<select name="timezone" class="select w-full">
+{% for tz in timezones %}<option value="{{ tz }}"{% if tz == poll.timezone %} selected{% endif %}>{{ tz }}</option>{% endfor %}
+</select>
+</fieldset>
+<div class="sm:col-span-2"><fieldset class="fieldset">
+<legend class="fieldset-legend">Add dates (comma separated, one per date)</legend>
+<input type="text" name="dates" class="input w-full font-mono" placeholder="2026-12-01, 2026-12-02">
+</fieldset></div>
+<div class="card-actions sm:col-span-2"><button type="submit" class="btn btn-sm">Save</button></div>
+</form>
+{% endcall %}
+
+<div class="card bg-base-100 shadow-sm my-4"><div class="card-body">
+<h2 class="card-title text-error text-lg">Danger zone</h2>
+<form method="post" action="{{ P }}/manage/{{ poll.id }}/delete" class="p-0" onsubmit="return confirm('Delete this poll and every response? This cannot be undone.')">
+<input type="hidden" name="csrf" value="{{ csrf_token }}">
+<button type="submit" class="btn btn-error btn-outline btn-sm">Delete this poll</button>
+</form>
+</div></div>
+
+<div class="card bg-base-100 shadow-sm my-4"><div class="card-body">
+<h2 class="card-title text-lg">Lost the link?</h2>
+<p class="text-sm">This browser's session lasts {{ session_hours }} hours. To get back in later, ask for a fresh link — we mail it to the address that created this poll.</p>
+{% if mail_ok %}
+<form method="post" action="{{ P }}/manage/link" class="flex flex-wrap items-end gap-2">
+{{ text_field('email', 'Email address', type='email', value=poll.creator_email or '', required=True, input_class='w-72') }}
+<button type="submit" class="btn btn-sm">Email me a link</button>
+</form>
+{% else %}<p class="text-sm text-error">{{ mail_note }}</p>{% endif %}
+</div></div>
+{% endif %}
+{% endblock %}

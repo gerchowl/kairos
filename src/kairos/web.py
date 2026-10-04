@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
 
-from kairos import settings
+from kairos import capability, settings
 from kairos.auth import can_manage, get_base_url, get_user, require_manage
 from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
@@ -60,6 +60,17 @@ router = APIRouter(prefix=P) if P else APIRouter()
 
 def _login_or_401(next_path: str):
     """Owner pages: redirect to the deployment's sign-in page, or explain."""
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # There is no sign-in in this mode and none is coming: the manage link *is*
+    # the credential. Redirecting to a proxy login page that does not exist, or
+    # telling someone to sign in when nobody can, is the one answer this mode
+    # cannot give. The /manage page carries the "email me a new link" box.
+    if capability.enabled():
+        return render(env, "message.html", status_code=401, title="Manage link required",
+                      heading="This page needs a manage link", error=True, user=None,
+                      detail=f"This deployment manages polls by emailed link, with no "
+                             f"accounts. Open the link we sent you, or request a new "
+                             f"one at {P}/manage.")
     if settings.LOGIN_URL:
         return RedirectResponse(f"{settings.LOGIN_URL}?next={next_path}", status_code=302)
     return render(env, "message.html", status_code=401, title="Sign in required",
@@ -209,6 +220,14 @@ def short_link(code: str):
 
 @router.get("/")
 def dashboard(request: Request):
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # No dashboard exists in this mode, deliberately. `list_polls` is keyed on an
+    # owner uid, and accountless polls are never listed anywhere (ADR-0009 --
+    # `sched_polls.owner_id` is NULL for them and nothing lists by absence), so
+    # the front page is the creation form rather than a list of other people's
+    # polls. The per-poll dashboard is #32's, alongside accounts and claim.
+    if capability.enabled():
+        return new_poll_page(request)
     user = get_user(request)
     if not user:
         return _login_or_401(f"{P}/")
@@ -236,6 +255,12 @@ def dashboard(request: Request):
 
 @router.get("/new")
 def new_poll_page(request: Request):
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # The same form, without a user behind it: `new_poll_context` carries the CSRF
+    # binding for an anonymous submit and the auth-mode flag that makes the
+    # template ask for a creator address.
+    if capability.enabled():
+        return render(env, "new_poll.html", **capability.new_poll_context())
     user = get_user(request)
     if not user:
         return _login_or_401(f"{P}/new")
@@ -246,10 +271,33 @@ def new_poll_page(request: Request):
 @router.post("/new")
 def create_poll_submit(request: Request, form=Depends(form_data),
                        _=Depends(rate_limit("create"))):
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # The same form, the same `create` budget, one difference: there is no identity
+    # to authorize, so the credential is minted and *mailed* instead. This is the
+    # only unauthenticated poll-creation path in the app, which is why #31's
+    # Turnstile check belongs on this branch and nowhere else, and why the branch
+    # is kept to the auth head, the refusal renderer and the create tail.
+    accountless = capability.enabled()
     user = get_user(request)
-    if not user:
-        return _login_or_401(f"{P}/new")
-    require_csrf(user, form)
+    if accountless:
+        capability.require_anon_csrf(form)
+    else:
+        if not user:
+            return _login_or_401(f"{P}/new")
+        require_csrf(user, form)
+
+    def _fail(detail, heading="New Poll"):
+        """A form refusal, in whichever shape this mode has a user for.
+
+        `_error_page` builds the notification navbar from an owner uid, which an
+        accountless submission does not have, so the accountless refusal goes
+        through the same template without one. The signature mirrors
+        `_error_page`'s (heading, detail) so the four call sites read the same as
+        the ones they replaced, and the page title stays "New Poll" rather than
+        becoming the sentence.
+        """
+        return (capability.anon_error(heading, detail, back=f"{P}/new") if accountless
+                else _error_page(user, heading, detail, f"{P}/new"))
 
     title = form.get("title", "").strip()
     description = form.get("description", "").strip() or None
@@ -257,9 +305,9 @@ def create_poll_submit(request: Request, form=Depends(form_data),
     timezone = form.get("timezone", "Europe/Zurich").strip()
 
     if not title:
-        return _error_page(user, "New Poll", "Title is required.", f"{P}/new")
+        return _fail("Title is required.")
     if not _valid_timezone(timezone):
-        return _error_page(user, "New Poll", "Unknown timezone.", f"{P}/new")
+        return _fail("Unknown timezone.")
 
     dates = form.getlist("dates")
 
@@ -269,9 +317,7 @@ def create_poll_submit(request: Request, form=Depends(form_data),
         end_all = form.get("end_time_all", "17:00")
         increment = int(form.get("increment", "30"))
         if not start_all or not end_all:
-            return _error_page(user, "New Poll",
-                               "Start and end times are required for time slot mode.",
-                               f"{P}/new")
+            return _fail("Start and end times are required for time slot mode.")
         t_start = datetime.strptime(start_all, "%H:%M")
         t_end = datetime.strptime(end_all, "%H:%M")
         for date in dates:
@@ -293,8 +339,16 @@ def create_poll_submit(request: Request, form=Depends(form_data),
             slots.append({"date": date})
 
     if not slots:
-        return _error_page(user, "New Poll", "At least one date is required.", f"{P}/new")
+        return _fail("At least one date is required.")
 
+    # ---- issue #30: the create tail. Everything above is shared; here the modes
+    # diverge -- an accountless poll has no owner_id and a per-poll placeholder
+    # creator (see capability.anonymous_creator_id for why that is not a
+    # migration), and its manage link goes out by mail.
+    if accountless:
+        return capability.create_accountless_poll(
+            request, form, title=title, description=description, mode=mode,
+            timezone=timezone, slots=slots)
     # owner_id is the authenticated owner (ADR-0009); in header mode that is the
     # same uid as creator_id, and creator_email stays NULL because only the
     # hosted accountless flow mails a management link (#30).

@@ -27,7 +27,12 @@ def create_env(extra_dir: Path | str | None = None) -> Environment:
                        # #53: only the OIDC mode has a session to sign out of, and
                        # the logout route 404s in every other mode, so the nav
                        # control is rendered from the mode rather than from a flag.
-                       OIDC=settings.AUTH_MODE == "oidc")
+                       OIDC=settings.AUTH_MODE == "oidc",
+                       # #30: same reasoning, for the accountless mode. `new_poll.html`
+                       # asks for a creator address in capability mode and not in any
+                       # other, and the flag is the mode rather than a context key
+                       # because the template is shared with every other mode.
+                       CAPABILITY=settings.AUTH_MODE == "capability")
     return env
 
 
