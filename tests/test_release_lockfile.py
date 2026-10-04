@@ -299,3 +299,43 @@ def test_the_tag_scheme_stays_version_only():
     root = RELEASE_CONFIG["packages"]["."]
     assert "component" not in root
     assert root["include-component-in-tag"] is False
+
+
+def test_the_image_build_still_refuses_a_stale_lockfile():
+    """Pin `--locked`.
+
+    `uv sync --locked` is a deliberate security property, not an incidental
+    flag: it pins the installed dependency set to `uv.lock` instead of
+    re-resolving at build time, so a stale lock fails the build rather than
+    silently installing something else. Nothing else in the suite asserts it, so
+    a later PR could quietly relax it to `--frozen` -- which tolerates exactly
+    the drift this repository just shipped a release for (issue #59).
+
+    Change either arm of this assertion and the security property is gone.
+    """
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    sync_lines = [ln.strip() for ln in dockerfile.splitlines()
+                  if "uv sync" in ln and not ln.strip().startswith("#")]
+    assert sync_lines, "no `uv sync` found in the Dockerfile -- has the build changed?"
+    for line in sync_lines:
+        assert "--locked" in line, f"image build no longer pins to uv.lock: {line!r}"
+        assert "--frozen" not in line, (
+            "--frozen tolerates a stale lockfile; --locked is the guarantee"
+        )
+
+
+def test_the_release_type_stays_python():
+    """A missing `release-type` is not caught by any other assertion here.
+
+    release-please reads it to choose its release strategy. Drop it and the real
+    library picks `node`, then fails with "Missing required file: package.json"
+    on a repository whose root has no package.json -- a baffling message for a
+    one-word config omission, and the same class of failure this file exists to
+    catch: correct in every assertion, wrong in the config that actually ships.
+    """
+    root = RELEASE_CONFIG["packages"]["."]
+    assert root.get("release-type") == "python", (
+        "kairos is a Python project; a missing or wrong release-type makes "
+        f"release-please pick the wrong strategy, got {root.get('release-type')!r}"
+    )
+
