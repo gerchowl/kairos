@@ -352,3 +352,88 @@ per-key rate limits OFF -> the TOTAL across polls is UNBOUNDED: each poll gets i
 own allowance, so N fresh polls get N of them. Set KAIROS_RATE_LIMIT=on before
 exposing this deployment.
 ```
+
+### Poll reach: which polls a caller may read
+
+<!-- #63/#64 reach. Self-contained section: appended at the end of the #51 scoping
+     block, so it rebases cleanly. -->
+
+A scope says what a key may *do*; **reach** says which *polls* it may do it to.
+Until now a scope was the only answer, so `polls:read` meant every poll on the
+instance and `GET /api/polls` enumerated it — while the web UI, three routes away,
+let only the owner manage a poll. Same rows, two rules, the weaker one on the
+machine-facing surface.
+
+`KAIROS_POLL_REACH` chooses the rule, on **both** surfaces:
+
+| `KAIROS_POLL_REACH` | web UI (`/polls/{id}`, `event.ics`) | API (`/api/polls…`) |
+|---|---|---|
+| unset / `open` (**default**) | any signed-in user | any authenticated key, every poll |
+| `scoped` | the poll's owner — **or** anyone invited to it or already answered on it | only the polls the key's `~` claim names |
+
+Unset means `scoped` when `KAIROS_HOSTED=on` (a deployment *we* operate is the
+multi-tenant case, where `open` is an IDOR) and `open` otherwise, so a self-hoster
+and the ETH group deployment keep the behaviour they have today. An
+unrecognised `KAIROS_POLL_REACH` refuses the boot.
+
+An unrecognised `KAIROS_HOSTED` (`Y`, `enabled`, `2`, …) reads as **scoped**, and
+the boot log says so at WARNING. The mail gate still reads that value as "not
+hosted", which is right for mail — but this knob now decides who may read which
+poll, so a misspelling must not quietly select the permissive policy. Fix the
+spelling, or say `KAIROS_POLL_REACH=open` if the deployment really is self-hosted.
+
+**`open` is a deprecation, not a recommendation.** It stays the default because
+every read that is legal today has to stay legal today (ADR-0001/0002), but it is
+the pre-#63 rule and it still reproduces #63/#64 in full: any authenticated caller
+reads every poll. Moving a deployment to `scoped` is three steps and no code:
+
+1. **Audit.** `GET /api/whoami` reports each key's reach claim; list the keys and
+   what they should reach.
+2. **Grant.** Add `~<poll-id>` per key, or `~*` for the deployment's own service
+   key and cron jobs. `KAIROS_API_KEY` already holds `~*`, so the ETH/duplet
+   adapter keeps the instance either way.
+3. **Flip.** `KAIROS_POLL_REACH=scoped` (or `KAIROS_HOSTED=on`) and read the boot
+   line: it states which rule is in force, and the warnings name anything that is
+   still off.
+
+Under `scoped`, a key says which polls it reaches:
+
+```bash
+KAIROS_API_KEYS="k1:polls:read,respond~*;k2:mail:send~<poll-uuid>"
+```
+
+`~*` is the explicit instance-wide grant (also what `KAIROS_API_KEY` holds, so
+scoping a deployment never costs it the instance); `~<poll-id>+<poll-id>` names
+some; **omitting the clause reaches no poll** — default deny. `GET /api/polls`
+returns what the caller reaches (an empty list, not a 403, for a key granted
+nothing), and `GET /api/whoami` reports the reach next to the scopes.
+
+Flat owner-gating was the alternative, and it would have broken the group
+deployment: in header mode the authenticating proxy *is* the tenant boundary, so
+`scoped` admits everyone named on the poll rather than only its creator. Full
+reasoning, and the cases this does not cover yet, in
+`docs/design/poll-reach.md`.
+
+**On the web surface, `scoped` is only as strong as the identity it trusts.** In
+`KAIROS_AUTH=header` mode the caller's identity *is* a request header, so with no
+`KAIROS_TRUSTED_PROXY_CIDRS` set, anyone who can reach the port can assert
+`X-User: <a creator uid>` and reach that creator's polls. `scoped` there is
+decorative until the app sits behind a proxy whose CIDRs are named — the boot log
+warns when it is not.
+
+Two things `scoped` does *not* do, both pinned by tests so a later change is
+deliberate:
+
+* a refusal on the web surface is the missing poll's own **404, byte for byte** —
+  same status, same page, same empty detail, one function for both — because that
+  surface has to read the poll in order to decide and must therefore not also tell
+  a caller which of the two it was. The first version of this matched the status
+  and not the body, and a 60-byte sentence on the refusal only was still an oracle.
+  Bytes are the channel that was closed, not every channel: deciding reach costs
+  two statements a missing poll never reaches, so a caller who times the two can
+  still separate them. That is inherent to "or anyone named on the poll" and is
+  written up as residual 6 in `docs/design/poll-reach.md`, which also carries the
+  one existence oracle this leaves open (`edit_poll_page`, #29's surface);
+* a key that creates a poll it cannot reach is **not** auto-granted reach over it
+  (nothing in the schema says which key made the row, issue #32) — the creation
+  response carries a `reach_warning` naming the grant it needs instead.

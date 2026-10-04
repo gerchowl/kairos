@@ -996,7 +996,15 @@ def test_a_valid_session_cookie_resolves_to_an_owner(monkeypatch):
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda token: token[:-1] + ("A" if token[-1] != "A" else "B"),
+        # A flip in the token's *body*, not in its last base64url character. The
+        # signature is 20 bytes = 160 bits, and 27 unpadded base64url characters
+        # carry 162, so the final character has two bits no decoder reads (the
+        # second review corrected four to two). Replacing it is therefore a
+        # byte-level no-op whenever those two bits are the only thing that changed
+        # -- 1 of the 16 possible final digests, i.e. 6.25%, about one run in 16 --
+        # and the tampered token still verified. A body flip always changes bytes
+        # the HMAC covers.
+        lambda token: token[:3] + ("A" if token[3] != "A" else "B") + token[4:],
         lambda token: token + "x",
         lambda token: token[:-4],
     ],

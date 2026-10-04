@@ -56,7 +56,7 @@ from typing import NamedTuple
 
 from fastapi import HTTPException, Request
 
-from kairos import settings
+from kairos import reach, settings
 from kairos.auth import bearer_credential, require_api_key
 
 log = logging.getLogger("kairos.scoping")
@@ -148,6 +148,15 @@ class Principal(dict):
     def key_id(self) -> str:
         return self["key_id"]
 
+    @property
+    def polls(self) -> "reach.Grant":
+        """Which polls this caller reaches (issue #63). See `kairos.reach`."""
+        # `.get`, not `[...]`, for the reason `reach.grant_for` is: a hand-built
+        # Principal or a code path that resolved a key without recording its grant
+        # must read as *nothing*, never as everything. One spelling of "absent is
+        # nothing" across both surfaces.
+        return self.get("polls", frozenset())
+
 
 def key_id(key: str) -> str:
     """A stable, non-reversible name for a key, safe to log and to bucket by.
@@ -168,12 +177,22 @@ class KeyEntry(NamedTuple):
     key: str
     scopes: frozenset[str] | None  # None => resolve from `tier`
     tier: str | None
+    # Which polls this key may *reach* (issue #63): `reach.EVERY_POLL` or a
+    # frozenset of poll ids. Empty means nothing, which under the `scoped` reach
+    # policy is the default-deny answer — a scope is a capability, never a tenant.
+    polls: "reach.Grant" = frozenset()
 
 
-# `;` separates entries and `,` separates the scopes within one. Not an
-# arbitrary split: with `,` doing both jobs, `k1:polls:read,respond` is genuinely
-# ambiguous between "one key with two scopes" and "two keys", and a security
-# control must not have a reading you have to guess at.
+# `;` separates entries, `,` separates the scopes within one and `~` introduces a
+# key's reach claim. Not an arbitrary split: with `,` doing both jobs,
+# `k1:polls:read,respond` is genuinely ambiguous between "one key with two scopes"
+# and "two keys", and a security control must not have a reading you have to guess
+# at.
+#
+# `~` is deliberately absent: `parse_keyring` partitions it off *before* either
+# fragment is parsed (and refuses a second one outright), so it can never reach the
+# checks below. Listing it here was dead code whose only effect was to name a
+# character in the "cannot carry" message that no fragment could ever contain.
 _DELIMITERS = ";:@"
 
 
@@ -186,6 +205,40 @@ def _reject(raw: str, why: str) -> RuntimeError:
     return RuntimeError(f"KAIROS_API_KEYS: {why} ({raw!r})")
 
 
+def _parse_reach(chunk: str, claim: str) -> "reach.Grant":
+    """The `~` clause: which polls one key may reach.
+
+        ~*        every poll on the instance — the *explicit* instance-wide grant
+                   issue #63 asked for, so a cron or an export says so rather than
+                   being exempted from the rule
+        ~<id>+<id>  exactly those polls
+        (absent)  none of them
+
+    `+` rather than `,` inside the claim because `,` already separates scopes and
+    one character per job is what keeps `k:polls:read~p1+p2` unambiguous.
+
+    Refuses rather than guessing: an id containing whitespace or a leftover
+    delimiter is a typo, and a typo silently dropped out of a grant is an operator
+    believing a key reaches a poll it cannot.
+    """
+    if not claim:
+        raise _reject(chunk, "no reach claim after '~' (use '~*' for every poll, or '~<poll-id>+<poll-id>')")
+    if claim == reach.ALL_POLL_CLAIM:
+        return reach.EVERY_POLL
+    if reach.ALL_POLL_CLAIM in claim:
+        raise _reject(claim, "'*' means every poll and cannot be combined with poll ids")
+    ids = []
+    for item in (p.strip() for p in claim.split("+")):
+        if not item:
+            raise _reject(claim, "an empty poll id in the reach claim")
+        if any(ch.isspace() for ch in item) or any(d in item for d in _DELIMITERS):
+            raise _reject(
+                item, "a poll id in a reach claim cannot be empty, contain whitespace or a grammar delimiter"
+            )
+        ids.append(item)
+    return frozenset(ids)
+
+
 def parse_keyring(raw: str) -> tuple[KeyEntry, ...]:
     """Parse `KAIROS_API_KEYS` into entries. Raises on anything malformed.
 
@@ -196,8 +249,18 @@ def parse_keyring(raw: str) -> tuple[KeyEntry, ...]:
                                  the legacy var is the only way to ask for that
         KEY:scope[,scope...]     least privilege, explicit
         KEY@tier                 scopes come from a registered tier (see below)
+        [KEY:scope[,scope...]|KEY@tier]~<reach>   ...and may name which polls
+                                 that capability reaches (issue #63): `~*` for the
+                                 whole instance, `~<poll-id>+<poll-id>` for some.
+                                 Omitted = reaches no poll under the `scoped`
+                                 reach policy, which is the default-deny answer.
 
-    So: `KAIROS_API_KEYS="k1:polls:read,respond;k2:mail:send"`.
+    So: `KAIROS_API_KEYS="k1:polls:read,respond~*;k2:mail:send~poll-uuid"`.
+
+    The `~` clause is split off *before* the rest of the entry is parsed, so every
+    form that was valid before reach existed parses through the identical code
+    path — the extension cannot have changed the meaning of a string that does not
+    contain a `~`.
 
     `scope` and `tier` are mutually exclusive on purpose: one rule, two readings,
     no precedence to get wrong.
@@ -211,36 +274,51 @@ def parse_keyring(raw: str) -> tuple[KeyEntry, ...]:
     for chunk in (c.strip() for c in raw.split(";")):
         if not chunk:
             continue
-        scope_part, at, tier_name = chunk.partition("@")
-        if at and not tier_name:
-            raise _reject(chunk, "a tier name is required after '@'")
-        key, colon, scope_text = scope_part.partition(":")
-        key = key.strip()
-        if not key:
-            raise _reject(chunk, "the key is empty")
-        if any(d in key for d in _DELIMITERS):
-            # token_urlsafe(32) — what .env.example tells operators to generate —
-            # never produces one of these, so this only fires on a key the
-            # grammar could not round-trip. Refusing is the safe direction.
-            raise _reject(key, "the key contains a character the grammar cannot carry (';', ':', '@')")
-        if colon and at:
-            raise _reject(chunk, "a key takes scopes or a tier, not both")
-        if not colon and not at:
-            raise _reject(key, "a keyring entry must name scopes (KEY:scopes) or a tier (KEY@name)")
-        scopes = None
-        if colon:
-            names = [s.strip() for s in scope_text.split(",") if s.strip()]
-            if not names:
-                raise _reject(chunk, "no scopes listed after ':'")
-            unknown = sorted(set(names) - set(SCOPES))
-            if unknown:
-                raise _reject(",".join(unknown), "not a scope (known: " + ", ".join(SCOPES) + ")")
-            scopes = expand(names)
-        if key in seen:
-            raise _reject(key_id(key), "duplicate key")
-        seen.add(key)
-        entries.append(KeyEntry(key, scopes, tier_name or None))
+        left, tilde, claim = chunk.partition("~")
+        if tilde and "~" in claim:
+            raise _reject(chunk, "more than one '~' in an entry (one reach claim per key)")
+        entry = _parse_entry(chunk, left)
+        polls = _parse_reach(chunk, claim) if tilde else frozenset()
+        if entry.key in seen:
+            raise _reject(key_id(entry.key), "duplicate key")
+        seen.add(entry.key)
+        entries.append(entry._replace(polls=polls))
     return tuple(entries)
+
+
+def _parse_entry(chunk: str, left: str) -> KeyEntry:
+    """One keyring entry's credential and capability claim. See `parse_keyring`."""
+    scope_part, at, tier_name = left.partition("@")
+    if at and not tier_name:
+        raise _reject(chunk, "a tier name is required after '@'")
+    key, colon, scope_text = scope_part.partition(":")
+    key = key.strip()
+    if not key:
+        raise _reject(chunk, "the key is empty")
+    if any(d in key for d in _DELIMITERS):
+        # token_urlsafe(32) — what .env.example tells operators to generate —
+        # never produces one of these, so this only fires on a key the
+        # grammar could not round-trip. Refusing is the safe direction.
+        raise _reject(
+            key,
+            "the key contains a character the grammar cannot carry ("
+            + ", ".join(repr(d) for d in _DELIMITERS)
+            + ")",
+        )
+    if colon and at:
+        raise _reject(chunk, "a key takes scopes or a tier, not both")
+    if not colon and not at:
+        raise _reject(key, "a keyring entry must name scopes (KEY:scopes) or a tier (KEY@name)")
+    scopes = None
+    if colon:
+        names = [s.strip() for s in scope_text.split(",") if s.strip()]
+        if not names:
+            raise _reject(chunk, "no scopes listed after ':'")
+        unknown = sorted(set(names) - set(SCOPES))
+        if unknown:
+            raise _reject(",".join(unknown), f"not a scope (known: {', '.join(SCOPES)})")
+        scopes = expand(names)
+    return KeyEntry(key, scopes, tier_name or None)
 
 
 def keyring() -> tuple[KeyEntry, ...]:
@@ -384,6 +462,14 @@ def resolve(request: Request) -> Principal:
         scopes=ALL_SCOPES,
         key_id=key_id(_legacy_key()),
         tier=None,
+        # The one caller that reaches every poll, and it says so out loud rather
+        # than by having no claim: `KAIROS_API_KEY` is the deployment's own
+        # service credential (the ETH/duplet adapter's `SCHEDULER_API_KEY`), and
+        # issue #63 asks for an explicit instance-wide grant rather than an
+        # exemption from the scoped policy. This is that grant. Under `open` it is
+        # redundant and under `scoped` it is the difference between the API working
+        # and not — which is why the boot line names it.
+        polls=reach.EVERY_POLL,
     )
 
 
@@ -409,6 +495,10 @@ def _principal(entry: KeyEntry) -> Principal:
         scopes=scopes,
         key_id=key_id(entry.key),
         tier=name,
+        # A tier resolves *capabilities*; reach is per key (issue #63), so an
+        # entry that named no `~` claim reaches nothing. #33 can put a default on
+        # `Tier` when a plan is one poll set or many — the call site does not move.
+        polls=entry.polls,
     )
 
 
@@ -460,13 +550,23 @@ class api_scope:
     future route can charge a different budget without a new dependency class.
     `scope=None` means "any authenticated key" and charges the floor rule: only
     `/whoami` uses it (`/ping` needs no key at all).
+
+    `reach=True` declares the *other* half of authorization on a poll-id route
+    (issue #63): the route reaches a poll, so its key must be granted that poll.
+    Same declaration, same audit — `reach.can_reach` decides, and
+    `reach.guard_reach` runs here, before the handler, so a route that declares
+    it is authorized by saying so rather than by remembering to ask. Every route
+    whose path names `{poll_id}` must declare it, which is what the audit asserts
+    off the live route table.
     """
 
-    def __init__(self, scope: str | None = None, rule: str | None = None):
+    def __init__(self, scope: str | None = None, rule: str | None = None,
+                 reach: bool = False):
         if scope is not None and scope not in ALL_SCOPES:
             raise RuntimeError(f"{scope!r} is not a scope ({', '.join(SCOPES)})")
         self.scope = scope
         self.rule = rule or DEFAULT_RULE_FOR_SCOPE.get(scope or "", "api")
+        self.reach = reach
 
     def __call__(self, request: Request) -> dict:
         principal = resolve(request)
@@ -476,6 +576,10 @@ class api_scope:
         charge_request(principal, self.rule)
         if self.scope:
             enforce(principal, self.scope)
+        if self.reach:
+            # After the scope check, so a key without the capability is told the
+            # scope is what it lacks rather than the reach.
+            reach.guard_reach(request, principal)
         request.state.api_principal = principal
         return principal
 
@@ -612,6 +716,26 @@ def boot_report() -> str:
             )
     scopes = sorted({s for e in entries for s in (e.scopes or frozenset())})
     legacy = "KAIROS_API_KEY (full scope)" if _legacy_key() else "unset"
+    # Reach (issue #63): which polls a *scoped* key may read, and what that means
+    # for this deployment. Stated at boot because the two states are opposites —
+    # "every key reads every poll" and "a key reads what it was granted" — and an
+    # operator who cannot tell which one their deployment is in has no way to know
+    # whether the surface in front of them is scoped. Says how to change it too,
+    # because the escape hatch is only real if it is discoverable.
+    policy = reach.policy()
+    legacy_reach = "KAIROS_API_KEY reaches every poll" if _legacy_key() else "no KAIROS_API_KEY"
+    reach_line = {
+        reach.OPEN: f"poll reach OPEN -> every authenticated caller reads every poll "
+                    f"({legacy_reach}; the pre-#63 rule, kept so no existing read stops "
+                    f"being legal — DEPRECATED as a default, set KAIROS_POLL_REACH=scoped "
+                    f"to scope it)",
+        reach.SCOPED: f"poll reach SCOPED -> a scoped key reads only the polls its "
+                      f"'~<poll-id>' claim names, {legacy_reach} (KAIROS_POLL_REACH=open "
+                      f"reverts to the pre-#63 rule)",
+    }[policy]
+    unreached = sum(
+        1 for e in entries if e.polls is not reach.EVERY_POLL and not e.polls
+    )
     if settings.RATE_LIMIT_ENABLED:
         aggregate = "per-key rate limits on -> the TOTAL across polls is bounded"
     else:
@@ -630,7 +754,40 @@ def boot_report() -> str:
         f"API surface: {legacy}; "
         f"{len(entries)} scoped key(s) in KAIROS_API_KEYS"
         + (f" granting {', '.join(scopes)}" if scopes else "")
-        + f"; mail ceiling {settings.MAIL_MAX_RECIPIENTS or 'off'} recipients/request,"
+        + (f"; {unreached} of them reach no poll at all under {policy}" if unreached else "")
+        + f"; {reach_line}; mail ceiling {settings.MAIL_MAX_RECIPIENTS or 'off'} recipients/request,"
         f" {settings.MAIL_PER_POLL[0] or 'off'} recipients/poll per"
         f" {settings.MAIL_PER_POLL[1]}s; {aggregate}"
     )
+
+
+def boot_warnings() -> list[str]:
+    """Warnings about a control an operator believes is in force and is not.
+
+    Returned rather than logged here and printed by `main.create_app` at WARNING,
+    next to the INFO line above, because that is the convention `oidc.boot_warnings`
+    established for exactly this case: the boot line is what an operator pastes
+    into a ticket, and the states worth a ticket are the ones a green boot would
+    otherwise hide.
+
+    Reach's own warnings (`reach.boot_warnings`: an unrecognised `KAIROS_HOSTED`,
+    `scoped` in header mode with no trusted-proxy CIDRs) are appended rather than
+    reimplemented, and the keyring's is added here because it needs the keyring:
+
+      * `open` with scoped keys configured. An operator who has handed out
+        least-privilege keys believes those keys are scoped to what they were
+        granted; under `open` every one of them still reads every poll on the
+        instance and their `~` claims are inert. That is #63 still reproducing, and
+        it is the single most useful thing a `scoped` operator has to be told
+        before they assume they are protected.
+    """
+    warnings = list(reach.boot_warnings())
+    entries = keyring()
+    if entries and reach.policy() == reach.OPEN:
+        warnings.append(
+            f"poll reach is OPEN: every authenticated caller reaches every poll, so the "
+            f"{len(entries)} scoped key(s) in KAIROS_API_KEYS still read the whole instance "
+            f"and their '~' claims are inert. Set KAIROS_POLL_REACH=scoped to make them mean "
+            f"what they say (docs/design/poll-reach.md)."
+        )
+    return warnings
