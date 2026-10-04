@@ -1444,13 +1444,24 @@ def test_an_unverifiable_response_says_so_without_echoing_the_provider(client, m
     provider.install(monkeypatch, ALLOWED_SUBJECTS=frozenset({"sub-alice"}))
     state, _ = _start(client)
     provider.token_status = 400
+    # A token that cannot collide with anything the page legitimately contains.
+    # The previous value here was the four characters "1234", and every rendered page
+    # carries `static_v` — `str(int(time.time()))`, fixed once per process — in its
+    # asset URLs, so this test failed whenever the wall clock's unix timestamp
+    # happened to contain "1234": 7 positions in a 10-digit number, so roughly a 1-in-140
+    # coin flip per test *run*, for every run in the process. It went red on this
+    # branch's first CI run of the review round and passed on every local run, which
+    # is the worst possible signature. The assertion's intent is "the provider's words
+    # never reach the page", and a distinctive token tests that intent with no coin
+    # flip attached. Reproduced by pinning the clock to 1791112348 and rendering the
+    # page: the old value failed on the asset URL, this one passes.
     provider.token_error = {
         "error": "invalid_client",
-        "error_description": "client secret is wrong for app 1234",
+        "error_description": "client secret is wrong for app zq7-fixture-4b2e",
     }
     response = client.get(f"{P}/oidc/callback", params={"code": "c", "state": state}, follow_redirects=False)
     assert response.status_code == 400
-    assert "1234" not in response.text  # provider internals stay in the log
+    assert "zq7-fixture-4b2e" not in response.text  # provider internals stay in the log
     assert not client.cookies.get(oidc.SESSION_COOKIE)
 
 
