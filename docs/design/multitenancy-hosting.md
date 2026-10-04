@@ -75,11 +75,16 @@ Every mutating route (`add_slots`, `invite`, `decide`, `delete`, `imip-decision`
 1. `POST /new` with a **Turnstile** token + `creator_email` → server verifies the
    token (Cloudflare siteverify) → creates the poll (`owner_id NULL`, `admin_token`
    minted, `manage_verified_at NULL`) → emails `/{P}/manage/<admin_token>`.
+   *Shipped by #31 — see "Step 3 shipped (#31)" below: click-to-load facade, one
+   `action` per form, and fail closed including on an unreachable verifier.*
 2. `GET /manage/<admin_token>` → set `manage_verified_at` on first open → management UI.
 3. **Anti-spam gate:** invite/send routes require `manage_verified_at IS NOT NULL`
    (accountless) **or** an account plan. So before Kairos emails any third party,
    the creator has passed **human (Turnstile)** + **verified-deliverable-email
    (opened the magic link)** — and it's their *own* address on the hook.
+   *Shipped by #31 as the one predicate `capability.require_sendable`. A NULL column
+   may not send — which is why the API-created poll, the shape with no human anywhere
+   in its loop, can be created and then cannot mail.*
 
 ## Accounts layer (Pro/Team) — optional upgrade, not a requirement
 
@@ -102,10 +107,12 @@ Every mutating route (`add_slots`, `invite`, `decide`, `delete`, `imip-decision`
 ## ETH / self-host convergence (why this doesn't fork)
 
 - `header` mode: `owner_id = uid`, `admin_token` unused, `manage_verified_at`
-  ignored (the header user is already trusted), Turnstile off. **Byte-for-byte
-  today's behavior.**
+  read but **never consulted** (the header user is already trusted), Turnstile off.
+  **Byte-for-byte today's behavior** — asserted on the rendered creation template,
+  with and without the gate's context key, as two strings.
 - All new columns are nullable/defaulted; `sched_accounts` is unused; the Turnstile
-  + magic-link middleware is hosted-only and off by default.
+  + magic-link machinery is hosted-only and off by default, and the send-gate is
+  inert outside capability mode.
 - Same release artifact runs ETH (single-tenant, header-auth) and hosted
   (many capability-isolated polls, optional accounts) — the isolation model is a
   function of *deployment + auth mode*, never a branch.
@@ -113,9 +120,9 @@ Every mutating route (`add_slots`, `invite`, `decide`, `delete`, `imip-decision`
 ## Build order (each independently shippable)
 
 1. `admin_token` + `require_manage` predicate (unlocks accountless management; ETH
-   unaffected since header mode short-circuits).
-2. `KAIROS_AUTH=capability` + `/manage/<admin_token>` magic-link route.
-3. Turnstile + `manage_verified_at` send-gate (hosted middleware).
+   unaffected since header mode short-circuits). **Shipped (#29).**
+2. `KAIROS_AUTH=capability` + `/manage/<admin_token>` magic-link route. **Shipped (#30).**
+3. Turnstile + `manage_verified_at` send-gate. **Shipped (#31)** — see below.
 4. `sched_accounts` + login + dashboard + claim (Pro).
 5. Stripe billing.
 
@@ -369,12 +376,12 @@ build on it rather than re-derive it:
     reads like a control — and worth revisiting with #32's accounts, where a session
     and its revocation can be the same object.
 
-Deliberately **not** in this step: the `manage_verified_at` **send-gate** (#31),
-Turnstile (#31), accounts / dashboard / claim (#32 — which is also where a
-creator's several accountless polls stop being one-session-at-a-time), a
+Deliberately **not** in this step: accounts / dashboard / claim (#32 — which is also
+where a creator's several accountless polls stop being one-session-at-a-time), a
 `manage_url` field on `POST /api/polls` (two lines in `api.py`, deferred while
 #63/#64 are in it; `POST /manage/link` already reaches an API-created poll by its
 `creator_email`), any expiry on the link, and the token-lifetime product question.
+The `manage_verified_at` **send-gate** and Turnstile are #31's and ship below.
 
 ## Step 1.5 shipped (#63/#64) — reach, the question above management
 
@@ -412,6 +419,138 @@ through this section rather than re-derive them:
    exactly as strong as a header anyone can assert, and #31's Turnstile work is
    about the *anonymous* surface. The boot log warns about the combination; the
    hosted deployment runs OIDC, where the IdP is the identity.
+
+## Step 3 shipped (#31) — Turnstile, and the `manage_verified_at` send-gate
+
+Two gates on the anonymous surface, and the decisions behind them that #32/#33
+should build on rather than re-derive.
+
+### A1 — the human check
+
+`kairos.turnstile`, consulted by `POST {prefix}/new` and by `POST {prefix}/manage/link`.
+
+1. **It is not middleware, because the position is the whole point.** Each route
+   calls `verify()` directly: after the CSRF token (local, and a drive-by should not
+   cost an outbound request) and before the slot expansion, any row write and any
+   SMTP connection. A middleware runs either side of both or neither. The test suite
+   pins it by call order *and* by a `tracemalloc` ceiling, because a check that ran
+   after the expansion would return the same 400 and allocate the same 2 GB.
+2. **The browser's `success` is a claim.** `verify()` posts the token to
+   `siteverify` with the *secret* and accepts only `success: true` plus a matching
+   `action` and, where configured, a matching `hostname`. `action` is one value per
+   gated form, so a token solved on the creation form cannot be replayed at the
+   re-link form — the same reason #30 gave the two anonymous forms separate CSRF
+   uids. Cloudflare's single-use tokens mean Kairos keeps no replay store of its own.
+3. **Fail closed, including on "I could not check".** Unreachable, 500 and
+   unparseable are refusals, one request each, no retry. The judgement: a gate whose
+   availability a third party controls is not a gate, and every "I could not check"
+   path here is reachable only by whoever can break our egress to Cloudflare. The
+   cost of the alternative reading is one env var away, is in a boot warning, and
+   produces an ERROR per attempt — the cost of this one is the feature.
+4. **The config fails in the strict direction and out loud.** `KAIROS_TURNSTILE` is
+   `off`/`on`; unset means `on` when `KAIROS_HOSTED` is on (the switch that already
+   means "a deployment *we* operate") and `off` otherwise. An **unrecognised value
+   reads as `on`**, following #67's `reach.policy()` after it measured
+   `KAIROS_HOSTED=enabled` selecting the permissive reach policy on the deployment
+   that had just asked to be hosted; here the same shape would silently remove the
+   gate from the one deployment whose anonymous path sends mail from our domain. A
+   deployment that turns the gate on **without both keys refuses to boot**, the
+   `SESSION_SECRET` gate's shape for the same reason. Every boot logs whether the
+   check is in force.
+5. **Click-to-load, and no flag.** Nothing from Cloudflare is fetched until the
+   person presses a button. That is what keeps obligation **P1** true — "no
+   third-party cookies, therefore no consent banner" — in the configuration that
+   actually ships, and `/privacy` discloses it either way (**P4**). There is
+   deliberately **no** setting to load the widget eagerly, because the only other
+   state is one where our own privacy page is false; a flag that selects between
+   "true" and "false" is a flag that will be flipped. The price is one extra click
+   on two forms. The widget is also *not rendered* on a page where the server would
+   waive it (a verified creator's console), so a control the server ignores never
+   spends a third-party request. *An earlier version of `static/turnstile.js`
+   created the widget's `<script>` during `init()` and therefore fetched Cloudflare
+   on every page view — the exact thing the facade exists to prevent. Found by
+   driving the real page in a browser, not by reading it; `node --check` is now a
+   pre-commit hook on `src/kairos/static/*.js`, which had no other gate.*
+6. **`action` is required, including its absence — and Cloudflare's public
+   *testing* keys therefore cannot be used.** Measured against the live endpoint:
+   the documented test secret `1x…AA` answers `success: true` for **any** response
+   string and returns no `action`. A deployment configured with one is
+   simultaneously ungated (every token verifies) and refusing every submission
+   ("Human check could not be confirmed"), which is a state no operator would guess.
+   So a verifier that reports no action is a 503 refusal rather than a pass, and
+   `identity_report`/`boot_warnings` name the test keys by value. Requiring the
+   action is what stops one solved token crossing between the two gated forms, and
+   "it did not say which form" is the same answer as "the other form": we cannot
+   prove it.
+
+### A2 — the send-gate
+
+`capability.require_sendable(poll)`: **NULL `manage_verified_at` means the poll may
+not send.**
+
+7. **Absent is NULL.** The column is read with `.get()`, so a poll dict that
+   predates it — or a stub in a test — is refused. A gate whose *missing* input reads
+   as "allowed" is the same defect `can_manage` warns about for the sibling
+   predicate, and it is the shape #29's review actually caught once.
+8. **It ships closed.** #29 added the column with no backfill, so every pre-existing
+   row is NULL and none has ever read as verified. That is why no migration risk
+   needed solving here.
+9. **One predicate, consulted ahead of the work.** `web.nudge_participants` is the
+   single chokepoint for all five reminder paths on all three surfaces, so the gate
+   is its first statement — before `charge_poll_recipients`, because a request that
+   is about to be refused must not spend the poll's whole mail allowance first. The
+   four decision/invite senders (`api.invite`, `api.email-decision`,
+   `api.imip-decision`, `web.email_decision`) and the two console actions call it
+   themselves. A spy-guard test asserts each route *reaches* it, in #29's S6 shape.
+10. **The creation mail and `POST /manage/link` are deliberately not gated.** Both
+   mail the creator's own address, and together they are how a creator becomes
+   verifiable — gating them would close the hole by deleting the feature. A2 is about
+   mail to *third parties*.
+11. **It is inert outside capability mode**, and that is the compatibility argument
+    rather than a gap: in `header`/`oidc` mode the creator is identified by the proxy
+    or the IdP, there is no address to verify, the column is dead, and ADR-0001/0002
+    require those deployments to keep behaving exactly as they do.
+12. **What "verified" is not.** A manage link we mailed was opened — no SPF/DKIM
+    `Received` chain is inspected, so a forwarded address satisfies it; and the
+    column is never cleared, so verification is permanent for the life of the poll.
+
+### The gap #68 named: `POST /manage/link` had no abuse owner
+
+13. **It is gated by the same check.** With shipped defaults a third party could
+    post a victim's address — the CSRF token is on every `/manage` page and scrapable
+    in one request, and `KAIROS_RATE_LIMIT` defaults off — and have the deployment
+    mail that victim up to ten manage links per post, from the operator's own sender
+    and domain, for free. It cannot *take* a poll (the link goes to the address that
+    owns it) and it learns nothing (the answer is identical either way), so what it
+    buys an attacker is a nuisance: our mail reputation and a spam-complaint rate.
+    Turnstile is the answer for the reason it is the answer on `/new`: the per-peer
+    budget measured at a 1.11× effect elsewhere in this repo, and eviction by address
+    rotation is not the axis that matters — the axis is one attacker aiming many
+    requests at *one* victim.
+14. **A per-address cooldown was considered and rejected**, because it is the
+    control that actually matches the threat and it fails *silently*: a creator with
+    ten polls asking twice in a day would be mailed nothing, and the response body
+    may not differ from a miss. Trading a visible failure for an invisible one on the
+    recovery path is the wrong trade; a ceiling the attacker cannot pass and the
+    owner can is better than a quota that protects both by punishing the second.
+15. **A verified creator is exempt** (`session_verifies_creator`, read off the live
+    capability cookie). They are already proof-of-human for this deployment and the
+    recovery path is where a stressed person is. Note what it does *not* allow: the
+    exemption cannot be obtained without having received a manage mail, so a
+    first-time attacker still faces the check; what it does allow is a *verified*
+    creator posting a victim's address, which is one nuisance mail per `send`-budget
+    window, bounded and rate-limited. That is the price of not making a creator
+    re-prove themselves to recover a link they legitimately lost.
+
+### Still not established
+
+A1 and A2 are ceilings and preconditions, not limiters: what bounds how much mail one
+verified creator sends afterwards is `KAIROS_RATE_LIMIT=on` plus the per-key budgets
+(A3/A4), and boot says so in those terms rather than letting a green line imply a
+closed door. A two-step confirmation on `/manage/link` (mail a *confirmation*, not the
+capability) would be strictly stronger against the nuisance case than any check on the
+requester, and is deliberately not built here: it changes that route's contract, which
+#68 owns. M1's DNS half is still the operator's and still unpublished.
 
 What #32 inherits, unchanged and pinned as tests in `tests/test_poll_reach.py`:
 

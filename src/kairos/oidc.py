@@ -348,12 +348,19 @@ class _NoRedirect(HTTPRedirectHandler):
 
 class UrllibTransport:
     def fetch(
-        self, url: str, *, method: str = "GET", data: bytes | None = None, headers: dict | None = None
+        self, url: str, *, method: str = "GET", data: bytes | None = None,
+        headers: dict | None = None, timeout: float | None = None
     ) -> Response:
+        # `timeout` is the app's one outbound seam's one tunable, added for
+        # `kairos.turnstile` (#31): a second caller with a different latency
+        # budget than an IdP token exchange, and the alternative would have been a
+        # second transport — or a runtime `httpx` import, since httpx is a *dev*
+        # dependency here, not a shipped one. Defaults to this module's
+        # `HTTP_TIMEOUT`, so every existing call site is unaffected.
         request = UrlRequest(url, data=data, method=method, headers=headers or {})
         opener = build_opener(_NoRedirect)
         try:
-            with opener.open(request, timeout=HTTP_TIMEOUT) as raw:
+            with opener.open(request, timeout=HTTP_TIMEOUT if timeout is None else timeout) as raw:
                 return self._wrap(raw)
         except HTTPError as exc:
             # A 400 from a token endpoint is information the operator needs, and
