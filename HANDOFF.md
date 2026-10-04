@@ -5,24 +5,36 @@
 
 ## Where we are
 
-`main` = `5654d20` ("KAIROS_AUTH=capability + /manage/<token> magic-link console",
-#30). Tests **1004 passing**, ~20s. 8 CI jobs: tests / quickstart / mysql / image /
-licenses / audit / gates / lockfile. All green. v0.11.0 released.
+`main` = `6a10e3c` ("chore(main): release 0.13.0"). Tests **1099 passing**, ~27s.
+8 CI jobs: tests / quickstart / mysql / image / licenses / audit / gates /
+lockfile. All green. **v0.13.0 released. PR queue empty.**
 
-Shipped since the bring-up triage, each reviewed by a fresh-context subagent and
-merged by hand: **S1 trusted-proxy allowlist** (#55/#47), **OCI image + compose**
-(#56/#35), **M1 mail identity gate + runbook** (#58/#48), **public rate limits**
-(#57/#37), **API/MCP scopes + send budgets** (#61/#51), **`admin_token` +
-`require_manage`** (#60/#29), **first-party OIDC** (#62/#53), **per-poll reach**
-(#67/#63+#64), **capability mode + /manage console** (#68/#30), and the
-**release-mechanism fix** (#66/#59). Closed as decided: **#36** (SQLite).
+The accountless chain is **complete**: #29 (`admin_token` + `require_manage`) →
+#30 (`KAIROS_AUTH=capability` + `/manage/<token>`) → #31 (Turnstile +
+`manage_verified_at` send-gate). A hosted poll can be created and managed with no
+signup, no proxy and no account.
+
+Also shipped since the bring-up triage, each after a fresh-context review:
+**S1 trusted-proxy allowlist** (#47), **OCI image + compose** (#35), **M1 mail
+identity gate + runbook** (#48), **public rate limits** (#37), **API/MCP scopes +
+send budgets** (#51), **first-party OIDC** (#53), **per-poll reach** (#67),
+**release-mechanism fix** (#59). Closed as decided: **#36** (SQLite).
 
 ## Open
 
-- **#71** release-please 0.12.0 — bot PR. Merge after confirming `uv.lock` is in
-  its file list; that is what #59 fixed and #65 proved works.
-- Next up: **#31** Turnstile + `manage_verified_at` send-gate (unblocked by #68).
-  It must also gate `POST /manage/link`. Then **#34**, **#54**, **#32**, **#33**.
+- **#34** inbound-webhook mail adapter — independent, and the Cloudflare
+  Email Routing shape #54 depends on.
+- **#54** Cloudflare Workers + D1 dialect port — a DB-driver rewrite, not config.
+- **#32** accounts + dashboard + claim, then **#33** Stripe.
+- **#70** the REST API's unbounded `dates × grid` — the fourth surface with the
+  shape that produced three rounds of OOM fixes in #68.
+- **#69** a ~1-in-140 flake on `main`: a test asserts `"1234"` is absent from a
+  page, and `static_v = str(int(time.time()))` in asset URLs contains it. Fixed on
+  a branch; needs landing.
+- **#63 / #64** deliberately left **open**: #67 shipped the mechanism but did not
+  auto-close them, because the defect is only closed once
+  `KAIROS_POLL_REACH=scoped` or `KAIROS_HOSTED=on` is in force. Closing them would
+  make the tracker claim a fix the default configuration does not deliver.
 
 ## What the reviews found (worth remembering)
 
@@ -46,6 +58,19 @@ real and all shipped:
 - **Two route audits that certified a page that would 500** — one because it
   keyed on a literal parameter name, one because it counted stubbed calls rather
   than real SQL.
+
+- **The `/manage/link` abuse owner, measured.** A *verified creator* bypassed the
+  Turnstile gate entirely (it never applies to them) and sent **200 nuisance mails
+  to one victim across 20 requests**, with `KAIROS_RATE_LIMIT` at its shipped
+  default of off. The ten polls can be planted for a victim address through
+  `POST /api/polls` with no human check at all, by design. Fixed by a cooldown
+  that **answers** — a visible "check your inbox" on the second request — so the
+  recovery path never fails silently. Bounded to 10 mails per victim per hour.
+- **A test fake that hid a real cross-form replay.** The Turnstile test double
+  answered whatever `action` the route asked for, so a token minted for `/new`
+  would have been accepted at `/manage/link` in tests while Cloudflare itself
+  binds the action from the token. The binding was always sound; the fake now
+  mints from the token so the test asserts the real property.
 
 ## Process notes that cost real time here
 
@@ -85,7 +110,9 @@ real and all shipped:
 
 1. **`KAIROS_POLL_REACH` defaults to `open`** (#67), so #63/#64's defect is fixed
    only under `KAIROS_POLL_REACH=scoped` or `KAIROS_HOSTED=on`. Defaulting to
-   `scoped` would break ETH's shared-poll model. Is `open` the right default?
+   `scoped` would break ETH's shared-poll model. Is `open` right? If yes, the
+   cheap fix is a boot warning when the policy is `open` **and** the bind is not
+   loopback — the default state currently logs nothing.
 2. **#31's consent shape** — Turnstile is a third-party embed, flipping obligation
    P4 and the `/privacy` claim. Facade, or banner?
 3. **ADR-0012's four questions** — recorded there as *recommendations*, not
