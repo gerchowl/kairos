@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
 
-from kairos import settings
+from kairos import capability, settings
 from kairos.auth import can_manage, get_base_url, get_user, require_manage
 from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
@@ -61,6 +61,17 @@ router = APIRouter(prefix=P) if P else APIRouter()
 
 def _login_or_401(next_path: str):
     """Owner pages: redirect to the deployment's sign-in page, or explain."""
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # There is no sign-in in this mode and none is coming: the manage link *is*
+    # the credential. Redirecting to a proxy login page that does not exist, or
+    # telling someone to sign in when nobody can, is the one answer this mode
+    # cannot give. The /manage page carries the "email me a new link" box.
+    if capability.enabled():
+        return render(env, "message.html", status_code=401, title="Manage link required",
+                      heading="This page needs a manage link", error=True, user=None,
+                      detail=f"This deployment manages polls by emailed link, with no "
+                             f"accounts. Open the link we sent you, or request a new "
+                             f"one at {P}/manage.")
     if settings.LOGIN_URL:
         return RedirectResponse(f"{settings.LOGIN_URL}?next={next_path}", status_code=302)
     return render(env, "message.html", status_code=401, title="Sign in required",
@@ -133,6 +144,143 @@ def _valid_timezone(tz: str) -> bool:
         return False
 
 
+# The slot-step bounds for `time_slot` mode, and the one place they are enforced.
+#
+# `increment` is a form field and this loop is a `while`, which is the whole
+# problem: `while t + timedelta(minutes=increment) <= t_end` with `increment == 0`
+# never advances `t`, so it appends a slot forever. In owner modes that is one
+# authenticated user's own request; since #30 this form is also the *anonymous*
+# accountless creation path, so `increment=0` (or `-5`) is a remote
+# unauthenticated OOM — measured against a real uvicorn, one such POST took the
+# process from 59 MB to 2.1 GB without answering, and anyio's 40-thread default
+# meant ~40 of them were enough to take the deployment down. A non-numeric value
+# was a plain `ValueError` → 500 on the same line.
+#
+# So the bound is *here*, before the loop, not in a size check after it: the cap in
+# `capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL` refuses a poll that is too big, but a
+# check that runs once the list exists cannot bound what building the list costs.
+# These two numbers make one loop iteration per minute of the window at worst, so a
+# single date is bounded by the day — 1440 iterations, 1440 slots.
+#
+# **Per date is not enough, and that was the second version of this bug.** The grid
+# is `dates × per-date iterations`, `dates` is an uncapped repeated field, and
+# Starlette's `max_fields` ceiling caps *fields*, not slots. So one 17 KB body with
+# 992 dates and a one-minute increment is 1.4 million slot dicts from a request with
+# no credential. Measured on the pre-fix tree at sixteen concurrent: **+2.2 GB**,
+# truncated only by the 2.5 GB address-space cap I put on that server to spare the
+# machine (~6 GB uncapped, per the review that found it), every request returning 400
+# "too large" afterwards and `/health` answering 200 throughout. The refusal arrived
+# after the memory was spent. Hence the product is checked before the loop, below,
+# from the same arithmetic the loop performs. After the fix, the same burst: **+4 MB**.
+MIN_INCREMENT_MINUTES = 1
+MAX_INCREMENT_MINUTES = 1440
+
+
+def _bounded_int(raw: str, low: int, high: int) -> int | None:
+    """`raw` as an int inside `low..high`, or None — never an exception.
+
+    One parser for both numeric form fields on this path, because a form field is
+    a string typed by a stranger: `int()` on it is a 500 waiting for a value like
+    `"1.5"`, and `max(1, int(raw))` is a 500 that a sanitizer makes worse.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if low <= value <= high else None
+
+
+def _parse_clock(raw: str):
+    """A `HH:MM` form field as a datetime, or None.
+
+    `strptime` is the parser; the None is the part that matters. A `start_time_all`
+    of `"25:00"` raised out of the route rather than being refused, and since #30
+    the route is anonymous, so an unparseable clock was a 500 on it — the same shape
+    as the unvalidated `increment` above, on the two lines beside it, and fixed in
+    the same place.
+    """
+    try:
+        return datetime.strptime(raw.strip(), "%H:%M")
+    except (AttributeError, ValueError):
+        return None
+
+
+def _expand_time_slots(form, dates) -> tuple[list[dict], str | None]:
+    """The `time_slot` grid for `dates`, or the sentence that refuses it.
+
+    Its own function so that every bound is visibly attached to the loop it
+    protects. That is not tidiness: the loop is a `while` over a form field, the
+    route is anonymous since #30, and the two facts together are what made
+    `increment=0` an unauthenticated OOM — a check that lives in another function,
+    or after the list is built, is not a bound on the loop. The refusals are
+    returned rather than rendered so this stays free of auth-mode shape: the caller
+    owns `_fail`, which is the one thing that differs between the modes.
+    """
+    start_all = form.get("start_time_all", "09:00")
+    end_all = form.get("end_time_all", "17:00")
+    if not start_all or not end_all:
+        return [], "Start and end times are required for time slot mode."
+    t_start = _parse_clock(start_all)
+    t_end = _parse_clock(end_all)
+    if t_start is None or t_end is None:
+        return [], "Start and end times must be given as HH:MM."
+    increment = _bounded_int(form.get("increment", "30"), MIN_INCREMENT_MINUTES, MAX_INCREMENT_MINUTES)
+    if increment is None:
+        return [], (
+            f"Increment must be a whole number of minutes between "
+            f"{MIN_INCREMENT_MINUTES} and {MAX_INCREMENT_MINUTES}."
+        )
+
+    # **The product, before any of it exists.** Two facts about this loop that are
+    # easy to hold one at a time and impossible to hold separately:
+    #
+    #   * `per_date` is the loop's own arithmetic — `(t_end - t_start) // increment`
+    #     is exactly how many whole steps fit, which is how many times the `while`
+    #     below runs. No float, no estimate, and no second copy of the rule to drift
+    #     out of step with it.
+    #   * `n_dates` counts what the loop actually iterates, not what the body
+    #     contained: the loop skips empty fields, so counting those would refuse a
+    #     submission the loop was going to answer "At least one date is required".
+    #
+    # So `n_dates * per_date` is the slot count this input produces, and asking
+    # `capability` whether that is allowed costs one integer multiplication. That is
+    # the entire fix: the grid below is only ever built when its size is already known
+    # to be acceptable.
+    #
+    # Exact for a forward window. For a *reversed* one (`end` before `start`) the
+    # floor division of a negative timedelta is negative — `12:00→00:00` at one minute
+    # predicts −720 — where the loop builds nothing, so the prediction is below the
+    # output rather than equal to it. That direction is the safe one and always is:
+    # a negative count is never over the ceiling, so the request is accepted, builds
+    # zero slots, and is answered "At least one date is required" by the caller.
+    # Checked over all 12.4M reversed (start, end, increment) combinations: the
+    # prediction is never above the loop's output.
+    n_dates = sum(1 for date in dates if date)
+    per_date = (t_end - t_start) // timedelta(minutes=increment)
+    refusal = capability.slot_cap_refusal(n_dates * per_date, n_dates)
+    if refusal:
+        return [], refusal
+
+    slots = []
+    for date in dates:
+        if not date:
+            continue
+        t = t_start
+        # Bounded twice over now, and the first bound is the load-bearing one:
+        # `increment >= 1` means `t` advances every iteration (so the `while`
+        # terminates at all), and `n_dates * per_date <= the cap` above means the
+        # list cannot exceed what was just checked.
+        while t + timedelta(minutes=increment) <= t_end:
+            t_next = t + timedelta(minutes=increment)
+            slots.append({
+                "date": date,
+                "start_time": t.strftime("%H:%M"),
+                "end_time": t_next.strftime("%H:%M"),
+            })
+            t = t_next
+    return slots, None
+
+
 def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
     """Auth + CSRF + management-authority gate shared by all owner POST actions.
 
@@ -151,24 +299,48 @@ def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
     return user, require_manage(poll, request, user=user)
 
 
-def expand_new_dates(poll: dict, dates: list[str]) -> list[dict]:
+def expand_new_dates(poll: dict, dates: list[str], *, cap: int | None = None) -> list[dict]:
     """Slots for genuinely-new dates; time_slot polls reuse the poll's time grid.
 
-    **Per date, and it multiplies.** A `time_slot` poll expands each new date over
-    the poll's whole time grid, so the number of rows written is
-    `len(new_dates) x len(time grid)` — a one-minute grid is 1440 slots *per date*,
-    and asking for ten dates writes 14,400 of them in one `POST
-    /polls/{id}/slots`. The grid is bounded by how the poll was created and the date
-    list is not capped here, which is a pre-existing write-amplification surface on
-    a route that already requires `polls:write` **and** reach over the poll; it is
-    written down rather than changed, because a cap would be a behaviour change on
-    requests that succeed today.
+    **`cap` is the ceiling on `new_dates × time-pairs`, and it is checked before the
+    comprehension rather than after it.** Both factors come from the request or from
+    the poll, and the product is what actually lands in the database:
+
+      * `dates` — on the capability console this arrives as ONE comma-separated field
+        that `_parse_dates` splits, so Starlette's `max_fields` ceiling never sees the
+        dates at all. One ~1 MB field is 95,000 valid dates; the review that found
+        this measured a 220 KB body with 20,000 dates against a poll carrying 125
+        distinct time pairs — **2,500,000 slot rows, 2,501,000 written, +1.1 GB,
+        14 s, status 302**. Not refused, because nothing here looked.
+      * `time_pairs` — the poll's *own* grid, which grows by up to one edit's worth
+        of slots every time. So even a single new date becomes expensive eventually,
+        and only the product says so.
+
+    The owner form and the REST API pass no `cap` and keep their existing behaviour:
+    the owner path is bounded by `max_fields` (about 90x lower per request) and the
+    API is #51/#63/#64's surface with its own budget. This parameter exists so the
+    capability console can ask for the ceiling at its own call site rather than
+    having a mode check reach into a shared helper and silently change two other
+    surfaces.
     """
     existing = {str(s["date"]) for s in poll["slots"]}
     new_dates = [d for d in dates if d and d not in existing]
     time_pairs = sorted({(fmt_time(s["start_time"]), fmt_time(s["end_time"]))
                          for s in poll["slots"] if s.get("start_time")})
-    if poll["mode"] == "time_slot" and time_pairs:
+    on_grid = poll["mode"] == "time_slot" and time_pairs
+    # Every date yields at least one slot, so this is the minimum the comprehension
+    # below can produce and never an over-estimate of it.
+    per_date = len(time_pairs) if on_grid else 1
+    product = len(new_dates) * per_date
+    if cap is not None and product > cap:
+        raise HTTPException(
+            400,
+            # `slot_cap_refusal` words it and knows the mode; the `or` is for a caller
+            # that passes a cap outside this mode, where it deliberately has no opinion.
+            capability.slot_cap_refusal(product, len(new_dates))
+            or f"That edit would add {product:,} slots, over the limit of {cap:,}.",
+        )
+    if on_grid:
         return [{"date": d, "start_time": st, "end_time": et}
                 for d in new_dates for st, et in time_pairs]
     return [{"date": d} for d in new_dates]
@@ -242,6 +414,14 @@ def short_link(code: str):
 
 @router.get("/")
 def dashboard(request: Request):
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # No dashboard exists in this mode, deliberately. `list_polls` is keyed on an
+    # owner uid, and accountless polls are never listed anywhere (ADR-0009 --
+    # `sched_polls.owner_id` is NULL for them and nothing lists by absence), so
+    # the front page is the creation form rather than a list of other people's
+    # polls. The per-poll dashboard is #32's, alongside accounts and claim.
+    if capability.enabled():
+        return new_poll_page(request)
     user = get_user(request)
     if not user:
         return _login_or_401(f"{P}/")
@@ -269,6 +449,12 @@ def dashboard(request: Request):
 
 @router.get("/new")
 def new_poll_page(request: Request):
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # The same form, without a user behind it: `new_poll_context` carries the CSRF
+    # binding for an anonymous submit and the auth-mode flag that makes the
+    # template ask for a creator address.
+    if capability.enabled():
+        return render(env, "new_poll.html", **capability.new_poll_context())
     user = get_user(request)
     if not user:
         return _login_or_401(f"{P}/new")
@@ -279,10 +465,33 @@ def new_poll_page(request: Request):
 @router.post("/new")
 def create_poll_submit(request: Request, form=Depends(form_data),
                        _=Depends(rate_limit("create"))):
+    # ---- issue #30, KAIROS_AUTH=capability --------------------------------
+    # The same form, the same `create` budget, one difference: there is no identity
+    # to authorize, so the credential is minted and *mailed* instead. This is the
+    # only unauthenticated poll-creation path in the app, which is why #31's
+    # Turnstile check belongs on this branch and nowhere else, and why the branch
+    # is kept to the auth head, the refusal renderer and the create tail.
+    accountless = capability.enabled()
     user = get_user(request)
-    if not user:
-        return _login_or_401(f"{P}/new")
-    require_csrf(user, form)
+    if accountless:
+        capability.require_anon_csrf(form)
+    else:
+        if not user:
+            return _login_or_401(f"{P}/new")
+        require_csrf(user, form)
+
+    def _fail(detail, heading="New Poll"):
+        """A form refusal, in whichever shape this mode has a user for.
+
+        `_error_page` builds the notification navbar from an owner uid, which an
+        accountless submission does not have, so the accountless refusal goes
+        through the same template without one. The signature mirrors
+        `_error_page`'s (heading, detail) so the four call sites read the same as
+        the ones they replaced, and the page title stays "New Poll" rather than
+        becoming the sentence.
+        """
+        return (capability.anon_error(heading, detail, back=f"{P}/new") if accountless
+                else _error_page(user, heading, detail, f"{P}/new"))
 
     title = form.get("title", "").strip()
     description = form.get("description", "").strip() or None
@@ -290,35 +499,17 @@ def create_poll_submit(request: Request, form=Depends(form_data),
     timezone = form.get("timezone", "Europe/Zurich").strip()
 
     if not title:
-        return _error_page(user, "New Poll", "Title is required.", f"{P}/new")
+        return _fail("Title is required.")
     if not _valid_timezone(timezone):
-        return _error_page(user, "New Poll", "Unknown timezone.", f"{P}/new")
+        return _fail("Unknown timezone.")
 
     dates = form.getlist("dates")
 
     slots = []
     if mode == "time_slot":
-        start_all = form.get("start_time_all", "09:00")
-        end_all = form.get("end_time_all", "17:00")
-        increment = int(form.get("increment", "30"))
-        if not start_all or not end_all:
-            return _error_page(user, "New Poll",
-                               "Start and end times are required for time slot mode.",
-                               f"{P}/new")
-        t_start = datetime.strptime(start_all, "%H:%M")
-        t_end = datetime.strptime(end_all, "%H:%M")
-        for date in dates:
-            if not date:
-                continue
-            t = t_start
-            while t + timedelta(minutes=increment) <= t_end:
-                t_next = t + timedelta(minutes=increment)
-                slots.append({
-                    "date": date,
-                    "start_time": t.strftime("%H:%M"),
-                    "end_time": t_next.strftime("%H:%M"),
-                })
-                t = t_next
+        slots, error = _expand_time_slots(form, dates)
+        if error:
+            return _fail(error)
     else:
         for date in dates:
             if not date:
@@ -326,8 +517,16 @@ def create_poll_submit(request: Request, form=Depends(form_data),
             slots.append({"date": date})
 
     if not slots:
-        return _error_page(user, "New Poll", "At least one date is required.", f"{P}/new")
+        return _fail("At least one date is required.")
 
+    # ---- issue #30: the create tail. Everything above is shared; here the modes
+    # diverge -- an accountless poll has no owner_id and a per-poll placeholder
+    # creator (see capability.anonymous_creator_id for why that is not a
+    # migration), and its manage link goes out by mail.
+    if accountless:
+        return capability.create_accountless_poll(
+            request, form, title=title, description=description, mode=mode,
+            timezone=timezone, slots=slots)
     # owner_id is the authenticated owner (ADR-0009); in header mode that is the
     # same uid as creator_id, and creator_email stays NULL because only the
     # hosted accountless flow mails a management link (#30).

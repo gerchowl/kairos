@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+{# HTML email — inline CSS is required by mail clients (style-guard exempts templates/email/). #}
+<html>
+<body style="font-family: -apple-system, system-ui, sans-serif; color: #2e3038;">
+<p>{{ brand }} sent you a link that lets you manage a scheduling poll:</p>
+<h2 style="color: #3060c8;">{{ poll_title }}</h2>
+
+<p style="margin: 0 0 8px;"><strong>Open your poll</strong></p>
+<p style="margin: 0 0 18px;"><a href="{{ manage_url }}" style="background: #3060c8; color: #f4f1eb; padding: 12px 24px; border-radius: 4px; text-decoration: none; display: inline-block;">Open the management page</a></p>
+
+<div style="border-left: 3px solid #d0d0d8; padding-left: 12px; margin: 0 0 18px;">
+<p style="margin: 0 0 8px;"><strong>This link is the credential.</strong> There is no account and no password behind it: whoever holds it can manage this poll &mdash; add dates, invite people, decide the date, or delete the poll.</p>
+<p style="margin: 0;"><strong>It works once.</strong> Opening it trades it for a private session in your browser, and the link itself stops working. That is deliberate &mdash; a link that stayed valid forever would still be sitting in your mailbox, your browser history, and any forwarded copy of this message.</p>
+</div>
+
+<p style="color: #70707a; font-size: 13px;">Need to get back in later? Open {{ brand }}, or use the <em>&ldquo;email me a new link&rdquo;</em> box on the manage page with this address.</p>
+<p style="color: #70707a; font-size: 12px; margin-top: 24px;">If you did not create this poll, ignore this message and delete it. Nobody else can reach it without this link.</p>
+</body>
+</html>

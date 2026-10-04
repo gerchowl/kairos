@@ -993,36 +993,145 @@ def test_a_valid_session_cookie_resolves_to_an_owner(monkeypatch):
     assert user["source"] == "oidc"
 
 
+def _decode_segment(segment: str) -> bytes:
+    return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+
+
+def _encode_segment(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _flip_a_byte_in_the_signature(token: str) -> str:
+    """One bit of the signature's *first* byte, inverted.
+
+    Written at the byte layer on purpose, because the obvious character-level
+    version does not tamper with anything. A base64url segment's length need not be
+    a multiple of 4, so its final character carries unused bits and several
+    characters decode to identical bytes. itsdangerous signs with a 20-byte digest —
+    a 27-character signature holding 160 bits — so that trailing character takes 16
+    different values across tokens (measured over 2000), and "replace it with A"
+    changes the decoded digest only when it happened not to be one of A's 15
+    aliases: 271 times in 4000, about 6.8%.
+
+    That is why the earlier character-flip test read as an intermittent failure
+    rather than as a test that asserts nothing: roughly one run in fifteen was
+    actually testing the signature, and the rest were being refused by something
+    else.
+
+    **Why the first byte specifically**, since "index 0" is an assumption like any
+    other: the unused bits are an artefact of the base64 *encoding* of a digest whose
+    length is not a multiple of 3, and they land in the final character. Byte 0 is
+    load-bearing under every digest algorithm and every length, and the length is
+    asserted rather than assumed. Between the two helpers here nothing indexes a
+    *character* and nothing depends on the payload's length: `_claims_tampered`
+    re-mints through the real serializer, so a short payload is not a special case.
+    """
+    payload, timestamp, signature = token.rsplit(".", 2)
+    digest = bytearray(_decode_segment(signature))
+    assert len(digest) >= 1, "a signature with no bytes has nothing to tamper with"
+    digest[0] ^= 0x01
+    return f"{payload}.{timestamp}.{_encode_segment(bytes(digest))}"
+
+
+def _claims_tampered(token: str) -> str:
+    """Valid, allowlisted claims with the *original* signature left in place.
+
+    The other half of the same problem, and the more important half. Flipping a
+    character in the payload produces bytes that are no longer valid JSON, so the
+    token gets refused whether or not the signature is ever checked — which is
+    exactly what a fail-open `_deserialize` does (unsigned decode → JSON error →
+    None), and why every mutation of this shape left 152/152 green with the
+    verifier weakened.
+
+    Here the claims are re-minted through the real serializer and spliced under the
+    old signature: an otherwise perfect session whose signed bytes no longer match.
+    Nothing but the signature can refuse it.
+    """
+    _, timestamp, signature = token.rsplit(".", 2)
+    claims = oidc._serializer(salt="oidc-session").loads(token)
+    claims["email"] = "attacker@example.org"
+    # `rsplit`, not `split`: itsdangerous marks a compressed payload with a leading
+    # ".", so a token is three segments or four depending on its size, and any
+    # helper that assumes a count breaks on half of them.
+    payload = oidc._serialize("oidc-session", claims).rsplit(".", 2)[0]
+    return f"{payload}.{timestamp}.{signature}"
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
-        # A flip in the token's *body*, not in its last base64url character. The
-        # signature is 20 bytes = 160 bits, and 27 unpadded base64url characters
-        # carry 162, so the final character has two bits no decoder reads (the
-        # second review corrected four to two). Replacing it is therefore a
-        # byte-level no-op whenever those two bits are the only thing that changed
-        # -- 1 of the 16 possible final digests, i.e. 6.25%, about one run in 16 --
-        # and the tampered token still verified. A body flip always changes bytes
-        # the HMAC covers.
-        lambda token: token[:3] + ("A" if token[3] != "A" else "B") + token[4:],
+        # #67's correction, and the reason the signature mutator exists: a flip in
+        # the token's *body*, not in its last base64url character. The signature is
+        # 20 bytes = 160 bits, and 27 unpadded base64url characters carry 162, so
+        # the final character has two bits no decoder reads (the second review
+        # corrected four to two). Replacing it is therefore a byte-level no-op
+        # whenever those two bits are the only thing that changed -- 1 of the 16
+        # possible final digests, i.e. 6.25%, about one run in 16 -- and the
+        # tampered token still verified. A body flip always changes bytes the
+        # HMAC covers, which is why the two mutators differ in kind.
+        _flip_a_byte_in_the_signature,
+        _claims_tampered,
         lambda token: token + "x",
         lambda token: token[:-4],
+        lambda token: token.replace(".", "", 1),
     ],
+    ids=["signature-bit", "claims-resealed", "trailing-junk", "truncated", "no-separator"],
 )
 def test_a_tampered_session_cookie_is_not_an_owner(monkeypatch, mutate):
     _allowlist(monkeypatch)
     good = _session_token(monkeypatch)
-    assert oidc.session_user(_with_session(mutate(good))) is None
+    tampered = mutate(good)
+    assert tampered != good, "the mutation did not change anything"
+    assert oidc.session_user(_with_session(tampered)) is None
 
 
 def test_a_session_cookie_signed_with_another_secret_is_not_an_owner(monkeypatch):
     """SESSION_SECRET is the only thing between a cookie and ownership of every
-    poll in the deployment."""
+    poll in the deployment.
+
+    Written as a pair that differs in *one* thing: the same claims — an
+    **allowlisted** subject and this deployment's own issuer, so the allowlist
+    check and the issuer check both pass — signed with a different secret. The
+    previous version of this test used `sub-mallory`, which is *not* on the
+    allowlist, so with a fail-open `_deserialize` it passed for a second reason and
+    the signature was never the thing doing the rejecting: weakening the verifier to
+    an unsigned decode left all 152 tests in this file green, this one included.
+
+    The control half is what makes it a test rather than a hope — the identical
+    claims, signed correctly, are accepted.
+    """
     _allowlist(monkeypatch)
-    forged = URLSafeTimedSerializer("a-different-secret", salt="oidc-session").dumps(
-        {"sub": "sub-mallory", "iss": ISSUER, "email": "m@example.org", "email_verified": True}
-    )
+    claims = {"sub": "sub-alice", "iss": ISSUER, "email": "alice@example.org",
+              "email_verified": True}
+    assert oidc.session_user(_with_session(oidc._serialize("oidc-session", claims)))["uid"] == "sub-alice"
+
+    forged = URLSafeTimedSerializer("a-different-secret", salt="oidc-session").dumps(claims)
+    # The payload is byte-identical to the accepted one; only the signature differs.
+    assert forged.rsplit(".", 2)[0] == oidc._serialize("oidc-session", claims).rsplit(".", 2)[0]
     assert oidc.session_user(_with_session(forged)) is None
+    assert oidc._deserialize("oidc-session", forged, oidc.SESSION_MAX_AGE) is None
+
+
+def test_the_verifier_is_the_only_thing_refusing_a_foreign_signature(monkeypatch):
+    """The mutation the last test cannot express: break the verifier and watch it fail.
+
+    A test can only pin what it asserts, so this one asserts the *seam*. Replacing
+    `oidc._serializer` with one built on a different secret must make every
+    correctly signed cookie unverifiable — which is the property the tests above
+    depend on and the one a reviewer weakened by hand to see whether anything
+    noticed. If a future change makes `_deserialize` fail open (an unsigned
+    base64 fallback, say), this fails and says which control stopped existing.
+    """
+    _allowlist(monkeypatch)
+    good = _session_token(monkeypatch)
+    assert oidc.session_user(_with_session(good)) is not None
+
+    monkeypatch.setattr(
+        oidc, "_serializer", lambda salt="session": URLSafeTimedSerializer("a-different-secret", salt=salt)
+    )
+    assert oidc._deserialize("oidc-session", good, oidc.SESSION_MAX_AGE) is None
+    assert oidc.session_user(_with_session(good)) is None
+
 
 
 def test_garbage_and_absent_cookies_are_simply_not_an_owner(monkeypatch):
@@ -1344,13 +1453,24 @@ def test_an_unverifiable_response_says_so_without_echoing_the_provider(client, m
     provider.install(monkeypatch, ALLOWED_SUBJECTS=frozenset({"sub-alice"}))
     state, _ = _start(client)
     provider.token_status = 400
+    # A token that cannot collide with anything the page legitimately contains.
+    # The previous value here was the four characters "1234", and every rendered page
+    # carries `static_v` — `str(int(time.time()))`, fixed once per process — in its
+    # asset URLs, so this test failed whenever the wall clock's unix timestamp
+    # happened to contain "1234": 7 positions in a 10-digit number, so roughly a 1-in-140
+    # coin flip per test *run*, for every run in the process. It went red on this
+    # branch's first CI run of the review round and passed on every local run, which
+    # is the worst possible signature. The assertion's intent is "the provider's words
+    # never reach the page", and a distinctive token tests that intent with no coin
+    # flip attached. Reproduced by pinning the clock to 1791112348 and rendering the
+    # page: the old value failed on the asset URL, this one passes.
     provider.token_error = {
         "error": "invalid_client",
-        "error_description": "client secret is wrong for app 1234",
+        "error_description": "client secret is wrong for app zq7-fixture-4b2e",
     }
     response = client.get(f"{P}/oidc/callback", params={"code": "c", "state": state}, follow_redirects=False)
     assert response.status_code == 400
-    assert "1234" not in response.text  # provider internals stay in the log
+    assert "zq7-fixture-4b2e" not in response.text  # provider internals stay in the log
     assert not client.cookies.get(oidc.SESSION_COOKIE)
 
 

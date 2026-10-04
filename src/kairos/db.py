@@ -353,6 +353,138 @@ def get_poll_by_token(public_token: str) -> dict | None:
     return poll
 
 
+# -- Accountless management (issue #30) -------------------------------------
+#
+# The three operations `/manage/<admin_token>` needs, kept in the data layer
+# rather than in the route module because each one is a state change on the
+# capability itself, and a route is the wrong place to make one look routine.
+
+
+def get_poll_by_admin_token(admin_token: str | None) -> dict | None:
+    """The poll a management capability denotes, or None.
+
+    Mirrors `get_poll_by_token` and inherits its reason for re-reading the
+    slots: the owner surface needs them for convergence and for the .ics.
+
+    `None` in, `None` out -- an absent token is not a lookup for the empty
+    string, which is what a caller that forgot to check would otherwise ask for.
+
+    Resolving by token is *not* authorization. A row with a NULL admin_token --
+    every poll that predates #29 -- is unreachable from here by construction, and
+    for the rest the caller still calls `auth.require_manage`, which compares in
+    constant time and fails closed.
+    """
+    if not admin_token:
+        return None
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM sched_polls WHERE admin_token = %s", (admin_token,))
+    poll = cursor.fetchone()
+    if not poll:
+        cursor.close()
+        conn.close()
+        return None
+    cursor.execute("SELECT * FROM sched_poll_slots WHERE poll_id = %s ORDER BY date, start_time", (poll["id"],))
+    poll["slots"] = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return poll
+
+
+def rotate_admin_token(poll_id: str, expected: str) -> str | None:
+    """Replace this poll's management capability with a fresh one, and return it.
+
+    **Single use.** This is what makes the emailed link a magic link rather than
+    a permanent bearer credential: the exchange consumes the token and hands back
+    the new one inside the session cookie, so the value that travelled through an
+    inbox stops working the moment anyone opens it. The same write retires every
+    older capability cookie, because such a cookie *is* a capability.
+
+    **Compare-and-swap, not an unconditional write.** `expected` is the token the
+    caller presented, and the `WHERE` clause requires it to still be the row's
+    token. Two exchanges racing on the same link therefore produce exactly one
+    winner and one refusal, instead of two winners whose first session cookie is
+    dead the moment it is minted. An unconditional `WHERE admin_token IS NOT
+    NULL` cannot express that: it reports success to the loser, who would mint a
+    session around a capability that has already been replaced -- a guard that
+    reads as if it works while being unreachable.
+
+    Returns None when `expected` no longer matches, which includes a row that
+    carries no capability at all (NULL means "no management capability was ever
+    minted for this poll", see `init_schema`) rather than handing such a row a
+    credential it was deliberately created without. The caller must treat None as
+    a refusal, not as "here is your new token".
+    """
+    token = new_token()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sched_polls SET admin_token = %s WHERE id = %s AND admin_token = %s",
+        (token, poll_id, expected),
+    )
+    conn.commit()
+    rotated = cursor.rowcount > 0
+    cursor.close()
+    conn.close()
+    return token if rotated else None
+
+
+def mark_manage_verified(poll_id: str) -> bool:
+    """Stamp `manage_verified_at` the first time a manage link is opened.
+
+    True only for the write that actually set it, so a caller can tell "this is
+    the first open" from "it was already open" -- the log line and the copy in the
+    UI differ. The `IS NULL` guard is in the SQL rather than in a read-then-write,
+    so two simultaneous first opens cannot both claim to be first and the column
+    keeps the *first* time rather than the last.
+
+    This is the write only. The **send-gate** -- refusing to put bytes in a third
+    party's inbox until this column is set -- is obligation A2 and belongs to #31;
+    nothing here gates anything, deliberately, so #31 can add that gate without
+    re-deciding who may manage a poll.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sched_polls SET manage_verified_at = CURRENT_TIMESTAMP"
+        " WHERE id = %s AND manage_verified_at IS NULL",
+        (poll_id,),
+    )
+    conn.commit()
+    first = cursor.rowcount > 0
+    cursor.close()
+    conn.close()
+    return first
+
+
+def list_polls_by_creator_email(email: str) -> list[dict]:
+    """Polls whose management link was sent to `email`, newest first.
+
+    Backs the "email me a new link" request in `KAIROS_AUTH=capability` (#30),
+    where a spent single-use link is recoverable only by re-mailing it to the
+    address that already owns the poll.
+
+    Filtered in SQL rather than by filtering `list_polls()` in Python, because the
+    unscoped call reads every poll in the deployment into memory and this route
+    is unauthenticated: it is charged to the peer by #37's `send` budget and must
+    not be a whole-table scan on top of that. No index on `creator_email`, so this
+    is a scan of the smallest table in the schema — the ~21k-poll ceiling #51
+    documents — and the caller caps how many rows it will act on.
+
+    Returns rows *without* slots: nothing here renders or serialises them.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM sched_polls WHERE creator_email = %s ORDER BY created_at DESC",
+        (email,),
+    )
+    polls = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return polls
+
+
 def list_polls(creator_id: str | None = None) -> list[dict]:
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)

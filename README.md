@@ -112,6 +112,7 @@ self-contained.
 | `oidc` | **~4 env vars** | **anything real.** Kairos terminates OIDC itself; no auth proxy |
 | `header` | an infrastructure project | you already run Shibboleth, OpenAthens, oauth2-proxy, Authelia, Cloudflare Access or Tailscale |
 | `none` | zero | public/respondent-only; the management UI is disabled |
+| `capability` | zero + working SMTP | **hosted accountless.** No account and no proxy: we mail the creator a manage link, and holding it *is* the credential. The link works once — opening it trades itself for a private browser session — so keep it. |
 
 The `oidc` mode is the primary multi-user self-host path because it is the only
 one that is both multi-user and cheap — nginx cannot terminate OIDC, which is
@@ -128,6 +129,36 @@ KAIROS_OIDC_ALLOWED_SUBJECTS=<sub-from-your-IdP> \
 SESSION_SECRET=$(openssl rand -hex 32) \
 uvx --from kairos-scheduler kairos --host 0.0.0.0
 ```
+
+In `capability` mode there is nothing to wire: `KAIROS_AUTH=capability`, a
+`SESSION_SECRET` (**required — the deployment refuses to boot without it**, because
+that secret signs the cookie which is the entire management credential) and working
+outbound mail, because the link *is* the credential — plus
+`KAIROS_TRUSTED_PROXY_CIDRS` and `KAIROS_PUBLIC_URL`, and `KAIROS_RATE_LIMIT=on`,
+without which anonymous poll creation and link re-requests are an open mail relay
+from your own domain. Every boot says which of these is missing. Creation asks for an email
+address, mails `{prefix}/manage/<link>`, and opening it exchanges for a signed
+session (`KAIROS_CAPABILITY_SESSION_HOURS`, default 12). Four consequences worth
+knowing before you enable it:
+
+* **it needs mail that works** — Kairos refuses to create a poll it cannot send a
+  link for, rather than minting a poll nobody can reach;
+* **the link is single use** — a second device, or a link eaten by a mail
+  prefetcher, needs `POST {prefix}/manage/link` with the creator's address, which
+  Kairos serves off every `/manage` page;
+* **the live token lands in your access log.** `GET {prefix}/manage/<link>` puts the
+  capability in the request line, so anything logging requests — uvicorn, nginx, a
+  CDN — has it. Kairos never writes a token or a creator address to its own logs, and
+  the token is retired the moment it is exchanged, but for a link nobody ever opens it
+  is valid forever *and* logged forever. Redact that path or keep those logs
+  short-lived;
+* **`KAIROS_PUBLIC_URL` is load-bearing here in a way it is not elsewhere.** A wrong
+  origin means a broken link in other modes; here it means a phishing mail sent from
+  your own sender and branding, carrying a manage-link URL on the attacker's host.
+
+There is no logout route in this mode: a shared browser ends its session by expiry or
+by opening a fresh link. See
+[docs/design/multitenancy-hosting.md](docs/design/multitenancy-hosting.md).
 
 `KAIROS_OIDC_ALLOWED_SUBJECTS` is **required** — an empty allowlist refuses to
 boot, because Kairos will not admit "anyone the IdP vouched for". A successful

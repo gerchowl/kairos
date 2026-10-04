@@ -23,7 +23,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    from kairos import scoping
+    from kairos import capability, scoping
     from kairos.api import router as api_router
     from kairos.auth import peer_address, peer_is_trusted
     from kairos.oidc import boot_warnings, identity_report
@@ -112,6 +112,15 @@ def create_app() -> FastAPI:
     # with no trusted-proxy CIDRs) are warnings, not a line of prose in a green log.
     for warning in scoping.boot_warnings():
         scoping_log.warning("%s", warning)
+# ---- issue #30: the same statement for the accountless mode. Which control
+    # decided "who may manage a poll" is the fact an operator cannot infer from a
+    # working page, and in capability mode the answer is a link in an inbox rather
+    # than a proxy — so say it, and say it unconditionally, so a self-hoster on a
+    # deployment that never asked for it still reads "not in use".
+    cap_log = logging.getLogger("kairos.capability")
+    cap_log.info("%s", capability.identity_report())
+    for warning in capability.boot_warnings():
+        cap_log.warning("%s", warning)
 
     @app.middleware("http")
     async def trusted_proxy_only(request, call_next):
@@ -137,6 +146,11 @@ def create_app() -> FastAPI:
     # route table — which tests/test_ratelimit.py's route audit reads — does not
     # change shape with the auth mode.
     app.include_router(oidc_router, include_in_schema=False)
+    # ---- issue #30: same rule for the accountless console, for the same reason.
+    # After `web_router`, because `web` imports `capability` at module scope for
+    # the accountless creation branch; the reverse edge is resolved lazily inside
+    # the handlers.
+    app.include_router(capability.router, include_in_schema=False)
 
     # Obligation A3 (#37): register the rejection handler for exhausted budgets.
     # Registered unconditionally and inert while KAIROS_RATE_LIMIT is unset, so
