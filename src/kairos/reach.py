@@ -51,8 +51,29 @@ function of the poll id in the path and the key's grant, so it is enforced by th
 route's `api_scope(..., reach=True)` declaration, ahead of the handler, where the
 CI audit can see it (`guard_reach`). On the web surface the decision needs the poll
 row and the caller's rows, so the routes ask in one line where they already have
-the poll (`require_reach`, `can_reach`). Both call `can_reach`; neither re-decides
-the rule.
+the poll (`can_reach`). Both call `can_reach`; neither re-decides the rule.
+
+**Both enforcement points fail closed on their own inputs.** A declaration of
+`reach=True` that cannot identify *which* poll is refused (`required_poll_id`
+raises) rather than allowed through, because "I could not tell" and "you may read
+it" must never be the same answer; and the poll id is read off the route's path
+*template* rather than by matching the literal name `poll_id`, so a route that
+spells its parameter `{pid}` is guarded and audited exactly like one that spells it
+`{poll_id}`. The first review of this PR found both halves of that missing at once
+and demonstrated the consequence: a rogue `{pid}` route handed a `polls:read` key
+every respondent on the instance while the suite stayed green.
+
+**What each surface answers with a refusal, and why it differs.** The API surface
+answers 403 and never consults the poll, so "not yours" and "does not exist" are
+literally the same code path — it cannot tell them apart, which is the whole reason
+there is no existence oracle there. The web surface *has* to read the poll to
+decide (its rule includes "named on this poll"), so it could tell them apart and
+therefore must not: both web refusals are **404, the same answer a missing poll
+gets**, and the wording says nothing about ownership. That is why there is no
+`require_reach` counterpart to `require_manage` (#29) — a helper that raised one
+status for a refusal while the route raised another for a missing poll *was* the
+oracle, and each web route renders its own 404 in whatever shape its own surface
+wants (a styled page for the poll, a bare 404 for the ICS).
 
 **What is deliberately not modelled here.** Per-account reach (#32) and per-plan
 reach (#33). Both need an identity the data model does not have yet:
@@ -80,10 +101,6 @@ SCOPED = "scoped"
 
 # The spelling of an instance-wide grant in `KAIROS_API_KEYS` (`KEY:scopes~*`).
 ALL_POLL_CLAIM = "*"
-
-# The claim a route makes about *where* its authorization lives, read off the live
-# route table by the audit test the way `api_scope.scope` is.
-_POLL_ID = "poll_id"
 
 
 class EveryPoll:
@@ -138,18 +155,72 @@ def policy() -> str:
     already declares "this is a deployment we operate" rather than inventing a
     second notion of hosted-ness that could disagree with it.
 
-    An unrecognised value refuses — a `RuntimeError` here fails the boot, because
-    `scoping.boot_report` calls this at startup — rather than falling back to either
-    reading. A typo that silently picked `open` would leave an operator believing a
-    control is in force that is not; one that silently picked `scoped` would lock a
-    deployment out of its own polls. Both are worse than a refusal at boot.
+    **An unrecognised `KAIROS_HOSTED` is `scoped` here, deliberately against the
+    mail gate's reading.** `settings` resolves that knob as a recognised-true set
+    (`1/on/true/yes`), so `KAIROS_HOSTED=Y` leaves `HOSTED` False and
+    `HOSTED_UNKNOWN` True, and the M1 gate reads that as *off* — the safe
+    direction for a self-hoster whose relay authenticates their own mail. This
+    function used to inherit that reading, and the consequence was that the one
+    spelling an operator actually types quietly selected `open`, the permissive
+    policy, on the deployment that had just asked to be treated as hosted: a
+    typo was a fail-open on the exact control that made HOSTED matter. The two
+    readings now differ on purpose, because the costs are not symmetric. Getting
+    the mail gate wrong costs a warning about DNS records nobody here can publish;
+    getting *this* wrong costs every respondent name on the instance. So an
+    unknown value is read as "the operator meant hosted, and misspelled it" and
+    gets the strict policy, which is also the recoverable one — a self-hoster who
+    meant otherwise sets `KAIROS_POLL_REACH=open` and gets back exactly the
+    pre-#63 behaviour, and `boot_warnings` says so by name.
+
+    An unrecognised `KAIROS_POLL_REACH` refuses — a `RuntimeError` here fails the
+    boot, because `scoping.boot_report` calls this at startup — rather than
+    falling back to either reading. A typo that silently picked `open` would leave
+    an operator believing a control is in force that is not; one that silently
+    picked `scoped` would lock a deployment out of its own polls. Both are worse
+    than a refusal at boot.
     """
     raw = _raw().strip().lower()
     if not raw:
-        return SCOPED if settings.HOSTED else OPEN
+        return SCOPED if settings.HOSTED or settings.HOSTED_UNKNOWN else OPEN
     if raw not in POLICIES:
         raise RuntimeError(f"KAIROS_POLL_REACH: {raw!r} is not a reach policy (known: {', '.join(POLICIES)})")
     return raw
+
+
+def boot_warnings() -> list[str]:
+    """Reach warnings: a control an operator believes is in force and is not.
+
+    The same convention as `oidc.boot_warnings` — returned, not logged here, and
+    printed as `log.warning` next to the INFO boot line by `main.create_app`.
+    Reach was INFO-only, which is exactly the wrong level for the two states where
+    the deployment is not what the operator believes:
+
+      * `KAIROS_HOSTED` set to something unrecognised, which `policy` now reads as
+        hosted (`scoped`) while the mail gate reads it as off. Both readings are
+        correct for their own control; an operator holding only the boot log
+        should not have to guess which one is in force.
+      * `scoped` in header mode with no trusted-proxy CIDRs, where reach is exactly
+        as strong as a header anybody can assert. Without a CIDR list the app
+        trusts every peer, so `X-User: <creator uid>` is reach on demand and the
+        strict policy is decorative.
+    """
+    warnings = []
+    if settings.HOSTED_UNKNOWN:
+        warnings.append(
+            f"KAIROS_HOSTED={settings.HOSTED_RAW!r} is not a value Kairos recognises, so it says "
+            f"neither 'hosted' nor 'self-hosted'. Poll reach is therefore SCOPED — the fail-closed "
+            f"reading, because this knob decides who may read which poll — while the mail gate "
+            f"(M1) still reads it as OFF. Fix the spelling, or set KAIROS_POLL_REACH=open if "
+            f"this really is a self-hosted deployment."
+        )
+    if policy() == SCOPED and settings.AUTH_MODE == "header" and not settings.TRUSTED_PROXY_NETWORKS:
+        warnings.append(
+            "poll reach is SCOPED in header mode with no KAIROS_TRUSTED_PROXY_CIDRS: reach is "
+            "then only as strong as the identity headers, so anyone who can reach this port can "
+            "assert X-User: <a creator uid> and reach that creator's polls. Put the app behind a "
+            "proxy and name its CIDRs, or treat reach as decorative."
+        )
+    return warnings
 
 
 # -- Who reaches what --------------------------------------------------------
@@ -288,23 +359,6 @@ def _refuse_key(principal: dict, poll_id: str) -> None:
     )
 
 
-def require_reach(poll: dict, request: Request, **kwargs) -> dict:
-    """`poll` if the caller may read it, else 403. Returns the poll.
-
-    The same shape as `require_manage` (#29) and for the same reason: a route that
-    already holds the poll asks for its authorization in one line and cannot forget
-    the 403. 403 rather than 404 for a caller who presented a credential — "you are
-    not the owner" is the only thing either a stranger or a wrong key is entitled to
-    learn — while a *missing* poll stays the route's own 404, so "forbidden" and
-    "gone" never share one code path.
-    """
-    if can_reach(poll, request, **kwargs):
-        return poll
-    if kwargs.get("principal") is not None:
-        _refuse_key(kwargs["principal"], poll["id"])
-    raise HTTPException(403, "Not the poll owner")
-
-
 def only_reachable(polls: list[dict], request: Request, **kwargs) -> list[dict]:
     """`polls` filtered to what the caller may reach — `GET /polls` under `scoped`.
 
@@ -324,18 +378,91 @@ def only_reachable(polls: list[dict], request: Request, **kwargs) -> list[dict]:
 
 # -- The route-side seam -----------------------------------------------------
 
+# The path segment a poll id follows, in both surfaces' shapes (`/polls/{...}`,
+# `/api/polls/{...}`). Structural on purpose: the first review of this PR found
+# `poll_id_of` and the audit both matching the literal name `poll_id`, so a route
+# that spelled its parameter `{pid}` was unguarded *and* invisible to the audit.
+_POLL_SEGMENT = "polls"
+
+# The house spelling, used only where there is no route template to read (a
+# hand-built scope, a test). Never as the rule: the rule is `poll_param`.
+_POLL_ID = "poll_id"
+
+
+def poll_param(path: str) -> str | None:
+    """The path-parameter name that holds the poll id in `path`, or None.
+
+    Found *structurally* — the `{...}` parameter immediately following the `polls`
+    segment — rather than by matching a literal `{poll_id}`, because the name a
+    route happens to use is a spelling and not the rule. A route that writes
+    `/polls/{pid}` is guarded by exactly the same predicate as one that writes
+    `/polls/{poll_id}`, and the CI audit asks the same question of both.
+
+    None for a route that names no poll after `polls` (`/polls`, `/polls/{poll_id}/…`
+    aside), which is the honest answer rather than a guess: those routes reach no
+    single poll and `required_poll_id` refuses them.
+    """
+    segments = [s for s in str(path or "").split("/") if s]
+    for i, segment in enumerate(segments):
+        if segment != _POLL_SEGMENT or i + 1 >= len(segments):
+            continue
+        candidate = segments[i + 1]
+        if len(candidate) > 2 and candidate.startswith("{") and candidate.endswith("}"):
+            return candidate[1:-1]
+    return None
+
+
+def route_path(request: Request) -> str:
+    """The path template of the route serving `request`, or "".
+
+    Read off the scope's route object rather than off the request URL, because the
+    *template* is what says which parameter is the poll id — the concrete path has
+    the id's value in it and no name.
+    """
+    route = (request.scope or {}).get("route")
+    return getattr(route, "path_format", "") or getattr(route, "path", "") or ""
+
 
 def poll_id_of(request: Request) -> str | None:
     """The poll id in this request's path, or None if the route names no poll.
 
-    Read from `request.path_params` rather than from the route's signature: a
-    dependency runs before the handler and before its arguments are bound, and the
-    path params are the one thing already resolved on the scope by then. Returns
-    None rather than raising for a route with no poll in its path — a declared reach
-    on such a route reaches no poll, so there is nothing to refuse, and the audit
-    test is what makes sure no *poll-id* route forgot to declare one.
+    Read from `request.path_params` — a dependency runs before the handler and
+    before its arguments are bound, and the path params are the one thing already
+    resolved on the scope by then — but *which* parameter is looked up comes from
+    the route's own template (`poll_param`), never from a hard-coded name.
+
+    None rather than raising for a route with no poll in its path: a declared reach
+    on such a route reaches no poll, and `required_poll_id` is what turns that into
+    a refusal. The audit test is what makes sure no *poll-id* route forgot to
+    declare one, and it asks the same structural question.
     """
-    return (request.path_params or {}).get(_POLL_ID)
+    params = request.path_params or {}
+    name = poll_param(route_path(request))
+    if name:
+        return params.get(name)
+    return params.get(_POLL_ID)
+
+
+def required_poll_id(request: Request) -> str:
+    """`poll_id_of(request)`, or a loud failure — never a silent pass.
+
+    The rule `guard_reach` turns into a decision. A declared reach whose route does
+    not resolve to exactly one poll is *not* an authorization anyone can evaluate,
+    and the two available answers are both wrong in the same direction: guessing
+    "no poll, therefore nothing to refuse" hands the caller whatever the handler
+    reads, which is #63's defect with a new name on it. So the guard refuses the
+    request (a 500, not a 403 — this is a bug in the route, not a caller's
+    mistake) and says which route and what it expected.
+    """
+    poll_id = poll_id_of(request)
+    if not poll_id:
+        raise RuntimeError(
+            f"{route_path(request) or '(unknown route)'}: reach was declared but no poll id "
+            f"resolves from this request's path — expected a '{{...}}' parameter after "
+            f"'/{_POLL_SEGMENT}/'. Refusing rather than allowing an authorization that "
+            f"cannot name its poll."
+        )
+    return poll_id
 
 
 def guard_reach(request: Request, principal: dict) -> None:
@@ -348,8 +475,8 @@ def guard_reach(request: Request, principal: dict) -> None:
     poll-id route shipping with no reach. The same principal is left on
     `request.state.api_principal` for the route's own use.
 
-    Two properties follow from reach on this surface being a pure function of the
-    path id, and both are worth having:
+    Three properties follow from reach on this surface being a pure function of the
+    path id, and all three are worth having:
 
     * **no query.** Under `open` this returns immediately, so the default
       configuration spends not one statement more than before this file existed; under
@@ -359,12 +486,16 @@ def guard_reach(request: Request, principal: dict) -> None:
       a poll with that id exists; no code path here can tell the difference. Poll
       ids are UUID4, so the oracle would have been worthless anyway — not having one
       is a property, not a fix.
+    * **no silent pass.** `reach=True` on a route whose poll id does not resolve is
+      a `RuntimeError`, not a `return` (see `required_poll_id`). The first review of
+      this PR shipped the silent pass, and it was not theoretical: a route naming its
+      parameter `{pid}` skipped the check entirely while the audit — matching the
+      same literal — reported the route table clean, and a `polls:read` key read
+      every respondent on the instance with the suite green.
     """
     if policy() == OPEN:
         return
-    poll_id = poll_id_of(request)
-    if not poll_id:
-        return
+    poll_id = required_poll_id(request)
     if not key_reaches(principal, poll_id):
         _refuse_key(principal, poll_id)
 

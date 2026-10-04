@@ -151,7 +151,11 @@ class Principal(dict):
     @property
     def polls(self) -> "reach.Grant":
         """Which polls this caller reaches (issue #63). See `kairos.reach`."""
-        return self["polls"]
+        # `.get`, not `[...]`, for the reason `reach.grant_for` is: a hand-built
+        # Principal or a code path that resolved a key without recording its grant
+        # must read as *nothing*, never as everything. One spelling of "absent is
+        # nothing" across both surfaces.
+        return self.get("polls", frozenset())
 
 
 def key_id(key: str) -> str:
@@ -717,8 +721,9 @@ def boot_report() -> str:
     legacy_reach = "KAIROS_API_KEY reaches every poll" if _legacy_key() else "no KAIROS_API_KEY"
     reach_line = {
         reach.OPEN: f"poll reach OPEN -> every authenticated caller reads every poll "
-                    f"({legacy_reach}; unchanged since before #63 — set "
-                    f"KAIROS_POLL_REACH=scoped to scope it)",
+                    f"({legacy_reach}; the pre-#63 rule, kept so no existing read stops "
+                    f"being legal — DEPRECATED as a default, set KAIROS_POLL_REACH=scoped "
+                    f"to scope it)",
         reach.SCOPED: f"poll reach SCOPED -> a scoped key reads only the polls its "
                       f"'~<poll-id>' claim names, {legacy_reach} (KAIROS_POLL_REACH=open "
                       f"reverts to the pre-#63 rule)",
@@ -749,3 +754,35 @@ def boot_report() -> str:
         f" {settings.MAIL_PER_POLL[0] or 'off'} recipients/poll per"
         f" {settings.MAIL_PER_POLL[1]}s; {aggregate}"
     )
+
+
+def boot_warnings() -> list[str]:
+    """Warnings about a control an operator believes is in force and is not.
+
+    Returned rather than logged here and printed by `main.create_app` at WARNING,
+    next to the INFO line above, because that is the convention `oidc.boot_warnings`
+    established for exactly this case: the boot line is what an operator pastes
+    into a ticket, and the states worth a ticket are the ones a green boot would
+    otherwise hide.
+
+    Reach's own warnings (`reach.boot_warnings`: an unrecognised `KAIROS_HOSTED`,
+    `scoped` in header mode with no trusted-proxy CIDRs) are appended rather than
+    reimplemented, and the keyring's is added here because it needs the keyring:
+
+      * `open` with scoped keys configured. An operator who has handed out
+        least-privilege keys believes those keys are scoped to what they were
+        granted; under `open` every one of them still reads every poll on the
+        instance and their `~` claims are inert. That is #63 still reproducing, and
+        it is the single most useful thing a `scoped` operator has to be told
+        before they assume they are protected.
+    """
+    warnings = list(reach.boot_warnings())
+    entries = keyring()
+    if entries and reach.policy() == reach.OPEN:
+        warnings.append(
+            f"poll reach is OPEN: every authenticated caller reaches every poll, so the "
+            f"{len(entries)} scoped key(s) in KAIROS_API_KEYS still read the whole instance "
+            f"and their '~' claims are inert. Set KAIROS_POLL_REACH=scoped to make them mean "
+            f"what they say (docs/design/poll-reach.md)."
+        )
+    return warnings

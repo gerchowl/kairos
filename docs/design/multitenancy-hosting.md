@@ -176,7 +176,18 @@ through this section rather than re-derive them:
    hosted deployment only because `KAIROS_HOSTED=on` implies `scoped`.** Under the
    default `open` policy an authenticated key (or any signed-in user in header
    mode) does enumerate by `GET /api/polls` — which is the single-team model
-   ADR-0001/0002 require, and why `open` cannot be the hosted default.
+   ADR-0001/0002 require, and why `open` cannot be the hosted default. It is a
+   *deprecation* rather than a permanent answer: the boot log says at WARNING
+   whenever scoped keys exist under `open` (their `~` claims are inert), and an
+   unrecognised `KAIROS_HOSTED` reads as `scoped` rather than quietly selecting
+   `open`, because a typo in that knob used to do exactly that. Issues #63/#64 are
+   therefore closed by `scoped`, not by this default — see the closure note in the
+   PR.
+3. **The hosted deployment's reach also depends on how identity is asserted.** In
+   `KAIROS_AUTH=header` mode with no `KAIROS_TRUSTED_PROXY_CIDRS`, `scoped` is
+   exactly as strong as a header anyone can assert, and #31's Turnstile work is
+   about the *anonymous* surface. The boot log warns about the combination; the
+   hosted deployment runs OIDC, where the IdP is the identity.
 
 What #32 inherits, unchanged and pinned as tests in `tests/test_poll_reach.py`:
 
@@ -189,7 +200,9 @@ What #32 inherits, unchanged and pinned as tests in `tests/test_poll_reach.py`:
 * **A key that creates a poll is not auto-granted reach over it**, for the same
   reason; auto-granting on create would hand every key every poll whose id it could
   guess. With accounts it becomes "the creating principal's reach includes what it
-  created", which is a one-line change plus the provisioning story.
+  created", which is a one-line change plus the provisioning story. Until then the
+  creation response carries a `reach_warning` naming the grant the key needs, so a
+  caller is never handed a poll id it cannot use without being told.
 * **`KAIROS_API_KEY` is the explicit instance-wide grant** rather than an exemption
   from the scoped policy, so a deployment that tightens reach cannot lose its own
   service credential. #33's per-plan reach slots into the same field.

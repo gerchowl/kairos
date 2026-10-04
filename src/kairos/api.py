@@ -32,7 +32,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from kairos import settings
+from kairos import reach, settings
 from kairos.auth import get_base_url
 from kairos.db import (
     add_response,
@@ -63,7 +63,6 @@ from kairos.email_service import (
 from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
-from kairos.reach import only_reachable, reached_by
 from kairos.scoping import api_scope, charge_force, charge_poll_recipients, check_recipient_list, enforce
 from kairos.web import (
     _valid_timezone,
@@ -214,8 +213,8 @@ def whoami(user: dict = Depends(api_scope())):
             # questions, and an agent refused a poll deserves to learn from one
             # call that it was refused the poll, not its capability — including
             # which of the two reach rules the deployment is running.
-            "polls": reached_by(user).polls,
-            "reach_policy": reached_by(user).policy}
+            "polls": reach.reached_by(user).polls,
+            "reach_policy": reach.reached_by(user).policy}
 
 
 @router.post("/polls")
@@ -240,7 +239,23 @@ def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depend
     poll = create_poll(creator_id, body.title, body.description, body.mode, body.timezone,
                        slots, creator_id, creator_email)
     poll["share_url"] = _share_url(request, poll)
-    return _without_secrets(poll)
+    created = _without_secrets(poll)
+    # Issue #63, residual 2, said out loud instead of discovered on the next call:
+    # a key whose reach is a bounded list cannot reach the poll it just made, so
+    # every read and every edit of it will 403 until an operator names it. That is
+    # deliberate (nothing can infer "the key that made this poll" from the row —
+    # `creator_id` is the literal "api" for every key, #32), but a caller that
+    # creates a poll and is then refused it has been handed an id it provably
+    # cannot use, so the response says so at the moment it can still be acted on.
+    if reach.policy() == reach.SCOPED and not reach.key_reaches(user, poll["id"]):
+        created["reach_warning"] = (
+            f"This key cannot reach poll {poll['id']} under KAIROS_POLL_REACH=scoped, so reads, "
+            f"edits and deletes of it will be refused until an operator grants it reach "
+            f"(KAIROS_API_KEYS, '~{poll['id']}') or widens the key's claim to '~*'. It has no "
+            f"per-key identity in the schema yet, so creating a poll does not imply reaching it "
+            f"(issue #32). GET /api/whoami reports what this key reaches."
+        )
+    return created
 
 
 @router.get("/polls")
@@ -249,7 +264,7 @@ def list_polls_endpoint(request: Request, user: dict = Depends(api_scope("polls:
     # the whole instance here. Under `open` the argument comes back unchanged and
     # unexamined; under `scoped` it is the caller's reach -- and an empty list,
     # rather than a 403, is what a correctly-scoped key with no grant is owed.
-    polls = only_reachable(list_polls(), request, principal=user)
+    polls = reach.only_reachable(list_polls(), request, principal=user)
     for poll in polls:
         poll["share_url"] = _share_url(request, poll)
     # Scrubbed on the way out, from the return value -- see _without_secrets.

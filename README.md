@@ -374,7 +374,27 @@ machine-facing surface.
 Unset means `scoped` when `KAIROS_HOSTED=on` (a deployment *we* operate is the
 multi-tenant case, where `open` is an IDOR) and `open` otherwise, so a self-hoster
 and the ETH group deployment keep the behaviour they have today. An
-unrecognised value refuses the boot.
+unrecognised `KAIROS_POLL_REACH` refuses the boot.
+
+An unrecognised `KAIROS_HOSTED` (`Y`, `enabled`, `2`, …) reads as **scoped**, and
+the boot log says so at WARNING. The mail gate still reads that value as "not
+hosted", which is right for mail — but this knob now decides who may read which
+poll, so a misspelling must not quietly select the permissive policy. Fix the
+spelling, or say `KAIROS_POLL_REACH=open` if the deployment really is self-hosted.
+
+**`open` is a deprecation, not a recommendation.** It stays the default because
+every read that is legal today has to stay legal today (ADR-0001/0002), but it is
+the pre-#63 rule and it still reproduces #63/#64 in full: any authenticated caller
+reads every poll. Moving a deployment to `scoped` is three steps and no code:
+
+1. **Audit.** `GET /api/whoami` reports each key's reach claim; list the keys and
+   what they should reach.
+2. **Grant.** Add `~<poll-id>` per key, or `~*` for the deployment's own service
+   key and cron jobs. `KAIROS_API_KEY` already holds `~*`, so the ETH/duplet
+   adapter keeps the instance either way.
+3. **Flip.** `KAIROS_POLL_REACH=scoped` (or `KAIROS_HOSTED=on`) and read the boot
+   line: it states which rule is in force, and the warnings name anything that is
+   still off.
 
 Under `scoped`, a key says which polls it reaches:
 
@@ -393,3 +413,20 @@ deployment: in header mode the authenticating proxy *is* the tenant boundary, so
 `scoped` admits everyone named on the poll rather than only its creator. Full
 reasoning, and the cases this does not cover yet, in
 `docs/design/poll-reach.md`.
+
+**On the web surface, `scoped` is only as strong as the identity it trusts.** In
+`KAIROS_AUTH=header` mode the caller's identity *is* a request header, so with no
+`KAIROS_TRUSTED_PROXY_CIDRS` set, anyone who can reach the port can assert
+`X-User: <a creator uid>` and reach that creator's polls. `scoped` there is
+decorative until the app sits behind a proxy whose CIDRs are named — the boot log
+warns when it is not.
+
+Two things `scoped` does *not* do, both pinned by tests so a later change is
+deliberate:
+
+* a refusal on the web surface is **404**, the same answer a missing poll gets,
+  because that surface has to read the poll in order to decide and must therefore
+  not also tell a caller which of the two it was;
+* a key that creates a poll it cannot reach is **not** auto-granted reach over it
+  (nothing in the schema says which key made the row, issue #32) — the creation
+  response carries a `reach_warning` naming the grant it needs instead.

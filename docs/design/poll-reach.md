@@ -56,6 +56,36 @@ the IDOR. One knob, no second notion of "hosted" that could disagree with the
 first, and the deployment where the defect is exploitable gets the fix without
 anyone having to remember to set a flag.
 
+**Why `open` is nevertheless a deprecation.** The default keeps the compatibility
+guarantee and nothing else: `open` is the pre-#63 rule, it still reproduces
+#63/#64 exactly, and it is stated at boot as such. A deployment that configures
+`KAIROS_API_KEYS` and gets a warning that its `~` claims are inert is being told
+the truth about what it has. The migration is three configuration steps and no
+code (README, "Poll reach"), so the default is a floor to stand on and a state to
+leave, not an answer.
+
+**Why an unrecognised `KAIROS_HOSTED` is `scoped`, against the mail gate's
+reading.** `settings` resolves that knob as a recognised-true set
+(`1/on/true/yes`); anything else leaves `HOSTED` False and sets
+`HOSTED_UNKNOWN`, and the M1 mail gate reads that as *off* — correctly, because a
+self-hoster's relay authenticates their own mail and unsetting the gate must not
+break it. This module reads the same knob and deliberately does **not** inherit
+that answer, because making HOSTED decide reach changed the cost of getting it
+wrong:
+
+| | misreading a typo costs | recoverable by |
+|---|---|---|
+| mail gate (M1) | a warning about DNS records nobody here can publish | fixing the spelling |
+| reach | every respondent name on the instance | — |
+| reach, other way | a deployment locked out of its own polls | `KAIROS_POLL_REACH=open` |
+
+The first review of this PR measured `KAIROS_HOSTED=Y` selecting `open`: the one
+spelling an operator actually types quietly chose the permissive policy on the
+deployment that had just asked to be treated as hosted. An unknown value is
+therefore read as "the operator meant hosted and misspelled it", gets the strict
+policy, and is reported at WARNING with the way back — which is also the direction
+whose mistake is cheap.
+
 ## Configuring reach for keys
 
 `KAIROS_API_KEYS` entries take an optional `~` clause:
@@ -86,24 +116,48 @@ its configuration is broken when it is exactly right.
 
 ## Enforcement, and what keeps it honest
 
-* **API** — every route whose path names `{poll_id}` declares
-  `api_scope(..., reach=True)`. On this surface reach is a pure function of the
-  path id and the key's grant, so it is enforced in that declaration
-  (`reach.guard_reach`), ahead of the handler, with no database read: under `open`
-  it returns immediately (the default spends not one statement more than before),
-  and under `scoped` a refused id is refused whether or not a poll with it exists.
-* **Web** — the routes that already hold the poll ask in one line
-  (`can_reach` / `require_reach`). The poll page hands the predicate the response
-  and invite rows it fetched for the grid, so refusing a stranger costs no extra
-  query, and the check sits before the only side effect on that path (marking
-  notifications read).
-* **The audit** — `tests/test_poll_reach.py` walks the live `/api` route table
-  through #51's `_api_routes` (and its fixed, both-sides-anchored prefix filter)
-  and fails if a route naming `{poll_id}` declares no reach. It is extended from
-  "declares a scope" to "declares a reach" rather than standing up a parallel
-  guard, and it is backed by driving every poll-id read with a key that has no
-  reach — a declaration the handler ignored would pass the audit and still ship
-  the IDOR.
+* **API** — every route whose path names a poll declares `api_scope(...,
+  reach=True)`. On this surface reach is a pure function of the path id and the
+  key's grant, so it is enforced in that declaration (`reach.guard_reach`), ahead
+  of the handler, with no database read: under `open` it returns immediately (the
+  default spends not one statement more than before), and under `scoped` a refused
+  id is refused whether or not a poll with it exists.
+* **Web** — the routes that already hold the poll ask in one line (`can_reach`).
+  The poll page hands the predicate the response and invite rows it fetched for
+  the grid, so refusing a stranger costs no extra query, and the check sits before
+  the only side effect on that path (marking notifications read).
+* **The poll id is found structurally.** `reach.poll_param` looks for the path
+  parameter *after the `polls` segment* and reads that parameter's value, so a
+  route that spells it `{pid}` is guarded and audited exactly like `{poll_id}`.
+  The first review found the guard and the audit both matching the literal name,
+  which is a fail-open with a green suite attached: a `{pid}` route skipped the
+  check and was invisible to the audit at the same time. One function, asked of
+  both.
+* **A declared reach that cannot name its poll refuses.** `required_poll_id`
+  raises rather than returning, so `reach=True` on a path with no poll id is a 500
+  naming the route — not a silent pass. "I could not tell" and "you may read it"
+  must never be the same answer.
+* **What a refusal looks like differs by surface, on purpose.** The API surface
+  answers 403 and never reads the poll, so "not yours" and "does not exist" are
+  one code path by construction. The web surface must read the poll to apply the
+  *named on this poll* half of the rule, so it could tell the two apart — and
+  therefore answers 404 to both, with wording that names neither. That is why
+  there is no `require_reach` beside `require_manage`: one helper raising one
+  status while the route raised another *was* the oracle.
+* **The audit, on both surfaces.** `tests/test_poll_reach.py` walks the live
+  `/api` route table through #51's `_api_routes` (and its fixed, both-sides-
+  anchored prefix filter) and fails if a route naming a poll declares no reach.
+  It is extended from "declares a scope" to "declares a reach" rather than
+  standing up a parallel guard. On the web surface there was no audit at all —
+  only rate-limit bookkeeping — and the first review demonstrated the cost: a new
+  unguarded `GET /polls/{poll_id}/rogue-export` answered 200 to an authenticated
+  stranger under `scoped` with the suite green. There the audit reads what the
+  routes *ask* (they authorize by calling, not by declaring), in three layers: the
+  live route table, so a new poll-id route is unlisted and fails; the handler's own
+  source, so a listed route cannot pass by not asking; and a real request as a
+  stranger, so a route cannot pass by asking and ignoring. Each layer is driven on
+  a synthetic app with the leaking request, because an audit that only proves it can
+  notice has not proved anything.
 * **REST and MCP agree** (ADR-0012) by construction: the MCP server is a thin HTTP
   client, and the parity harness is reused unchanged.
 
@@ -118,13 +172,29 @@ its configuration is broken when it is exactly right.
    cannot be, for the reason above — auto-granting on create would hand every key
    every poll whose id it could guess. Until accounts exist, a scoped key that
    creates a poll must be granted reach to it in `KAIROS_API_KEYS`; the 403 names
-   the poll and the knob. This is pinned as a test so #32 changes it deliberately.
+   the poll and the knob. Pinned as a test so #32 changes it deliberately.
+
+   The second review sharpened the shape of this residual. Under `scoped`,
+   `POST /polls` returned an id the caller provably could not use — every later read
+   and mutation 403, and the row is in nobody's `GET /polls` — which is the worst of
+   both: auto-granting would be wrong, and silence makes the caller discover it
+   later. Creation is *not* refused, because the deployment that should be creating
+   polls with a bounded key would break; the response instead carries a
+   `reach_warning` naming the poll, the knob and the grant that fixes it, at the
+   moment the operator can still act on it. A `respond` key cannot hit this at all
+   (`POST /polls` needs `polls:write`), so the two capabilities cannot disagree
+   about creating; both facts are pinned.
 3. **Per-plan reach** (#33): `scoping.Tier` resolves capabilities only. A tier may
    grow a reach field; no call site moves.
 4. **In header mode, `scoped` is narrower than the proxy's own notion of the
    group.** A colleague who was neither the creator nor invited nor a respondent
    loses the page — correctly, under `scoped`, but it is why the ETH deployment
    should stay on `open` (its default) rather than assume `scoped` is free.
+
+   The converse also holds and belongs next to it: in header mode with no
+   `KAIROS_TRUSTED_PROXY_CIDRS`, `scoped` is *only* as strong as the headers.
+   Anyone who can reach the port can assert `X-User: <a creator uid>` and reach
+   that creator's polls. The boot log warns about exactly this combination.
 5. **What a permitted reader sees is unchanged.** Under `scoped` an invited
    colleague reads the same page they read before, including the availability grid
    with respondent names — the sharing rule the group is relying on. Narrowing

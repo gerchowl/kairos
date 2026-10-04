@@ -51,7 +51,7 @@ from kairos.helpers import (
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
 from kairos.ratelimit import rate_limit
-from kairos.reach import can_reach, require_reach
+from kairos.reach import can_reach
 from kairos.scoping import charge_poll_recipients
 from kairos.templating import render
 
@@ -196,6 +196,20 @@ def _error_page(user: dict, heading: str, detail: str, back: str, status_code: i
                   **_nav_ctx(user))
 
 
+def _not_yours_or_gone(user: dict, back: str) -> Response:
+    """404 for a poll the caller may not read — and for one that is not there.
+
+    One answer for both, on purpose (issue #63/#64, second review). On this surface
+    reach cannot be decided without reading the poll row, so a 403 for "not yours"
+    beside a 404 for "not there" is a probe that distinguishes them for anyone
+    holding an id. The detail therefore names neither: it says the poll is not
+    available, which is true in both cases and useless as a probe.
+    """
+    return _error_page(user, "Poll not found",
+                       "This poll does not exist, or is not available to you.",
+                       back, status_code=404)
+
+
 # -- Routes --
 
 @router.get("/v/{code}")
@@ -332,10 +346,13 @@ def view_poll(poll_id: str, request: Request):
     # without making it public (kairos.reach). Placed before the notifications are
     # marked read, which is the only side effect on this path: a refused caller must
     # not leave a trace.
+    #
+    # 404 and not 403, and the wording says nothing about ownership: this route has
+    # read the poll in order to decide, so 403-here/404-for-a-missing-poll would be
+    # an existence oracle for anyone holding an id (see `kairos.reach`'s module
+    # docstring). Same answer, same page, whether the poll is not yours or not there.
     if not can_reach(poll, request, user=user, participants=(responses, invites)):
-        return _error_page(user, "Not allowed",
-                           "Only the poll owner or a participant can view this poll.",
-                           f"{P}/", status_code=403)
+        return _not_yours_or_gone(user, f"{P}/")
 
     # Mark poll notifications as read
     notifs = get_notifications(user["uid"], unread_only=True)
@@ -455,6 +472,11 @@ def edit_poll_page(poll_id: str, request: Request):
     poll = get_poll(poll_id)
     if not poll:
         return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
+    # Left at 403, not unified to 404 with the reach refusals above: this is
+    # management authority (#29), which the default configuration also serves, and
+    # changing it would alter bytes on a surface #63/#64 does not own. The
+    # management-side oracle it leaves is written down as a residual in
+    # docs/design/poll-reach.md.
     if not can_manage(poll, request, user=user):
         return _error_page(user, "Not allowed", "Only the poll owner can edit it.",
                            f"{P}/polls/{poll_id}", status_code=403)
@@ -665,12 +687,16 @@ def poll_ics(poll_id: str, request: Request):
     if not user:
         return _login_or_401(f"{P}/polls/{poll_id}")
     poll = get_poll(poll_id)
-    if not poll:
-        raise HTTPException(404)
     # Same reach rule as the poll page above (issue #64): the decided time and the
     # title are the owner's to publish, and this route is easy to forget because it
-    # looks like a harmless read. `require_reach` refuses before the ICS is built.
-    return ics_response(require_reach(poll, request, user=user), request)
+    # looks like a harmless read. One 404 for "not there" and "not yours", with the
+    # *same body* — this surface had to read the poll to decide, so a distinct
+    # refusal would be an existence oracle for anyone holding an id (see
+    # `kairos.reach`). The bare 404 is also exactly what a missing poll answered
+    # before this check existed.
+    if not poll or not can_reach(poll, request, user=user):
+        raise HTTPException(404)
+    return ics_response(poll, request)
 
 
 @router.post("/polls/{poll_id}/email-decision")

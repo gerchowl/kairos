@@ -16,16 +16,20 @@ What these tests hold to, in the order they matter:
    A self-hoster and the ETH group deployment are in that state and must stay in it
    (ADR-0001/0002). The strict policy is opt-in, and `KAIROS_HOSTED` turns it on
    because that is the multi-tenant case the defect is actually exploitable in.
+   Section 1b is the second review's addition: the knob that *selects* the policy
+   may not itself fail open.
 2. **Under `scoped`, the right caller may read and nobody else.** Sections 3 and 4
    are the authorization matrix: for each protected read, *who* may read it —
    owner, legacy service key, key granted that poll, key granted every poll, key
    granted another poll, and a stranger on the web surface. Not "403 vs 200" but
    named callers.
-3. **A new poll-id route cannot ship unguarded.** Section 5 extends #51's route
-   audit from "declares a scope" to "declares a reach", reusing its live route
-   walk (and its fixed prefix anchoring) rather than standing up a parallel guard,
-   and then drives every poll-id read with a key that has no reach — so the audit
-   is backed by observed behaviour, not only by a declaration.
+3. **A new poll-id route cannot ship unguarded, on either surface.** Section 5
+   extends #51's route audit from "declares a scope" to "declares a reach", reusing
+   its live route walk (and its fixed prefix anchoring) rather than standing up a
+   parallel guard; 5b holds both enforcement points to their own inputs — a renamed
+   path parameter is still guarded, and a declared reach that cannot name its poll
+   refuses; 5c is the web-surface audit the second review found missing entirely.
+   Each is backed by driving the live app, not only by reading a declaration.
 4. **The refusal is legible and never names the credential** (#51's rule), and
    REST and MCP answer identically (ADR-0012).
 
@@ -34,11 +38,14 @@ The residual cases this could not cover — per-account reach (#32), per-plan re
 pinned as tests at the end so a later change to any of them is a deliberate diff.
 """
 
+import os
+import sys
 from datetime import date, time
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
-from test_api_scoping import API, _api_routes, _load_mcp, _wire_mcp_to_app
+from test_api_scoping import API, _api_routes, _load_mcp, _walk, _wire_mcp_to_app
 
 from kairos import api, main, ratelimit, reach, scoping, settings, web
 
@@ -306,6 +313,179 @@ def test_the_policy_is_read_at_call_time_from_either_door(monkeypatch):
     assert reach.policy() == reach.SCOPED
 
 
+# -- 1b. `KAIROS_HOSTED` MAY NOT FAIL OPEN ------------------------------------
+#
+# Second review. `KAIROS_HOSTED` was a mail-identity knob (M1/#48) whose fail-open
+# was correct there: an unrecognised value keeps the mail gate *off*, which is the
+# safe direction for a self-hoster whose relay authenticates their own mail. This
+# PR is what made the same knob decide *who may read which poll*, and it inherited
+# the reading: `KAIROS_HOSTED=Y` — the spelling an operator actually types — left
+# `HOSTED` False and silently selected `open`, the permissive policy, on the
+# deployment that had just asked to be treated as hosted.
+
+
+def _policy_in_a_fresh_process(env: dict) -> str:
+    """`(HOSTED, HOSTED_UNKNOWN, policy)` from a real process, for one env value.
+
+    A subprocess rather than a monkeypatched constant because the bug *is* the
+    wiring: `HOSTED_UNKNOWN` is derived from the raw string at import, and a test
+    that patched the boolean would assert the conclusion without exercising the
+    parse. Same shape as `tests/test_mail_auth.py::_import_settings`.
+    """
+    import subprocess
+    from pathlib import Path
+
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, 'src');"
+            " from kairos import settings, reach;"
+            " print(settings.HOSTED, settings.HOSTED_UNKNOWN, reach.policy())",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, **env},
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # Recognised. `Y` is not one of these, which is the whole point.
+        ("on", "True False scoped"),
+        ("1", "True False scoped"),
+        ("yes", "True False scoped"),
+        ("true", "True False scoped"),
+        # Recognised as self-host: the pre-#63 rule, unchanged.
+        ("", "False False open"),
+        ("0", "False False open"),
+        ("off", "False False open"),
+        # Unrecognised — the reviewer's table. Every one of these used to yield
+        # `open`, i.e. an operator asking to be treated as hosted and silently
+        # getting the permissive policy on a control that now decides reads.
+        ("Y", "False True scoped"),
+        ("y", "False True scoped"),
+        ("enabled", "False True scoped"),
+        ("t", "False True scoped"),
+        ("2", "False True scoped"),
+        ("nope", "False True scoped"),
+    ],
+)
+def test_a_misspelt_hosted_knob_does_not_select_the_permissive_policy(value, expected):
+    """`policy()` reads an unrecognised `KAIROS_HOSTED` as **scoped**, on purpose.
+
+    Asserted end to end in a real process, so the settings parse and the policy
+    default are pinned together: patching `settings.HOSTED_UNKNOWN` would test the
+    conclusion, not the thing an operator types.
+    """
+    assert _policy_in_a_fresh_process({"KAIROS_HOSTED": value}) == expected
+
+
+def test_the_policy_reads_an_unrecognised_hosted_value_as_scoped(monkeypatch):
+    """The same rule at the seam, on all three states `settings` can report."""
+    monkeypatch.setattr(settings, "POLL_REACH", "")
+    monkeypatch.setattr(settings, "HOSTED_RAW", "Y")
+    for hosted, unknown, expected in [
+        (True, False, reach.SCOPED),  # recognised hosted
+        (False, False, reach.OPEN),  # recognised self-host
+        (False, True, reach.SCOPED),  # unrecognised -> fail closed
+    ]:
+        monkeypatch.setattr(settings, "HOSTED", hosted)
+        monkeypatch.setattr(settings, "HOSTED_UNKNOWN", unknown)
+        assert reach.policy() == expected
+
+
+def test_an_explicit_policy_still_overrides_the_hosted_default(monkeypatch):
+    """The fail-closed reading is a *default*, not a lock: `KAIROS_POLL_REACH=open`
+    is how a self-hoster who meant the other thing gets the pre-#63 behaviour back,
+    which is what makes choosing `scoped` here safe."""
+    monkeypatch.setattr(settings, "POLL_REACH", reach.OPEN)
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", True)
+    assert reach.policy() == reach.OPEN
+
+
+def test_the_boot_warnings_name_an_unrecognised_hosted_value(monkeypatch):
+    """A control that is in force but was never asked for is a warning, not a line
+    of prose in a green log — and it has to say how to undo it."""
+    monkeypatch.setattr(settings, "POLL_REACH", "")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", True)
+    monkeypatch.setattr(settings, "HOSTED_RAW", "Y")
+    monkeypatch.setattr(settings, "AUTH_MODE", "oidc")  # not the header warning
+    warnings = reach.boot_warnings()
+    assert len(warnings) == 1
+    assert "KAIROS_HOSTED='Y'" in warnings[0]
+    assert "SCOPED" in warnings[0]
+    assert "KAIROS_POLL_REACH=open" in warnings[0]  # the way back
+
+
+def test_scoped_in_header_mode_without_trusted_proxies_warns(monkeypatch):
+    """`scoped` is only as strong as the identity it trusts.
+
+    Header mode takes the caller's identity from a request header, so with no
+    `KAIROS_TRUSTED_PROXY_CIDRS` the app trusts every peer and `X-User: <a creator
+    uid>` is reach on demand. The strict policy is decorative there, and the boot
+    log should say so rather than let an operator read "SCOPED" as protection.
+    """
+    monkeypatch.setattr(settings, "POLL_REACH", reach.SCOPED)
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", False)
+    monkeypatch.setattr(settings, "AUTH_MODE", "header")
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", ())
+    assert any("KAIROS_TRUSTED_PROXY_CIDRS" in w for w in reach.boot_warnings())
+    # With a proxy named, or off the web identity surface, there is nothing to say.
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", ("10.0.0.0/8",))
+    assert reach.boot_warnings() == []
+    monkeypatch.setattr(settings, "TRUSTED_PROXY_NETWORKS", ())
+    monkeypatch.setattr(settings, "AUTH_MODE", "oidc")
+    assert reach.boot_warnings() == []
+
+
+def test_open_with_scoped_keys_warns_that_the_claims_are_inert(monkeypatch):
+    """`open` reads as a deprecation because the boot log says what it costs.
+
+    An operator who has handed out least-privilege keys believes those keys are
+    scoped to what they were granted. Under `open` every one of them still reads
+    every poll and their `~` claims do nothing — #63 still reproducing, on a
+    deployment that has the grammar configured for it.
+    """
+    monkeypatch.setattr(settings, "API_KEYS", KEYRING)
+    monkeypatch.setattr(settings, "POLL_REACH", reach.OPEN)
+    assert any("'~' claims are inert" in w for w in scoping.boot_warnings())
+    monkeypatch.setattr(settings, "POLL_REACH", reach.SCOPED)
+    assert not any("'~' claims are inert" in w for w in scoping.boot_warnings())
+    # ...and with no keyring configured there is nothing to warn about: the ETH/duplet
+    # and self-host default deployment must boot without a lecture.
+    monkeypatch.setattr(settings, "API_KEYS", "")
+    monkeypatch.setattr(settings, "POLL_REACH", reach.OPEN)
+    assert not any("'~' claims are inert" in w for w in scoping.boot_warnings())
+
+
+def test_the_boot_line_marks_the_default_deprecated(monkeypatch):
+    """`open` is the pre-#63 rule kept for compatibility, and the log says so."""
+    monkeypatch.setattr(settings, "API_KEYS", KEYRING)
+    monkeypatch.setenv("KAIROS_API_KEY", LEGACY)
+    monkeypatch.setattr(settings, "POLL_REACH", reach.OPEN)
+    assert "DEPRECATED as a default" in scoping.boot_report()
+    monkeypatch.setattr(settings, "POLL_REACH", reach.SCOPED)
+    assert "DEPRECATED" not in scoping.boot_report()
+
+
+def test_the_boot_warnings_are_logged_as_warnings_not_prose(monkeypatch, caplog):
+    """The convention the reach line was missing: `log.warning`, beside the INFO
+    boot line, from `create_app` (which is also where the ETH adapter lands)."""
+    monkeypatch.setattr(settings, "API_KEYS", KEYRING)
+    monkeypatch.setattr(settings, "POLL_REACH", reach.OPEN)
+    with caplog.at_level("INFO", logger="kairos.scoping"):
+        main.create_app()
+    warned = [r for r in caplog.records if r.levelname == "WARNING"
+              and r.name == "kairos.scoping"]
+    assert any("'~' claims are inert" in r.getMessage() for r in warned)
+
+
 def test_a_typo_in_the_policy_refuses_the_boot(monkeypatch):
     """A control that silently picked a reading is worse than one that is off."""
     monkeypatch.setattr(settings, "POLL_REACH", "scopped")
@@ -517,11 +697,40 @@ def test_someone_named_on_the_poll_still_reads_it(scoped, client):
 
 def test_a_stranger_is_refused_the_poll_and_the_ics(scoped, client):
     page = as_person(client, STRANGER).get(WEB_POLL)
-    assert page.status_code == 403
-    assert "Not allowed" in page.text  # an HTML error page, like every other here
+    assert page.status_code == 404
+    assert "not available to you" in page.text  # an HTML error page, like every other here
     feed = as_person(client, STRANGER).get(WEB_ICS)
-    assert feed.status_code == 403
-    assert "Not the poll owner" in feed.text  # a calendar feed is not a page
+    assert feed.status_code == 404  # a calendar feed is not a page, but it is 404 too
+
+
+def test_the_web_refusals_are_404_and_they_name_nothing(scoped, client):
+    """One answer for "not yours" and "not there", so neither is a probe.
+
+    Second review. On the API surface reach is a pure function of the path id and
+    the grant, so "not yours" and "does not exist" are the same 403 by
+    construction. On the web surface the rule includes *being named on the poll*,
+    so the row has to be read before the decision -- which means the route could
+    tell the two apart, and 403-beside-404 was exactly that tell for anyone holding
+    an id. Both refusals are now the missing poll's own 404, with wording that
+    gives an id-holder nothing either way.
+    """
+    # Two clients: `as_person` mutates the one it is given, so an "owner" view of
+    # the same client would be a view of whoever was last written onto it.
+    stranger = as_person(client, STRANGER)
+    owner = TestClient(main.app, base_url="https://testserver", headers=dict(OWNER))
+    mine = stranger.get(WEB_POLL).status_code
+    gone = stranger.get("/scheduler/polls/no-such-poll").status_code
+    assert mine == gone == 404
+    ics_mine = stranger.get(WEB_ICS).status_code
+    ics_gone = stranger.get("/scheduler/polls/no-such-poll/event.ics").status_code
+    assert ics_mine == ics_gone == 404
+    # ...and no refusal names ownership, which is the only other thing that would
+    # distinguish them.
+    for body in (stranger.get(WEB_POLL).text, stranger.get("/scheduler/polls/no-such-poll").text):
+        assert "owner" not in body.lower()
+    # The owner is unaffected: this is a refusal shape, not a lost page.
+    assert owner.get(WEB_POLL).status_code == 200
+    assert owner.get(WEB_ICS).status_code == 200
 
 
 def test_the_web_ics_is_gated_by_reach_alone(scoped, client):
@@ -531,7 +740,7 @@ def test_the_web_ics_is_gated_by_reach_alone(scoped, client):
     Asserted on the content as well as the status, since what leaked was the data.
     """
     refused = as_person(client, STRANGER).get(WEB_ICS)
-    assert refused.status_code == 403
+    assert refused.status_code == 404
     assert "BEGIN:VCALENDAR" not in refused.text
     assert "Team retro" not in refused.text
     assert as_person(client, ALICE).get(WEB_ICS).status_code == 200
@@ -540,7 +749,7 @@ def test_the_web_ics_is_gated_by_reach_alone(scoped, client):
 def test_a_refused_poll_page_carries_no_respondent_data(scoped, client):
     """Not a status code: what the stranger cannot get is the *content*."""
     r = as_person(client, STRANGER).get(WEB_POLL)
-    assert r.status_code == 403
+    assert r.status_code == 404
     for leaked in ("Alice Answered", "alice@example.org", "Invitee Person", "Team retro"):
         assert leaked not in r.text
 
@@ -555,7 +764,7 @@ def test_a_refused_caller_leaves_no_trace(scoped, client, monkeypatch):
         "get_notifications",
         lambda uid, unread_only=False: [{"id": "n1", "poll_id": "p1"}, {"id": "n2", "poll_id": "p2"}],
     )
-    assert as_person(client, STRANGER).get(WEB_POLL).status_code == 403
+    assert as_person(client, STRANGER).get(WEB_POLL).status_code == 404
     assert marked == []
 
     assert as_person(client, OWNER).get(WEB_POLL).status_code == 200
@@ -621,13 +830,155 @@ def _declared_reach(app=None):
 
 def test_every_api_route_that_names_a_poll_declares_its_reach():
     """The guard that pays for itself, in #51's shape: the table is read off the
-    live app, so a new `/api` poll-id route without `reach=True` fails here."""
+    live app, so a new `/api` poll-id route without `reach=True` fails here.
+
+    "Names a poll" is asked *structurally* — `reach.poll_param` looks for the
+    parameter after the `polls` segment — and not by looking for the literal
+    `{poll_id}`. The first review of this PR matched the literal, and that half of
+    it was the same bug as the guard: a route spelling its parameter `{pid}` was
+    invisible here *and* unguarded at request time, so it was reported clean and
+    shipped the IDOR. One question, asked of both, from one function.
+    """
     declared = _declared_reach()
-    poll_routes = {k: v for k, v in declared.items() if "{poll_id}" in k[1]}
+    poll_routes = {k: v for k, v in declared.items() if reach.poll_param(k[1])}
     assert poll_routes, "the filter stopped finding poll-id routes at all"
-    assert set(poll_routes) == {k for k in declared if "{poll_id}" in k[1]}
+    assert set(poll_routes) == {k for k in declared if reach.poll_param(k[1])}
     missing = sorted(path for (_m, path), reached in poll_routes.items() if not reached)
     assert missing == [], f"/api routes naming a poll with no declared reach: {missing}"
+
+
+# -- 5b. THE SECOND REVIEW: the guard and the audit must both survive a renamed
+#        parameter, and a declared reach that cannot name its poll must refuse. --
+
+
+def test_poll_param_is_the_rule_and_the_name_is_only_a_spelling():
+    """The one function both enforcement points and both audits ask.
+
+    A table rather than an example, because the blind spot this closes is a class
+    of spellings: `{pid}`, `{pollId}`, `{id}`, anything. What must hold is that a
+    parameter *after the polls segment* is the poll id whatever it is called, and
+    that a route which names no poll reports none rather than guessing one.
+    """
+    assert reach.poll_param("/api/polls/{poll_id}") == "poll_id"
+    assert reach.poll_param("/api/polls/{pid}") == "pid"
+    assert reach.poll_param("/api/polls/{pollId}/responses/{rid}") == "pollId"
+    assert reach.poll_param("/api/polls/{id}/invite") == "id"
+    assert reach.poll_param("/scheduler/polls/{poll_id}/event.ics") == "poll_id"
+    assert reach.poll_param("/api/polls/{poll_id}/responses/{response_id}") == "poll_id"
+    # No poll after the segment: no guess.
+    assert reach.poll_param("/api/polls") is None
+    assert reach.poll_param("/api/polls/") is None
+    assert reach.poll_param("/api/whoami") is None
+    assert reach.poll_param("/api/imip/poll") is None
+    assert reach.poll_param("") is None
+
+
+def _request_for_route(path_template: str, path_params: dict, key: str | None = None):
+    """A Request carrying a route template, as one really does inside a dependency."""
+    from starlette.requests import Request
+
+    headers = [(b"authorization", f"Bearer {key}".encode())] if key else []
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": path_template,
+            "query_string": b"",
+            "path_params": dict(path_params),
+            "headers": headers,
+            "route": type("_R", (), {"path_format": path_template})(),
+        }
+    )
+
+
+def test_the_poll_id_is_read_off_the_route_template_not_the_house_spelling():
+    """`{pid}` is resolved exactly like `{poll_id}`.
+
+    This is the first review's mutation W9: reverting `poll_id_of` to the literal
+    key makes it fail, because `poll_id` comes back None for a `{pid}` route — and
+    before `required_poll_id` existed, that None was a `return` and `guard_reach`
+    silently let the request through.
+    """
+    renamed = _request_for_route("/api/polls/{pid}/rogue", {"pid": "p1"})
+    assert reach.poll_id_of(renamed) == "p1"
+    assert reach.required_poll_id(renamed) == "p1"
+    house = _request_for_route("/api/polls/{poll_id}/rogue", {"poll_id": "p2"})
+    assert reach.poll_id_of(house) == "p2"
+    # A hand-built scope with no template still resolves the house spelling, which
+    # is what the unit-level callers (#30's token route, tests) rely on.
+    assert reach.poll_id_of(_request_with(NOREACH, params={"poll_id": "p3"})) == "p3"
+
+
+def test_a_declared_reach_that_cannot_name_its_poll_refuses_rather_than_passing(scoped):
+    """"I could not tell" and "you may read it" must not be the same answer."""
+    request = _request_for_route("/api/instance/report", {})
+    assert reach.poll_id_of(request) is None
+    with pytest.raises(RuntimeError, match="no poll id resolves"):
+        reach.required_poll_id(request)
+    # And with the real guard, on a real request: a 500 for a route that declares
+    # reach on a path that names no poll -- never the handler's own 200.
+    from fastapi import APIRouter, Depends, FastAPI
+
+    rogue = APIRouter(prefix=API)
+
+    @rogue.get("/instance/report")
+    def report(user: dict = Depends(scoping.api_scope("polls:read", reach=True))):
+        return {"leak": "every row on the instance"}
+
+    app = FastAPI()
+    app.include_router(rogue)
+    with TestClient(app, raise_server_exceptions=False) as rogue_client:
+        got = rogue_client.get(f"{API}/instance/report",
+                               headers={"Authorization": f"Bearer {WIDE}"})
+    assert got.status_code == 500
+    assert "every row on the instance" not in got.text
+
+
+def _rogue_app(declared_reach: bool, param: str = "pid"):
+    """A synthetic `/api` route naming a poll, with or without a declared reach."""
+    from fastapi import APIRouter, Depends, FastAPI
+
+    rogue = APIRouter(prefix=API)
+
+    @rogue.get(f"/polls/{{{param}}}/rogue")
+    def rogue_export(pid: str, user: dict = Depends(scoping.api_scope("polls:read", reach=declared_reach))):
+        return {"respondent_names": ["Alice Victim", "Bob Victim"], "poll_id": pid}
+
+    app = FastAPI()
+    app.include_router(rogue)
+    return app
+
+
+def test_the_audit_catches_a_route_whose_poll_parameter_is_not_spelled_poll_id(scoped):
+    """The exact mutation the reviewer shipped: `{pid}`, `reach=True`, no audit.
+
+    Built with the request as well as the route table, for the reason the test
+    above does: the point is not that the audit notices, it is that such a route is
+    genuinely reachable by a key that has no reach.
+    """
+    guarded = _rogue_app(declared_reach=True)
+    with TestClient(guarded) as rogue_client:
+        # A key granted p2 — not p1 — is refused. This is the assertion the
+        # pre-fix code failed: it returned 200 with the respondents' names, because
+        # `poll_id_of` looked up a key the route does not have.
+        refused = rogue_client.get(f"{API}/polls/p1/rogue",
+                                   headers={"Authorization": f"Bearer {OTHERPOLL}"})
+    assert refused.status_code == 403
+    assert "Alice Victim" not in refused.text
+
+    # The audit now *sees* the route at all — the other half of the same bug. Before
+    # the fix the `{pid}` spelling did not match its `{poll_id}` filter, so the
+    # route was not in the audited set and nothing could complain about it.
+    declared = _declared_reach(guarded)
+    assert declared[("GET", "/polls/{pid}/rogue")] is True
+    assert set(declared) == {k for k in declared if reach.poll_param(k[1])}
+
+    # Drop the declaration and the audit has something to complain about, which is
+    # the failure mode `test_every_api_route_that_names_a_poll_declares_its_reach`
+    # turns into CI red for a real route.
+    undeclared = _declared_reach(_rogue_app(declared_reach=False))
+    assert undeclared[("GET", "/polls/{pid}/rogue")] is False
+    assert reach.poll_param("/polls/{pid}/rogue") == "pid"
 
 
 def test_the_reach_audit_catches_a_route_that_forgot_to_declare(monkeypatch, scoped, client):
@@ -673,6 +1024,174 @@ def test_every_poll_id_read_route_is_refused_in_practice_not_just_on_paper(scope
     so the audit is backed by observed behaviour on every poll-id read.
     """
     assert as_key(client, key).get(path).status_code == 403
+
+
+# -- 5c. THE SAME AUDIT ON THE WEB SURFACE -------------------------------------
+#
+# Second review. The API surface above is auditable because its routes *declare*
+# their authorization as a dependency (`api_scope(reach=True)`), so the audit can
+# read it off the live route table. The web surface had no such audit at all — only
+# rate-limit bookkeeping — and the second review demonstrated what that costs: a
+# new unguarded `GET /polls/{poll_id}/rogue-export` returning the title and the
+# respondents answered **200 to an authenticated stranger under `scoped`**, and the
+# suite stayed green after the two table updates #51's audit demands. No reach
+# test would ever have noticed, because on this surface a route authorizes by
+# *asking*, not by declaring.
+#
+# So the audit reads what the routes ask. Three layers, each catching something the
+# others cannot:
+#
+#   1. the live route table, so a new poll-id web route is unlisted and fails;
+#   2. the handler's own source, so a listed route cannot pass by not asking;
+#   3. a real request as a stranger, so a route cannot pass by asking and ignoring.
+
+# The authorization a web route asks for, by the call that asks. `_owner_action`
+# is #29's shared management gate (identity -> CSRF -> require_manage) and is what
+# every mutating route goes through, so a route calling it inherits its
+# authorization the way an owner-POST inherits the CSRF requirement.
+_WEB_MANAGE_CALLS = ("_owner_action(", "require_manage(", "can_manage(")
+_WEB_REACH_CALLS = ("can_reach(", "required_poll_id(")
+
+# (method, path) -> the authorization the route asks for. Read off the live route
+# table by the test below; this table is the assertion, so a new poll-id web route
+# has to be listed here with the rule it enforces. The poll page asks for both,
+# because "may read this page" and "may see the participants table and the owner's
+# controls on it" are different questions and it asks each.
+EXPECTED_WEB_POLL_AUTH = {
+    # reads: reach (issue #64) — refused as the missing poll's own 404
+    ("GET", "/polls/{poll_id}"): (frozenset({"reach", "manage"}), 404),
+    ("GET", "/polls/{poll_id}/event.ics"): (frozenset({"reach"}), 404),
+    # the owner's own pages and every mutating route: management authority (#29),
+    # which answers 403 — including for a poll that is not there, so this surface
+    # has no existence oracle of its own.
+    ("GET", "/polls/{poll_id}/edit"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/close"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/reopen"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/decide"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/edit"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/remind-selected"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/remind"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/email-decision"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/invite"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/participants/update"): (frozenset({"manage"}), 403),
+    ("POST", "/polls/{poll_id}/participants/remove"): (frozenset({"manage"}), 403),
+}
+
+
+def _web_routes(app=None):
+    """Every route on the identity-authenticated web surface, `/api` excluded."""
+    prefix = web.P
+    for route in _walk(app or main.app):
+        path = getattr(route, "path", "")
+        if (
+            path.startswith(f"{prefix}/")
+            and not path.startswith(f"{prefix}/api")
+            and hasattr(route, "dependant")
+        ):
+            yield route
+
+
+def _declared_web_auth(app=None) -> dict:
+    """{(method, path): the rules the handler asks} for every web route.
+
+    An empty frozenset is a real answer and the one that matters: a route naming a
+    poll and asking nobody is the defect the second review demonstrated, and it has
+    to be reportable as a value so the audit can name it.
+    """
+    import inspect
+
+    declared = {}
+    for route in _web_routes(app):
+        try:
+            source = inspect.getsource(route.endpoint)
+        except (OSError, TypeError):  # pragma: no cover — a C-level or eval'd handler
+            source = ""
+        asked = frozenset(
+            name
+            for name, calls in (("manage", _WEB_MANAGE_CALLS), ("reach", _WEB_REACH_CALLS))
+            if any(call in source for call in calls)
+        )
+        for method in getattr(route, "methods", set()) - {"HEAD"}:
+            declared[(method, route.path[len(web.P):])] = asked
+    return declared
+
+
+def test_every_web_route_that_names_a_poll_authorizes_its_poll():
+    """The web surface's #51/#63 audit, and the first that has ever existed here.
+
+    Asserted in two halves because they fail for different reasons: a new route is
+    *missing* from the table (the live walk is the input, so it cannot be satisfied
+    by adding a row), and a route that lists an authorization it does not ask for
+    is *wrong* in the table.
+    """
+    declared = {k: v for k, v in _declared_web_auth().items() if reach.poll_param(k[1])}
+    expected = {k: v[0] for k, v in EXPECTED_WEB_POLL_AUTH.items()}
+    assert declared, "the web filter stopped finding poll-id routes at all"
+    assert set(declared) == set(expected), (
+        f"/web routes naming a poll that are not in the audit table: "
+        f"{sorted(set(declared) - set(expected))}"
+    )
+    assert declared == expected
+
+
+def test_a_rogue_web_poll_route_answers_a_stranger_and_the_audit_catches_it():
+    """The second review's live demonstration, pinned as a test.
+
+    Built as a real request as well as a real route, for the reason the API-side
+    rogue tests are: the point is not that the audit notices an unguarded route, it
+    is that such a route genuinely leaks under `scoped` — which is what makes the
+    audit noticing it worth anything.
+    """
+    from fastapi import APIRouter, FastAPI
+
+    rogue = APIRouter(prefix=web.P)
+
+    @rogue.get("/polls/{poll_id}/rogue-export")
+    def rogue_export(poll_id: str, request: Request):
+        return {"title": POLL["title"], "respondents": [r["respondent_name"] for r in RESPONSES["p1"]]}
+
+    app = FastAPI()
+    app.include_router(rogue)
+    # A stranger really does get the title and every respondent name.
+    with TestClient(app) as rogue_client:
+        leaked = rogue_client.get(f"{web.P}/polls/p1/rogue-export", headers=dict(STRANGER))
+    assert leaked.status_code == 200
+    assert "Alice Answered" in leaked.text
+
+    # And the audit sees it, with nothing to add: no row, and nothing asked for.
+    seen = _declared_web_auth(app)
+    rogue = ("GET", "/polls/{poll_id}/rogue-export")
+    assert seen[rogue] == frozenset()
+    assert rogue not in EXPECTED_WEB_POLL_AUTH
+    assert reach.poll_param(rogue[1]) == "poll_id"  # ...and it is a poll route at all
+
+
+def test_every_web_poll_route_refuses_a_stranger_in_practice_not_just_on_paper(scoped, stubbed):
+    """Belt and braces for the audit above: the live app, driven.
+
+    A declaration the handler ignores — or asks and then proceeds anyway — would
+    pass the source check, so every poll-id web route is driven as a stranger with
+    a *valid* CSRF token, which gets past the token check and lands on the
+    authorization the route actually claims.
+    """
+    from kairos.csrf import make_csrf
+
+    forms = {"data": {"csrf": make_csrf(STRANGER["X-User"])}}
+    for (method, template), (_auth, refused_with) in EXPECTED_WEB_POLL_AUTH.items():
+        path = f"{web.P}{template.format(poll_id='p1')}"
+        kwargs = forms if method == "POST" else {}
+        response = as_person(client_for_stranger(), STRANGER).request(method, path, **kwargs)
+        assert response.status_code == refused_with, (
+            f"{method} {path} answered {response.status_code} to a stranger under `scoped`, "
+            f"expected {refused_with}"
+        )
+        assert "Alice Answered" not in response.text, f"{method} {path} leaked a respondent"
+        assert POLL["title"] not in response.text, f"{method} {path} leaked the title"
+
+
+def client_for_stranger() -> TestClient:
+    """A fresh client: `as_person` mutates the one it is handed."""
+    return TestClient(main.app, base_url="https://testserver")
 
 
 # -- 6. THE GRAMMAR -----------------------------------------------------------
@@ -812,6 +1331,60 @@ def test_a_key_does_not_inherit_reach_over_the_poll_it_just_created(scoped, clie
     assert as_key(client, WRITER).get(f"{API}/polls/p2").status_code == 403
 
 
+def test_a_key_that_cannot_reach_what_it_creates_is_told_so(scoped, client, monkeypatch):
+    """The half of the create residual that is a *reporting* problem, not a policy one.
+
+    Second review: under `scoped`, `POST /polls` hands back an id the caller provably
+    cannot use — `GET`/`PATCH`/`DELETE` on it all 403, and it is absent from
+    `GET /polls`, because nothing in the schema says which key made the row (#32).
+    Auto-granting is still wrong (every key shares the uid `"api"`), and refusing
+    creation outright would break the deployment that *should* be creating polls with
+    a bounded key, so the response says it instead of leaving it to be discovered on
+    the next call.
+    """
+    monkeypatch.setattr(api, "create_poll", lambda *a, **k: {**POLL, "id": "brand-new"})
+    body = {"title": "t", "mode": "full_day", "slots": [{"date": "2026-06-08"}]}
+
+    # A key granted p1 is told it cannot reach the *new* poll, not p1.
+    warned = as_key(client, WRITER).post(f"{API}/polls", json=body)
+    assert warned.status_code == 200
+    assert "brand-new" in warned.json()["reach_warning"]
+    assert "KAIROS_API_KEYS" in warned.json()["reach_warning"]
+
+    # An instance-wide grant has nothing to be told.
+    assert "reach_warning" not in as_key(client, WRITER_ALL).post(f"{API}/polls", json=body).json()
+
+    # And under the default policy the field is absent, byte-for-byte as before.
+    with monkeypatch.context() as m:
+        m.setattr(settings, "POLL_REACH", reach.OPEN)
+        assert "reach_warning" not in as_key(client, WRITER).post(f"{API}/polls", json=body).json()
+
+
+def test_the_surface_is_coherent_about_who_may_create_and_who_may_read(scoped, client, monkeypatch):
+    """Answering the coherence question the second review raised, on the facts.
+
+    A `respond` key with no grant 403s on every poll, and it also cannot create one:
+    `POST /polls` needs `polls:write`, so the two capabilities cannot disagree about
+    creating. The combination that *can* is `polls:write` with no reach claim — it
+    creates a row it cannot then read, edit, delete or enumerate — and that one is
+    refused no further (auto-granting would hand every key every poll whose id it
+    could guess) but is told, in the response, by the test above. Pinned here so the
+    next person to widen either rule has to decide about both.
+    """
+    monkeypatch.setattr(api, "create_poll", lambda *a, **k: {**POLL, "id": "brand-new"})
+    body = {"title": "t", "mode": "full_day", "slots": [{"date": "2026-06-08"}]}
+    monkeypatch.setattr(settings, "API_KEYS", f"{NOREACH}:respond")
+    assert as_key(client, NOREACH).post(f"{API}/polls", json=body).status_code == 403
+
+    monkeypatch.setattr(settings, "API_KEYS", f"{NOREACH}:respond,polls:write")
+    allowed = as_key(client, NOREACH).post(f"{API}/polls", json=body)
+    assert allowed.status_code == 200
+    assert "brand-new" in allowed.json()["reach_warning"]
+    # ...and the grant that fixes it is the one the warning names.
+    monkeypatch.setattr(settings, "API_KEYS", f"{NOREACH}:respond,polls:write~*")
+    assert "reach_warning" not in as_key(client, NOREACH).post(f"{API}/polls", json=body).json()
+
+
 def test_a_scoped_key_with_no_polls_claim_reaches_nothing_not_everything(monkeypatch, client):
     """Default-deny, stated directly on the predicate rather than through a route."""
     monkeypatch.setenv("KAIROS_API_KEY", "")
@@ -826,7 +1399,7 @@ def test_a_scoped_key_with_no_polls_claim_reaches_nothing_not_everything(monkeyp
     assert reach.key_reaches(None, "p1") is False
 
 
-def _request_with(key: str):
+def _request_with(key: str, *, params: dict | None = None):
     from starlette.requests import Request
 
     scope = {
@@ -834,7 +1407,7 @@ def _request_with(key: str):
         "method": "GET",
         "path": "/",
         "query_string": b"",
-        "path_params": {},
+        "path_params": dict(params or {}),
         "headers": [(b"authorization", f"Bearer {key}".encode())],
     }
     return Request(scope)
