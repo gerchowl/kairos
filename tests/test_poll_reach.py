@@ -38,7 +38,9 @@ The residual cases this could not cover — per-account reach (#32), per-plan re
 pinned as tests at the end so a later change to any of them is a deliberate diff.
 """
 
+import hashlib
 import os
+import re
 import sys
 from datetime import date, time
 
@@ -715,6 +717,48 @@ def test_a_stranger_is_refused_the_poll_and_the_ics(scoped, client):
     assert feed.status_code == 404  # a calendar feed is not a page, but it is 404 too
 
 
+# The two per-run values in a rendered page, scrubbed before hashing so the pin
+# below is about the page rather than about when the suite ran: the nav's signed
+# CSRF token, and the static-asset cache-buster (`?v=<source mtime>`), which moves
+# whenever a file under `static/` is touched. The second was found by pinning the
+# digest and having it disagree between two runs of the same tree — byte 476,
+# `?v=1791120485` against `?v=1791120486`, which is the whole point of scrubbing.
+_SIGNED = re.compile(rb"[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}")
+_ASSET_V = re.compile(rb"\?v=\d+")
+
+
+def _scrubbed_page(response) -> bytes:
+    return _ASSET_V.sub(b"?v=<mtime>", _SIGNED.sub(b"<signed>", response.content))
+
+
+def test_the_missing_poll_page_is_the_page_it_has_always_been(scoped, client):
+    """The absolute bytes, pinned — because `refused == missing` cannot catch a change
+    that moves *both*.
+
+    The third review's point, and it is the load-bearing one: the whole
+    default-configuration claim rests on this page not changing, and an equality
+    assertion between the two branches is blind to a sentence added to the helper
+    they share. (Neither does `prek`: it proves lint and behaviour, not bytes. The
+    byte-identity evidence is an external digest probe over 30 reads, which is why
+    this pin exists in the repo at all.)
+
+    The pin is on the page with the per-run CSRF token scrubbed — that token is the
+    only thing in a rendered page that changes between two identical requests — and
+    in **bytes**, not characters: the template carries two em dashes in its inline
+    theme script, so `len(response.text)` is four short of `len(response.content)`
+    and a character count would let a real change hide in that gap. (The third
+    review's 4309 is this number, which is how the two environments agree.)
+    """
+    page = as_person(client, STRANGER).get(f"{web.P}/polls/no-such-poll")
+    assert page.status_code == 404
+    scrubbed = _scrubbed_page(page)
+    assert len(page.content) == 4309
+    assert len(scrubbed) == 4274
+    assert hashlib.sha256(scrubbed).hexdigest() == (
+        "23ae8fdc2ff0c6e5d448eedf5f7939cd4f95c2560a828782213ab5c684c587d8"
+    ), "the missing-poll page changed: update this pin deliberately, and re-run the byte probe"
+
+
 def test_a_refusal_is_byte_identical_to_a_missing_poll(scoped, client):
     """Not merely the same status — the same **bytes**. The second review's must-fix,
     and easy to regress: the first attempt at this unification put a 60-byte sentence
@@ -886,6 +930,20 @@ def test_every_api_route_that_names_a_poll_declares_its_reach():
     declared = _declared_reach()
     poll_routes = _poll_routes(declared)
     assert poll_routes, "the filter stopped finding poll-id routes at all"
+    # And every declared reach must be *resolvable* on the route that declares it.
+    # A `reach=True` on a path `required_poll_id` cannot resolve is not a weak guard,
+    # it is none: `guard_reach` raises, so the route answers 500 on every call. That
+    # fails closed, but it is an outage discovered in production rather than in CI,
+    # and the synthetic tests only prove `required_poll_id` behaves — not that no
+    # live route can ask it something impossible.
+    unresolvable = sorted(
+        path for (_method, path), reached in declared.items()
+        if reached and reach.poll_param(path) is None
+    )
+    assert unresolvable == [], (
+        f"/api routes declaring reach on a path with no resolvable poll id (they 500): "
+        f"{unresolvable}"
+    )
     # The two collection routes are the ones the rule must *not* sweep in: they name
     # no single poll, which is why they answer with the caller's whole reach instead.
     assert ("GET", "/polls") not in poll_routes

@@ -188,7 +188,12 @@ class KeyEntry(NamedTuple):
 # `k1:polls:read,respond` is genuinely ambiguous between "one key with two scopes"
 # and "two keys", and a security control must not have a reading you have to guess
 # at.
-_DELIMITERS = ";:@~"
+#
+# `~` is deliberately absent: `parse_keyring` partitions it off *before* either
+# fragment is parsed (and refuses a second one outright), so it can never reach the
+# checks below. Listing it here was dead code whose only effect was to name a
+# character in the "cannot carry" message that no fragment could ever contain.
+_DELIMITERS = ";:@"
 
 
 def _reject(raw: str, why: str) -> RuntimeError:

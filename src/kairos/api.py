@@ -207,14 +207,17 @@ def whoami(user: dict = Depends(api_scope())):
     documented in an operator's env file. Reports the key's digest, never the
     key, and only what this key holds — not the whole vocabulary.
     """
+    reached = reach.reached_by(user)
     return {"scopes": sorted(user["scopes"]), "key_id": user["key_id"],
             "tier": user.get("tier"),
             # Reach as well as capability (issue #63): the two are different
             # questions, and an agent refused a poll deserves to learn from one
             # call that it was refused the poll, not its capability — including
-            # which of the two reach rules the deployment is running.
-            "polls": reach.reached_by(user).polls,
-            "reach_policy": reach.reached_by(user).policy}
+            # which of the two reach rules the deployment is running. Read once:
+            # `reached_by` walks the grant and the policy, and there is no reason
+            # to do either of them twice.
+            "polls": reached.polls,
+            "reach_policy": reached.policy}
 
 
 @router.post("/polls")

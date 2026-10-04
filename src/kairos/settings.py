@@ -158,7 +158,9 @@ TRUSTED_PROXY_NETWORKS = _parse_networks(TRUSTED_PROXY_CIDRS, "KAIROS_TRUSTED_PR
 # spelling of "not hosted" was the one that turned a self-hoster's deployment strict.
 HOSTED_RAW = os.environ.get("KAIROS_HOSTED", "").strip()
 HOSTED_TRUE = ("1", "on", "true", "yes", "y")
-HOSTED_FALSE = ("0", "off", "false", "no", "n", "f", "")
+# No "" in it: `HOSTED_UNKNOWN` is guarded by `bool(HOSTED_RAW)`, so an empty value
+# never reaches the membership test and listing it would suggest otherwise.
+HOSTED_FALSE = ("0", "off", "false", "no", "n", "f")
 HOSTED = HOSTED_RAW.lower() in HOSTED_TRUE
 HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + HOSTED_FALSE
 # Normalised, not validated: a typo must fail as a loud refusal naming this knob, not as

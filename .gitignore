@@ -2,7 +2,14 @@
 .direnv/
 __pycache__/
 *.pyc
-kairos.db
+# Databases. The pattern, not the one filename: `kairos.db` was named specifically,
+# which is why a probe's `scoped.db` — a real poll row, tokens and all — was committed
+# by a review that had just checked for secrets. gitleaks does not read strings inside
+# a SQLite file, so the ignore rule is the only thing standing there. The -wal/-shm
+# siblings ride along for the same reason.
+*.db
+*.db-wal
+*.db-shm
 node_modules/
 dist/
 .pytest_cache/

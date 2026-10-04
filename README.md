@@ -428,7 +428,12 @@ deliberate:
   same status, same page, same empty detail, one function for both — because that
   surface has to read the poll in order to decide and must therefore not also tell
   a caller which of the two it was. The first version of this matched the status
-  and not the body, and a 60-byte sentence on the refusal only was still an oracle;
+  and not the body, and a 60-byte sentence on the refusal only was still an oracle.
+  Bytes are the channel that was closed, not every channel: deciding reach costs
+  two statements a missing poll never reaches, so a caller who times the two can
+  still separate them. That is inherent to "or anyone named on the poll" and is
+  written up as residual 6 in `docs/design/poll-reach.md`, which also carries the
+  one existence oracle this leaves open (`edit_poll_page`, #29's surface);
 * a key that creates a poll it cannot reach is **not** auto-granted reach over it
   (nothing in the schema says which key made the row, issue #32) — the creation
   response carries a `reach_warning` naming the grant it needs instead.

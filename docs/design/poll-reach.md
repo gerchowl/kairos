@@ -148,11 +148,21 @@ its configuration is broken when it is exactly right.
   must never be the same answer.
 * **What a refusal looks like differs by surface, on purpose.** The API surface
   answers 403 and never reads the poll, so "not yours" and "does not exist" are
-  one code path by construction. The web surface must read the poll to apply the
+  one code path by construction — no bytes *and* no statements differ, since a
+  refused id never causes a query. The web surface must read the poll to apply the
   *named on this poll* half of the rule, so it could tell the two apart — and
   therefore answers with the missing poll's own 404 **byte for byte**, from one
   function (`web._not_yours_or_gone`) that both the missing and the refusing
-  branch call. Byte-identical, not merely the same status: the first version of
+  branch call. Bytes are not the whole channel, and the design doc would be lying
+  by omission if it stopped here: deciding reach on the web surface costs two
+  extra statements a missing poll never reaches (`get_responses` and `get_invites`,
+  because the rule includes *being named on this poll*), and a caller timing the
+  two can separate them with no help (measured: AUC ≈ 0.78, medians 2.5 ms vs 2.3
+  ms). That is pre-existing and this work strictly improves it — the missing-poll
+  path is the shorter of the two, as it was before — and it is inherent to the
+  rule rather than to the 404. Closing it means deciding reach without the poll's
+  participants, i.e. the per-account reach of residual 1, or an explicit
+  per-identity grant set. Byte-identical, not merely the same status: the first version of
   this unified the status and gave the refusal a 60-byte sentence of its own, which
   the second review measured on the live app as 4365 bytes against 4305 — an
   oracle with the same status code. That is why there is no `require_reach` beside
@@ -213,3 +223,28 @@ its configuration is broken when it is exactly right.
    colleague reads the same page they read before, including the availability grid
    with respondent names — the sharing rule the group is relying on. Narrowing
    *that* is a product decision about participation, not authorization.
+6. **The owner-only edit page still answers 403 beside a 404**, so it is an
+   existence oracle for anyone holding an id — the one this work leaves open, and
+   it is #29's rather than reach's:
+
+   ```
+   GET {P}/polls/<id>/edit     ->  403  "Not allowed"        (exists, not yours)
+   GET {P}/polls/<missing>/edit ->  404  "Poll not found"
+   ```
+
+   Deliberately not changed here. `edit_poll_page` decides with `can_manage`, which
+   is management authority (#29); it is *not* gated by the reach policy, so it
+   answers identically in the default configuration, where reach is `open` — and
+   unifying it would move bytes in a default read that every existing deployment
+   serves, on a surface #63/#64 does not own. The POST routes beside it
+   (`_owner_action`) answer 403 for a missing poll too, so they carry no oracle;
+   only this page does. Fixing it is a one-line change to
+   `web.edit_poll_page`, and it belongs with #29/#30.
+7. **The audit's path rule is a chosen limit, not an oversight.** `names_poll`
+   recognises a `polls`/`poll` segment with something after it, so a future route
+   that names a poll some *third* way — `/reports/{x}`, `/polls-archive/{x}`,
+   `/pollsters/{x}` — satisfies neither audit and is unguarded. `/reports` in
+   particular is a plausible thing to add. A route like that must either carry the
+   poll in the path (`/polls/{id}/report`), or authorize every id it takes itself;
+   the audit cannot see ids it cannot see, and pretending otherwise is what the
+   first two rounds of this review were about.
