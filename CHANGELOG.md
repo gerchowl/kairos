@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.0](https://github.com/gerchowl/kairos/compare/v0.10.0...v0.11.0) (2026-10-04)
+
+
+### Features
+
+* **auth:** admin_token + one require_manage predicate (obligation S6, [#29](https://github.com/gerchowl/kairos/issues/29)) ([#60](https://github.com/gerchowl/kairos/issues/60)) ([9985eea](https://github.com/gerchowl/kairos/commit/9985eea4317926d0689df19cc05fc503438cced6))
+* **auth:** first-party OIDC owner login, allowlisted by subject ([#53](https://github.com/gerchowl/kairos/issues/53)) ([#62](https://github.com/gerchowl/kairos/issues/62)) ([fba7304](https://github.com/gerchowl/kairos/commit/fba7304e023396ef818cdc9223aa6dc4e0c412ff))
+* **security:** scope, budget and cap the API/MCP surface ([#51](https://github.com/gerchowl/kairos/issues/51)) ([#61](https://github.com/gerchowl/kairos/issues/61)) ([9d1be2e](https://github.com/gerchowl/kairos/commit/9d1be2e16b16e91a43e36d4a722f45c20c4dc79e))
+
+
+### Bug Fixes
+
+* **build:** release-please must update uv.lock, or the image build breaks ([#59](https://github.com/gerchowl/kairos/issues/59)) ([#66](https://github.com/gerchowl/kairos/issues/66)) ([0c308d8](https://github.com/gerchowl/kairos/commit/0c308d8c85c9c1caa15b38807db88f26d4e4aabe))
+
+
+### Documentation
+
+* make the queue restart-safe — HANDOFF.md state, PLAN.md progress ([6fecb2d](https://github.com/gerchowl/kairos/commit/6fecb2d5a6a57e20333007c1cf0aba5353889ac3))
+
 ## [0.10.0](https://github.com/gerchowl/kairos/compare/v0.9.1...v0.10.0) (2026-10-02)
 
 
