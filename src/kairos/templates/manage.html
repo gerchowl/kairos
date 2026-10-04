@@ -31,6 +31,7 @@
 {% if mail_ok %}
 <p class="text-sm">We mail a fresh link to an address that already created a poll on this deployment. Nothing else is sent, and asking does not reveal whether a poll exists.</p>
 <form method="post" action="{{ P }}/manage/link" class="flex flex-wrap items-end gap-2">
+<input type="hidden" name="csrf" value="{{ link_csrf }}">
 {{ text_field('email', 'Email address', type='email', required=True, input_class='w-72') }}
 <button type="submit" class="btn btn-primary">Email me a link</button>
 </form>
@@ -140,6 +141,7 @@
 <p class="text-sm">This browser's session lasts {{ session_hours }} hours. To get back in later, ask for a fresh link — we mail it to the address that created this poll.</p>
 {% if mail_ok %}
 <form method="post" action="{{ P }}/manage/link" class="flex flex-wrap items-end gap-2">
+<input type="hidden" name="csrf" value="{{ link_csrf }}">
 {{ text_field('email', 'Email address', type='email', value=poll.creator_email or '', required=True, input_class='w-72') }}
 <button type="submit" class="btn btn-sm">Email me a link</button>
 </form>

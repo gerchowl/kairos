@@ -7,7 +7,9 @@ false:
 1. **The mode is inert unless asked for** (ADR-0001/0002). Every `/manage` route
    is 404 in demo/header/oidc/none, a stray `KAIROS_CAPABILITY_*` cannot take down
    a deployment that never opted in, and an unrecognised `KAIROS_AUTH` refuses to
-   boot rather than silently disabling owner auth.
+   boot rather than silently disabling owner auth. `SESSION_SECRET` is the one
+   variable that refuses to boot *in this mode*, because the mode cannot work
+   without it.
 2. **The emailed link is a secret with a stated lifetime**: no clock, single use,
    consumed by an exchange that rotates the capability and mints a signed cookie.
    The two-step (GET interstitial, POST exchange) is asserted because link
@@ -17,19 +19,27 @@ false:
    assert *where* authorization happens, the way #29's own guard does.
 4. **The placeholder creator** — the schema decision #29 left here — cannot be
    presented as an identity and cannot make `list_polls` return another poll.
+5. **The anonymous POSTs are bounded and bound-bound.** `POST /new` refuses an
+   `increment` that cannot terminate the slot loop or that is not a number, before
+   the loop runs; `POST /manage/link` refuses a post no page of this app rendered.
+   Both were found by review rather than by this suite, and both are the kind of
+   thing that only shows up when someone reads the route instead of the tests.
 
 NOT in this file: #31's Turnstile check and the `manage_verified_at` **send-gate**.
 The column is written here, because #29 handed that write to this issue and the
 route is what performs it; nothing in this file refuses a send because of it.
 """
 
+import inspect
 import logging
 import re
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from itsdangerous import URLSafeTimedSerializer
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -167,8 +177,22 @@ def _open(live, token):
     return live.client.post(f"/scheduler/manage/{token}", data={})
 
 
+def _link(live, email, **extra):
+    """POST the re-link form the way the page does — with the form's CSRF token.
+
+    Every caller goes through here rather than posting `email` alone, so a test
+    cannot quietly stop exercising the route: without the token it gets a 403,
+    which passes an assertion about "no mail was sent" while checking nothing.
+    """
+    return live.client.post(
+        "/scheduler/manage/link",
+        data={"email": email, "csrf": make_csrf(capability.LINK_FORM_UID), **extra},
+    )
+
+
 Live.create = lambda self, **kw: _create(self, **kw)
 Live.open = lambda self, token: _open(self, token)
+Live.link = lambda self, email, **extra: _link(self, email, **extra)
 
 
 def _request_uid(uid):
@@ -760,7 +784,7 @@ def test_no_capability_ever_appears_in_a_response_body_or_a_log(live, caplog):
     interstitial = live.client.get(f"/scheduler/manage/{emailed}")
     exchange = live.client.post(f"/scheduler/manage/{emailed}", data={})
     console_page = live.client.get("/scheduler/manage")
-    live.client.post("/scheduler/manage/link", data={"email": "ada@example.org"})
+    live.link("ada@example.org")
     rotated = live.poll()["admin_token"]
 
     # The interstitial legitimately echoes the token: it is the URL the creator
@@ -1060,24 +1084,42 @@ def test_requesting_a_link_mails_the_current_capability_to_the_owner(console):
     live = console
     live.client.cookies.clear()
     live.reset_mail()
-    response = live.client.post("/scheduler/manage/link", data={"email": "ada@example.org"})
+    response = live.link("ada@example.org")
     assert response.status_code == 200
     assert "Check your inbox" in response.text
     assert len(live.relay.sent) == 1
     assert f"/scheduler/manage/{live.poll()['admin_token']}" in live.relay.sent[0].as_string()
 
 
+def _without_csrf_tokens(html: str) -> str:
+    """The page with its per-render CSRF bindings masked.
+
+    A signed CSRF token embeds the second it was minted, so two renders a second
+    apart differ in it — and it is a function of the clock, not of the address. The
+    honest form of "the answer is identical" therefore masks those and compares
+    everything else, rather than comparing two whole strings that happened to be
+    minted inside the same second. (It only became visible when the re-link form got
+    a CSRF field: until then the page had no per-render value at all, so the
+    comparison passed for a reason that had nothing to do with the property.)
+    """
+    return re.sub(r'name="csrf" value="[^"]+"', 'name="csrf" value="TOKEN"', html)
+
+
 def test_the_re_link_answer_is_identical_whether_or_not_anything_matched(console):
-    """Not an address oracle: no count, no title, no difference in the page."""
+    """Not an address oracle: no count, no title, no difference in the page.
+
+    Masked, not raw — see `_without_csrf_tokens`. What is left after masking is the
+    whole sentence a reader sees, and it does not move.
+    """
     live = console
     live.client.cookies.clear()
     live.reset_mail()
-    matched = live.client.post("/scheduler/manage/link", data={"email": "ada@example.org"})
+    matched = live.link("ada@example.org")
     live.reset_mail()
-    unmatched = live.client.post("/scheduler/manage/link", data={"email": "nobody@example.org"})
+    unmatched = live.link("nobody@example.org")
 
     assert matched.status_code == unmatched.status_code == 200
-    assert matched.text == unmatched.text
+    assert _without_csrf_tokens(matched.text) == _without_csrf_tokens(unmatched.text)
     assert live.relay.sent == [], "a stranger's address was mailed somebody else's link"
 
 
@@ -1098,7 +1140,7 @@ def test_the_re_link_request_is_capped_per_post(console):
             creator_email="bulk@example.org",
         )
     live.reset_mail()
-    live.client.post("/scheduler/manage/link", data={"email": "bulk@example.org"})
+    live.link("bulk@example.org")
     assert len(live.relay.sent) == capability.MAX_LINKS_PER_REQUEST
 
 
@@ -1109,8 +1151,8 @@ def test_the_re_link_request_is_rate_limited(console, monkeypatch):
     monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
     monkeypatch.setitem(settings.RATE_LIMITS, "send", (1, 3600))
     live.client.cookies.clear()
-    assert live.client.post("/scheduler/manage/link", data={"email": "a@example.org"}).status_code == 200
-    assert live.client.post("/scheduler/manage/link", data={"email": "a@example.org"}).status_code == 429
+    assert live.link("a@example.org").status_code == 200
+    assert live.link("a@example.org").status_code == 429
 
 
 def test_a_link_request_that_fans_out_is_charged_in_links_not_requests(console, monkeypatch):
@@ -1132,7 +1174,7 @@ def test_a_link_request_that_fans_out_is_charged_in_links_not_requests(console, 
     monkeypatch.setitem(settings.RATE_LIMITS, "send", (3, 3600))
     live.reset_mail()
 
-    assert live.client.post("/scheduler/manage/link", data={"email": "bulk@example.org"}).status_code == 429
+    assert live.link("bulk@example.org").status_code == 429
     assert live.relay.sent == [], "a refused fan-out still sent mail"
 
 
@@ -1140,7 +1182,7 @@ def test_the_re_link_route_says_so_when_mail_is_unusable(console, monkeypatch):
     live = console
     live.client.cookies.clear()
     monkeypatch.setattr(email_service, "SMTP_HOST", "")
-    response = live.client.post("/scheduler/manage/link", data={"email": "ada@example.org"})
+    response = live.link("ada@example.org")
     assert response.status_code == 503
     assert "Email is not available" in response.text
 
@@ -1247,8 +1289,8 @@ def test_the_console_charges_the_budgets_the_owner_ui_charges(console, monkeypat
     assert charged == [("invite", 1), ("send", 1)], "edit should cost nothing; sends must"
 
 
-def test_an_anonymous_creation_cannot_insert_an_unbounded_number_of_slots(live):
-    """The one input-size limit this mode adds, and why it is here.
+def test_an_anonymous_creation_refuses_a_poll_larger_than_the_slot_cap(live):
+    """The cap on the *result*, and only that.
 
     In `time_slot` mode each date expands into `(end - start) / increment` rows, so
     a handful of form fields is enough to ask for thousands of writes -- and this
@@ -1256,6 +1298,14 @@ def test_an_anonymous_creation_cannot_insert_an_unbounded_number_of_slots(live):
     field count, not the slot count, which is the one that matters here.) Turnstile
     (#31) is the real answer for the public surface; this is the structural bound in
     the meantime.
+
+    Named for what it asserts. It used to claim the *expansion* was bounded, which
+    was false and load-bearing: the cap runs after the slot list has been built, so
+    it cannot bound what building it costs, and `increment=0` proved it — an
+    unbounded loop in front of a cap that never got a chance to run. What bounds the
+    expansion is the increment, before the loop; see
+    `test_the_slot_step_bounds_are_what_make_the_loop_terminate`. This test covers
+    the second line of defence and nothing more.
     """
     payload = {"title": "Wide", "creator_email": "ada@example.org", "mode": "time_slot",
                "start_time_all": "00:00", "end_time_all": "12:00", "increment": "1",
@@ -1306,16 +1356,39 @@ def test_the_interstitial_states_the_real_session_lifetime(monkeypatch):
     assert "2 hours" in rendered and "12 hours" not in rendered
 
 
-def test_a_capability_boot_without_a_session_secret_says_so(monkeypatch):
-    """The credential cookie is signed with SESSION_SECRET.
+def test_a_capability_boot_without_a_session_secret_refuses_to_boot(monkeypatch):
+    """SESSION_SECRET is a hard requirement of this mode, not a warning.
 
-    `settings.session_secret()` raises at first use, so without this the operator
-    sees a 500 on every manage page and has no idea why — and the boot log looks
-    perfectly healthy.
+    It signs the capability cookie, which is the only credential the console has,
+    and `settings.session_secret()` raises at first use. As a warning this was a
+    green boot, a 200 from `GET /manage` (the "no session" branch never touches the
+    secret) and then a 500 on the two routes that actually mint or verify a cookie —
+    so the failure looked like a bug and the log looked healthy. #53 refuses to boot
+    on a missing allowlist for the same reason, and the gate costs the other modes
+    nothing because they never reach this line. Driven through a re-import, because
+    the thing being asserted is module-level code.
     """
     monkeypatch.setattr(settings, "AUTH_MODE", "capability")
     monkeypatch.delenv("SESSION_SECRET", raising=False)
-    assert "SESSION_SECRET is unset" in " ".join(capability.boot_warnings())
+    with pytest.raises(RuntimeError) as exc:
+        _reimport("capability.py", "kairos_cap_probe_nosecret", KAIROS_AUTH="capability")
+    assert "SESSION_SECRET" in str(exc.value)
+    assert "openssl rand -hex 32" in str(exc.value), "the refusal has to say what to do"
+    # And the rest of the mode's mail surface is unreachable rather than half-working.
+    assert "SESSION_SECRET is unset" not in " ".join(capability.boot_warnings())
+
+
+def test_a_missing_session_secret_does_not_affect_any_other_mode(monkeypatch):
+    """The other half of the gate: this may not become a new way to break a
+    self-hoster who never asked for capability mode (ADR-0001/0002).
+
+    `KAIROS_AUTH=header` with no SESSION_SECRET in the environment must still
+    import cleanly, which is the whole reason the refusal sits under `enabled()`.
+    """
+    monkeypatch.delenv("SESSION_SECRET", raising=False)
+    for mode in ("header", "demo", "oidc", "none"):
+        module = _reimport("capability.py", f"kairos_cap_probe_nosecret_{mode}", KAIROS_AUTH=mode)
+        assert module.enabled() is False
 
 
 def test_a_capability_boot_without_rate_limits_says_so(monkeypatch):
@@ -1403,3 +1476,338 @@ def test_no_route_in_this_feature_compares_a_token_or_an_owner_by_hand():
     assert not re.search(r"""\["creator_id"\]\s*[!=]=\s*(session|token)""", source)
     assert "require_manage(" in source
     assert "can_manage(" in source
+
+
+# -- 9. the second review round, pinned ---------------------------------------
+#
+# Everything below was found by a fresh-context review of this branch rather than by
+# this branch's own tests, and each item says what it was, because a test whose
+# comment only says "still true" teaches the next reader nothing.
+
+
+def _backdate(poll_id, when="2000-01-01 00:00:00"):
+    """Move one poll to the far end of the newest-first ordering.
+
+    `created_at` is `CURRENT_TIMESTAMP` — one-second resolution — so "newest first"
+    is a tie among rows created in the same test, and a test that relied on the tie
+    would be asserting on SQLite's row order rather than on this route.
+    """
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE sched_polls SET created_at = %s WHERE id = %s", (when, poll_id))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def _creation_post(live, data, header_uid=None):
+    """POST the creation form in whichever mode is currently in force."""
+    payload = {"title": "Wide", "mode": "time_slot", "timezone": "UTC",
+               "start_time_all": "09:00", "end_time_all": "17:00",
+               "csrf": make_csrf(capability.ANON_FORM_UID if header_uid is None else header_uid),
+               **data}
+    headers = {"X-User": header_uid} if header_uid else {}
+    return live.client.post("/scheduler/new", data=payload, headers=headers)
+
+
+@pytest.mark.parametrize(
+    "increment", ["0", "-5", "-1440", "x", "", "1.5", "1441", "100000", "0x10", "30min", "1e3"],
+    ids=["zero", "negative", "negative-day", "text", "empty", "float", "over-a-day", "absurd",
+         "hex", "suffixed", "exponent"],
+)
+def test_an_anonymous_creation_refuses_an_increment_that_cannot_terminate_the_loop(
+    live, monkeypatch, increment
+):
+    """**This was an unauthenticated OOM.** Measured against a real uvicorn in this
+    mode with shipped defaults and no credential at all (the anon CSRF token is
+    scraped off the public `/new` form): `increment=0` took the process from 59 MB
+    to 2.1 GB without answering, and anyio's 40-thread default meant ~40 requests
+    were enough to take the deployment down. `/health` kept answering, so it read
+    as a hang rather than a crash.
+
+    `while t + timedelta(minutes=increment) <= t_end` never advances `t` when
+    `increment <= 0`, so it appends a slot forever. The bound this branch advertises
+    (`MAX_SLOTS_PER_ACCOUNTLESS_POLL`) was checked *after* the loop, which cannot
+    bound what building the list costs — so the PR claimed a bound the loop did not
+    have. These are refusals now, before the loop, and both halves of the old line
+    are here: a value that cannot terminate it, and a value that is not an int
+    (`increment=x` was a `ValueError` → 500 on an anonymous route).
+
+    Run in both modes, because #30 made an owner-only form anonymous and the field
+    is on the shared path: a 500 in header mode is an authenticated 500, and a 400
+    is what every other field on this form already does.
+    """
+    response = _creation_post(live, {"increment": increment, "dates": ["2026-01-05"]})
+    assert response.status_code == 400, "an unbounded increment must be refused, not served"
+    assert live.polls == [], "a refused creation still wrote a row"
+
+    monkeypatch.setattr(settings, "AUTH_MODE", "header")
+    owner = _creation_post(live, {"increment": increment, "dates": ["2026-01-05"]}, header_uid="alice")
+    assert owner.status_code == 400
+    assert live.polls == [], "a refused creation still wrote a row"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("start_time_all", "25:00"), ("start_time_all", "noon"), ("end_time_all", "99:99"),
+     ("end_time_all", "5pm"), ("start_time_all", "09:00:00")],
+)
+def test_an_anonymous_creation_refuses_a_clock_it_could_not_parse(live, field, value):
+    """**The same bug on the two fields above it, found while fixing that one.**
+    `datetime.strptime` raises `ValueError` on all five of those, out of the route,
+    on an anonymous POST — a sixth 500 on this path, in the same three lines. The
+    empty-string case was already refused (and pinned); every other unparseable
+    clock was not, which is why the existing test gave a false sense of coverage.
+    """
+    response = _creation_post(live, {field: value, "dates": ["2026-01-05"]})
+    assert response.status_code == 400
+    assert live.polls == []
+
+
+def test_the_slot_step_bounds_are_what_make_the_loop_terminate():
+    """The numbers, and where they live.
+
+    Two properties, both load-bearing. The *values*: `increment >= 1` is the only
+    reason the `while` advances at all, and 1440 is one day, so the worst case is
+    1440 iterations and 1440 slots for one date. The *location*: the validation and
+    the loop are in one function, asserted with `inspect` rather than by reading,
+    because "the bound is over there, in the caller" is precisely how an unbounded
+    anonymous loop ships with a slot cap three frames away from it.
+    """
+    assert web.MIN_INCREMENT_MINUTES >= 1, "increment <= 0 makes the loop immortal"
+    assert web.MAX_INCREMENT_MINUTES <= 1440, "the window is bounded by the day"
+
+    source = inspect.getsource(web._expand_time_slots)
+    assert "_bounded_int(" in source and "while " in source, \
+        "the increment bound and the loop it bounds must be one function"
+
+    slots, error = web._expand_time_slots(
+        {"start_time_all": "00:00", "end_time_all": "23:59", "increment": "1"}, ["2026-01-05"]
+    )
+    assert error is None
+    assert len(slots) == 1439, "one slot per minute of the widest possible window"
+    assert slots[0]["start_time"] == "00:00" and slots[-1]["end_time"] == "23:59"
+
+    for bad in ("0", "-1", "x", "", "1441"):
+        slots, error = web._expand_time_slots(
+            {"start_time_all": "09:00", "end_time_all": "17:00", "increment": bad}, ["2026-01-05"]
+        )
+        assert error is not None and slots == [], f"increment={bad!r} was accepted"
+
+    # Deliberately *not* refusals, stated so nobody "tightens" them later: " 30 " and
+    # "٣٠" are both the number 30 to `int`, and a form field is typed by a human who
+    # pasted it. Refusing a padded number would be pedantry, not a bound.
+    for padded in (" 30 ", "30\t", "٣٠", "+30"):
+        slots, error = web._expand_time_slots(
+            {"start_time_all": "09:00", "end_time_all": "17:00", "increment": padded}, ["2026-01-05"]
+        )
+        assert error is None and len(slots) == 16, f"{padded!r} should read as 30 minutes"
+
+
+def test_the_re_link_request_refuses_a_post_no_page_of_this_app_rendered(console):
+    """**This was a drive-by mail primitive.** The creation form has been
+    CSRF-bound since it was written; this one was not, and it is the anonymous POST
+    that sends mail. Measured: 26 cross-origin form posts with no cookie and no
+    token, and 26 manage-link mails sent to an address the attacker chose — from
+    this deployment's own sender, domain and branding. The mail only goes to an
+    address that already created a poll here, so the attacker learns nothing they
+    could not read; what they get is the ability to make somebody else's
+    deployment send mail, on demand, for free.
+
+    The check is CSRF, not authorization: the uid is a constant, so a direct
+    attacker scrapes the token off `/manage` in one request. What it removes is the
+    *drive-by*, which is what a cross-site form post is.
+    """
+    live = console
+    live.client.cookies.clear()
+    live.reset_mail()
+    # No token at all.
+    assert live.client.post("/scheduler/manage/link", data={"email": "ada@example.org"}).status_code == 403
+    # The creation form's token is not this form's token — one page's token is not
+    # replayable at the other form on the same origin.
+    assert live.client.post(
+        "/scheduler/manage/link",
+        data={"email": "ada@example.org", "csrf": make_csrf(capability.ANON_FORM_UID)},
+    ).status_code == 403
+    assert live.relay.sent == [], "a refused cross-origin post still sent mail"
+    # And the real form still works, which is the half a CSRF change usually breaks.
+    assert live.link("ada@example.org").status_code == 200
+    assert len(live.relay.sent) == 1
+
+
+@pytest.mark.parametrize("stage", ["signed-out", "console"])
+def test_both_link_forms_render_the_token_the_route_checks(live, stage):
+    """The template half of the check above.
+
+    A CSRF requirement with no matching hidden field is a 403 on every legitimate
+    click, and it is the failure mode that gets "fixed" by removing the check. Both
+    forms — the one on the signed-out page and the one in the console footer — must
+    carry the binding `request_link` verifies.
+    """
+    if stage == "console":
+        live.create()
+        live.open(live.poll()["admin_token"])
+    page = live.client.get("/scheduler/manage").text
+    match = re.search(
+        r'action="[^"]*/manage/link".*?name="csrf" value="([^"]+)"', page, re.DOTALL
+    )
+    assert match, f"the {stage} page has no CSRF token on its link-request form"
+    assert match.group(1) == make_csrf(capability.LINK_FORM_UID)
+
+
+def test_the_re_link_answer_holds_a_time_floor_so_the_fan_out_is_not_a_timing_oracle(console):
+    """**The body was byte-identical and the response time was not.** Measured
+    against a real relay: 0.254s for an address with polls, 0.003s for one without —
+    87x, from the SMTP connection a match opens and a miss does not. Same oracle, in
+    a channel nobody reads, and not a harmless one: it confirms which addresses have
+    created a poll here, and the Subject line of the mail a real hit triggers
+    ("Your manage link: Quarterly planning") then leaks the titles.
+
+    The floor is a mitigation, not a proof, and the constant says so: a relay slower
+    than the floor still shows through, and the real fix is queueing the mail and
+    answering before SMTP. What is asserted here is the part that is in this
+    branch's hands — a match cannot be *faster* than the floor, so the direction
+    that carries the bit is gone.
+    """
+    live = console
+    live.client.cookies.clear()
+    assert capability.LINK_REQUEST_FLOOR_SECONDS >= 0.25, \
+        "the floor has to cover the fan-out it is hiding, or it hides nothing"
+
+    started = time.monotonic()
+    matched = live.link("ada@example.org")
+    hit = time.monotonic() - started
+    started = time.monotonic()
+    unmatched = live.link("nobody@example.org")
+    miss = time.monotonic() - started
+
+    assert matched.status_code == unmatched.status_code == 200
+    assert _without_csrf_tokens(matched.text) == _without_csrf_tokens(unmatched.text)
+    assert miss >= capability.LINK_REQUEST_FLOOR_SECONDS
+    assert hit >= capability.LINK_REQUEST_FLOOR_SECONDS
+    assert abs(hit - miss) < capability.LINK_REQUEST_FLOOR_SECONDS / 2, \
+        f"the hit and the miss still differ in time by {abs(hit - miss):.3f}s"
+
+
+def test_a_capability_cookie_is_verified_by_its_signature_and_by_nothing_else(live):
+    """**The signature was untested.** Replacing the signed `loads` in
+    `read_session` with an unsigned base64 decode left 809/809 green: every
+    refusal test in the file is refused by a second gate as well — a junk string is
+    not JSON, a rotated token fails `require_manage`'s row comparison — so the one
+    thing enforcing `max_age` and unforgeability was never the thing doing the
+    rejecting, and nothing noticed.
+
+    So this test is a pair that differ in exactly one byte of input: the same
+    payload, naming the same poll and carrying that poll's *real* capability, signed
+    with a different secret. `require_manage` would accept it — the row matches — so
+    if it is refused, the signature is the reason.
+    """
+    live.create(title="Retreat")
+    poll = live.poll()
+    payload = {"pid": poll["id"], "at": poll["admin_token"]}
+
+    # Control: this deployment's own signature. The console opens.
+    live.client.cookies.set(capability.SESSION_COOKIE, _signed_cookie(poll["id"], poll["admin_token"]))
+    assert "Retreat" in live.client.get("/scheduler/manage").text
+
+    forged = URLSafeTimedSerializer("a-different-secret", salt="cap-session").dumps(payload)
+    assert forged != _signed_cookie(poll["id"], poll["admin_token"])
+    live.client.cookies.set(capability.SESSION_COOKIE, forged)
+    assert "Open your manage link" in live.client.get("/scheduler/manage").text
+
+
+def test_a_capability_cookie_past_its_lifetime_is_refused_despite_a_valid_signature(live, monkeypatch):
+    """The other half of what the signature is for.
+
+    A correctly signed cookie older than `SESSION_MAX_AGE` is the one thing a
+    weakened verifier would let through, and `read_session` is the only place that
+    knows the age — `require_manage` compares a token and cannot. `time.time` is
+    patched rather than the parsed constant, because expiry is computed by
+    itsdangerous at verification time.
+    """
+    live.create(title="Retreat")
+    poll = live.poll()
+    cookie = _signed_cookie(poll["id"], poll["admin_token"])
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + capability.SESSION_MAX_AGE + 60)
+    live.client.cookies.set(capability.SESSION_COOKIE, cookie)
+    assert "Open your manage link" in live.client.get("/scheduler/manage").text
+
+
+def test_a_creator_with_more_polls_than_the_cap_still_gets_their_link(console):
+    """**Filter, then cap — the order was the bug.** The route did
+    `list_polls_by_creator_email(email)[:MAX_LINKS_PER_REQUEST]` and filtered
+    afterwards, on a newest-first list. Every poll minted since #29 carries a
+    capability, so a creator with ten recent polls and one *older* poll that still
+    does (a pre-#29 row, or one created through the API) matched nothing, was sent
+    nothing, and was told to check an inbox that would stay empty — on the one route
+    that exists to get a spent-link creator back in.
+
+    The NULL rows here stand in for both of those cases; they are what the filter
+    exists for.
+    """
+    live = console
+    live.client.cookies.clear()
+    original = live.poll()  # the one poll that still has a capability is the oldest
+    _backdate(original["id"])
+    for i in range(capability.MAX_LINKS_PER_REQUEST + 2):
+        unlinkable = db.create_poll(
+            capability.anonymous_creator_id(), f"NoCap{i}", None, "full_day", "UTC",
+            [{"date": "2026-12-01"}], creator_email="ada@example.org",
+        )
+        _null_out_capability(unlinkable["id"])
+    live.reset_mail()
+
+    response = live.link("ada@example.org")
+    assert response.status_code == 200 and "Check your inbox" in response.text
+    assert len(live.relay.sent) == 1
+    assert f"/scheduler/manage/{original['admin_token']}" in live.relay.sent[0].as_string()
+
+
+def test_the_bounds_on_this_mode_are_pinned_by_this_suite():
+    """`MAX_LINKS_PER_REQUEST` was unpinned: raising 10 → 1000 left 809/809 green.
+
+    It is the only bound on the re-link fan-out, and the rate limit is the operator's
+    number rather than ours, so a bound nobody asserts is a number that gets widened
+    by accident and reviewed by nobody. The slot cap is here for the same reason,
+    and the increment bounds because they are what terminate the loop above.
+    """
+    assert capability.MAX_LINKS_PER_REQUEST == 10
+    assert capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL == 1000
+    assert (web.MIN_INCREMENT_MINUTES, web.MAX_INCREMENT_MINUTES) == (1, 1440)
+    # And the fan-out is charged in links, so the bound above is the blast radius a
+    # single form post can open against a relay.
+    assert capability.MAX_LINKS_PER_REQUEST <= settings.RATE_LIMITS["send"][0] or \
+        not settings.RATE_LIMIT_ENABLED
+
+
+def test_the_loser_of_a_rotation_does_not_stamp_the_verification_column(live):
+    """**Wrong order for the consumer.** `mark_manage_verified` ran *before* the
+    compare-and-swap, so the loser of a race — the stale link, replayed a moment
+    after the creator used it, which is exactly what a mail prefetcher or a stale
+    tab does — stamped `manage_verified_at`. That column is dead today, but #31
+    gates sends on it, and the flag it is meant to carry ("this creator proved they
+    read the mail we sent") would be set by a request that never won the capability.
+
+    Simulated by rotating first, which is what the racing winner does.
+    """
+    live.create()
+    poll = live.poll()
+    assert db.rotate_admin_token(poll["id"], poll["admin_token"])  # the other device wins
+    assert live.open(poll["admin_token"]).status_code == 404
+    assert live.poll()["manage_verified_at"] is None, \
+        "a refused exchange stamped the column #31 will gate sends on"
+
+
+def test_the_creator_address_is_not_written_to_the_log(live, caplog):
+    """A stranger's address at INFO, in a log an operator ships to a collector, for a
+    poll the operator cannot see. The poll id is enough to find the row; whoever
+    wants the address has it in the database.
+    """
+    caplog.set_level(logging.DEBUG, logger="kairos")
+    live.create(email="ada@example.org")
+    live.open(live.poll()["admin_token"])
+    live.link("ada@example.org")
+    assert "ada@example.org" not in caplog.text
+    # The poll id is still there, so this is a redaction and not a silence.
+    assert live.poll()["id"] in caplog.text

@@ -54,8 +54,36 @@ keeps the cookie-setting off a GET.
 it on a second device fails, because the first exchange already rotated the token.
 That is the intended trade — a link usable twice from two devices is a link
 somebody forwarded and forgot about — and `POST /manage/link` is the way back: it
-re-mails a link to an address that already created a poll here. The response is
-identical whether or not anything matched, so it is not an address oracle.
+re-mails a link to an address that already created a poll here. The answer is
+identical in the *body* whether or not anything matched, so the response is not an
+address oracle; the response *time* was one (a match opens SMTP, a miss does not —
+87x measured), and is now held to a floor. See `LINK_REQUEST_FLOOR_SECONDS` for
+what that does and does not fix, and for why the honest sentence is longer than the
+one this paragraph used to be.
+
+**A capability in a URL is in the access log.** `GET /manage/<token>` puts the live
+token in whatever the front end writes down, and for a link nobody ever opens it
+stays valid forever *and* stays in the log forever. Kairos never writes a token to
+its own logs — no log line in this file carries one, and that is asserted — but the
+access log is the reverse proxy's or uvicorn's, and the token is in the request
+line. So the README and `docs/design/{multitenancy-hosting,self-host-hardening}.md`
+say so plainly, because this is the one credential in the app whose exposure is
+decided entirely outside it: the mitigations that exist are single use (the token
+dies the moment it is exchanged), `Referrer-Policy: no-referrer` on the one page
+whose URL carries it, and no creator address in any log line — and the mitigation
+left is the operator's, redact that path or keep those logs short-lived. There is
+no logout route in this mode, so a shared browser ends its session by expiry or by
+opening a fresh link, not by a button — deliberate for this issue (a logout that
+cannot revoke the *link* would be a misleading half-measure) and worth revisiting
+with #32's accounts.
+
+**Every anonymous POST here is CSRF-bound.** `POST /new` and `POST /manage/link`
+both carry a token minted by this app and both check it, against a constant uid
+rather than a session — the same bargain the creation form has always made. It
+proves the POST came from a page Kairos rendered; it does not prove who sent it, so
+it is not an authorisation control and is not described as one. It does mean an
+unrelated website cannot make a visitor's browser have this deployment send mail
+(`LINK_FORM_UID` for the detail).
 
 **What this composes with, and what it deliberately does not touch.**
 
@@ -91,12 +119,16 @@ Env-only (ADR-0003) and parsed here rather than in `settings.py`, the way
 `oidc.py` keeps the whole OIDC mode in one file: a stray `KAIROS_CAPABILITY_*` in
 a self-hoster's environment must not break a deployment that never opted in
 (ADR-0001/0002), so an unusable value is a boot warning and never an import error
-outside this mode.
+outside this mode. The exception is `SESSION_SECRET`, which is not a policy knob but
+a requirement of the mode — see the gate beside `SESSION_HOURS` for why that one
+refuses to boot and lands nowhere else.
 """
 
 import logging
 import os
 import secrets
+import time
+from itertools import islice
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -149,6 +181,24 @@ BOOT_WARNINGS: list[str] = []
 # console's own forms bind to the poll id instead.
 ANON_FORM_UID = "anon:new-poll"
 
+# The same binding for the *re-link* form, which is on every `/manage` page and
+# which an unrelated website can reach with nothing but a victim's browser. Without
+# it this route was the one anonymous POST in the feature that a drive-by could
+# fire: 26 cross-origin form posts, no cookie and no token, and 26 manage-link
+# mails sent from this deployment to an address the attacker chose — mail this app
+# can send, from the operator's own sender and domain, on demand, for free. That is
+# not a way to *take* a capability (the mail goes to the address that already owns
+# one, so the attacker learns nothing they could not read), but it is a way to make
+# somebody else's deployment send mail they never asked for, which is a reputation
+# problem for the operator and a spam problem for everyone else.
+#
+# A separate uid from the creation form's, so one page's token cannot be replayed
+# at the other. It proves the same thing — a page this app rendered — and it does
+# not pretend to be more: the uid is a constant, so a direct attacker scrapes it
+# off `/manage` in one request, exactly as they scrape the creation token off
+# `/new`. What it removes is the drive-by primitive, which is what CSRF is for.
+LINK_FORM_UID = "anon:manage-link"
+
 # `sched_polls.creator_id` is NOT NULL and an accountless poll has no creator to
 # put there. See `anonymous_creator_id` for why that is a sentinel and not a
 # migration.
@@ -157,8 +207,36 @@ ANON_CREATOR_PREFIX = "anon:"
 # How many links one re-link request may send. Not an anti-spam measure — the
 # rate limit is — just a ceiling on how many SMTP messages one form post can
 # open, so a deployment with a thousand polls on one address does not turn one
-# click into a thousand messages.
+# click into a thousand messages. Pinned by a test: it is the only bound on the
+# fan-out, and a bound nobody asserts is a number that gets widened by accident.
 MAX_LINKS_PER_REQUEST = 10
+
+# The floor on how long `POST /manage/link` takes to answer, in seconds.
+#
+# The response body is identical whether or not anything matched — verified, and
+# pinned by a test, modulo the per-render CSRF binding, which is a function of the
+# clock rather than of the address. The *time* was not identical: a match opens one
+# SMTP connection per poll and a miss opens none, which measured 87x (0.254s hit vs
+# 0.003s miss) against a real relay. That is the same oracle in a channel nobody
+# looks at, and it is not a harmless one: it confirms which addresses have created a
+# poll here, and the Subject line of the mail a real hit triggers ("Your manage link:
+# Quarterly planning") then leaks the poll titles, so one timing bit buys a list.
+#
+# A floor is the honest fix here and not a complete one: it equalises the two cases
+# only while the relay answers inside it. A relay slower than the floor still shows
+# through, and the real answer — queueing the mail and answering before SMTP — is a
+# delivery change, not a route change, so it is not this issue's to make. Stated
+# rather than implied, because a doc that says "not an address oracle" when it
+# means "not in the body" is what let this through in the first place.
+#
+# The price, stated because it is real: a *miss* used to answer in 3ms and now
+# occupies a worker for 0.3s, so this converts a cheap refusal into a held thread.
+# It is the right direction of trade (a rate-limit-free capability deployment is
+# already documented at boot as an open mail relay, and a matching address was
+# already paying SMTP latency), it is bounded by `LINK_REQUEST_FLOOR_SECONDS` rather
+# than by the attacker, and `KAIROS_RATE_LIMIT=on` — which boot already insists on
+# for this mode — puts a ceiling on it.
+LINK_REQUEST_FLOOR_SECONDS = 0.3
 
 # Slots one anonymous accountless creation may insert. Sized above any real
 # meeting (a full week of 15-minute slots over a 12-hour day is ~576) and below
@@ -209,6 +287,31 @@ SESSION_HOURS_RAW = os.environ.get("KAIROS_CAPABILITY_SESSION_HOURS", "").strip(
 # re-imports the module rather than patching the parsed values).
 SESSION_HOURS = parse_session_hours(SESSION_HOURS_RAW) if enabled() else DEFAULT_SESSION_HOURS
 SESSION_MAX_AGE = SESSION_HOURS * 3600
+
+# SESSION_SECRET is the one variable in this file that refuses to boot, and the
+# difference from `KAIROS_CAPABILITY_SESSION_HOURS` above is the difference between
+# a default and a requirement. The lifetime is a policy the operator can have an
+# opinion about and a bad value for still fails safe (an unbounded cookie, as
+# `parse_session_hours` says). The secret is not optional at all: it signs the
+# capability cookie, which is the only credential the whole console has, and
+# `settings.session_secret()` raises at first use — so the deployment booted green,
+# `GET /manage` answered 200 from the "no session" branch, and the two routes that
+# actually mint or verify a cookie 500'd. That is the worst shape a hard requirement
+# can take: a healthy boot log and a broken mode.
+#
+# Gated on the mode for exactly the reason the parse above is, so it costs every
+# other deployment nothing: a stray KAIROS_AUTH is not a reason to break a self-hoster
+# who never asked for this mode, and #53 already establishes the pattern (an OIDC
+# deployment with no owner allowlist refuses to boot). Test re-imports the module
+# rather than patching a parsed constant, for the same reason oidc's does.
+if enabled() and not os.environ.get("SESSION_SECRET", ""):
+    raise RuntimeError(
+        "KAIROS_AUTH=capability requires SESSION_SECRET: the capability cookie is the "
+        "credential for the entire management console and is signed with it. Set it to a "
+        "random value (openssl rand -hex 32). Refusing to boot is deliberate — the mode "
+        "cannot work without it, and a green boot followed by a 500 on /new is not a "
+        "better answer."
+    )
 
 
 # -- The placeholder creator ------------------------------------------------
@@ -327,6 +430,25 @@ def manage_url(request: Request, token: str) -> str:
     return f"{get_base_url(request)}{manage_path(token)}"
 
 
+def _hold_for(floor_seconds: float, started: float) -> None:
+    """Spend the rest of `floor_seconds` since `started`, doing nothing.
+
+    A constant-time response on the one route whose work is *supposed* to depend
+    on data the caller does not own. Sleep, not fake work: a decoy SMTP round trip
+    would send mail to make a timing claim true, and a CPU spin would burn a core to
+    avoid holding a thread — the wrong trade for a route whose whole problem is
+    exhaustion. `time.monotonic`, because the wall clock can go backwards and the
+    wrong answer would be a negative sleep.
+
+    Only ever a floor, so the honest limit is stated where the constant is: a
+    caller that takes *longer* than the floor still shows through, and this does not
+    pretend otherwise.
+    """
+    remaining = floor_seconds - (time.monotonic() - started)
+    if remaining > 0:
+        time.sleep(remaining)
+
+
 # -- Pages ------------------------------------------------------------------
 
 
@@ -364,6 +486,9 @@ def _link_page(request: Request, heading: str, detail: str, status_code: int = 2
         error=status_code >= 400,
         mail_ok=is_configured(),
         mail_note=_mail_note(),
+        # Its own binding, not the console's: there is no session on this page, and
+        # the link-request form below is the one POST here (see LINK_FORM_UID).
+        link_csrf=make_csrf(LINK_FORM_UID),
         msg=msg,
     )
 
@@ -416,6 +541,15 @@ def console(poll: dict, request: Request, *, msg: str | None = None):
         share_url=f"{get_base_url(request)}{P}/p/{poll['public_token']}",
         timezones=TIMEZONES,
         csrf_token=make_csrf(poll["id"]),
+        # The footer link-request form posts to a route that has no session, so it
+        # carries its own binding rather than this page's poll-id one.
+        link_csrf=make_csrf(LINK_FORM_UID),
+        # ...and it is behind `{% if mail_ok %}` like the other two stages, which
+        # means a console rendered without these two showed no way back in at all —
+        # just an empty red paragraph where the form should be, on the one page
+        # where a creator who has already spent their link is most likely to look.
+        mail_ok=is_configured(),
+        mail_note=_mail_note(),
         msg=msg,
         session_hours=SESSION_HOURS,
         noindex=True,
@@ -500,8 +634,10 @@ def request_link(request: Request, form=Depends(form_data)):
     which is the same trust the magic link itself rests on.
 
     The answer is identical whether or not anything matched, so it cannot be used
-    to learn which addresses have polls here — and it never says how many it
-    sent.
+    to learn which addresses have polls here — and it never says how many it sent.
+    Identical in the *body*, that is; the response time is held to a floor too, so
+    the SMTP fan-out is not an oracle in a second channel (see
+    `LINK_REQUEST_FLOOR_SECONDS` for what the floor does and does not fix).
 
     The budget is `send`, the one every SMTP-opening route already draws on, and
     the fan-out is charged *in links* rather than in requests: one post can open up
@@ -513,13 +649,27 @@ def request_link(request: Request, form=Depends(form_data)):
     _require_enabled()
     if not is_configured():
         return _link_page(request, "Email is not available", _mail_note(), 503)
+    # Same shape as the creation form's check and for the same reason: this posts
+    # mail from the operator's domain, and a form on a public page is exactly what
+    # another site can submit on a visitor's behalf. See LINK_FORM_UID.
+    require_anon_csrf(form, LINK_FORM_UID)
+    started = time.monotonic()
     email = valid_email(form.get("email", ""))
     if email:
-        matching = [p for p in list_polls_by_creator_email(email)[:MAX_LINKS_PER_REQUEST]
-                    if p.get("admin_token")]
+        # Filter, then cap — never cap, then filter. `list_polls_by_creator_email`
+        # is newest-first and every poll minted after #29 has a token, so slicing
+        # first meant a creator with ten recent polls and one older poll (a pre-#29
+        # row with no capability, or an API-created one) got *no link at all* from
+        # the one route that exists to get them back in. `islice` over a generator
+        # says the order out loud and stops the walk once the cap is reached.
+        matching = list(
+            islice((p for p in list_polls_by_creator_email(email) if p.get("admin_token")),
+                   MAX_LINKS_PER_REQUEST)
+        )
         _charge_fanout(request, len(matching))
         for poll in matching:
             send_manage_email(email, poll["title"], manage_url(request, poll["admin_token"]))
+    _hold_for(LINK_REQUEST_FLOOR_SECONDS, started)
     return _link_page(
         request,
         "Check your inbox",
@@ -573,14 +723,10 @@ def manage_exchange(token: str, request: Request):
     # the single line a reader looks for to see *how* this route authorizes.
     require_manage(poll, request, token=token)
 
-    # Obligation A2's precondition, written for the first time here (#29 handed
-    # the write to this issue, and the column is otherwise dead): the creator's
-    # address is demonstrably deliverable *and* demonstrably theirs, because they
-    # opened what we sent it. #31 reads this column to gate sending; nothing here
-    # gates on it.
-    if mark_manage_verified(poll["id"]):
-        log.info("manage link opened for poll %s (first open: email verified)", poll["id"])
-
+    # A race for one link resolves here, and only the winner proceeds: the swap
+    # below is a compare-and-swap on the token presented, so two exchanges produce
+    # one winner and one refusal rather than two winners whose first cookie is dead
+    # on arrival.
     rotated = rotate_admin_token(poll["id"], token)
     if not rotated:
         # Another exchange of the same link won between our lookup and this
@@ -588,6 +734,21 @@ def manage_exchange(token: str, request: Request):
         # mint a session around a capability that has already been replaced.
         log.warning("could not rotate the management capability for poll %s", poll["id"])
         return _dead_link(request)
+
+    # Obligation A2's precondition, written for the first time here (#29 handed
+    # the write to this issue, and the column is otherwise dead): the creator's
+    # address is demonstrably deliverable *and* demonstrably theirs, because they
+    # opened what we sent it. #31 reads this column to gate sending; nothing here
+    # gates on it.
+    #
+    # After the swap, not before. The loser of a race reaches neither line now, and
+    # that is the point: this column is what #31 will gate sends on, so a request
+    # that did not win the capability must not be able to stamp it. Stamping first
+    # meant the loser of a rotation — a link prefetcher replaying a token a moment
+    # after the creator used it — set the very flag that says "this address is
+    # verified".
+    if mark_manage_verified(poll["id"]):
+        log.info("manage link opened for poll %s (first open: email verified)", poll["id"])
 
     # The cookie carries the NEW capability, so this exchange is the only way in
     # and the link is spent. The log line names the poll, never the token.
@@ -868,8 +1029,14 @@ def new_poll_context() -> dict:
     }
 
 
-def require_anon_csrf(form) -> None:
-    require_csrf({"uid": ANON_FORM_UID}, form)
+def require_anon_csrf(form, uid: str = ANON_FORM_UID) -> None:
+    """The anonymous-form CSRF check, for whichever anonymous form is posting.
+
+    `uid` rather than a fixed constant because there are two of them and they bind
+    to different pages (`ANON_FORM_UID` for creation, `LINK_FORM_UID` for the
+    re-link request), and one form's token must not be replayable at the other.
+    """
+    require_csrf({"uid": uid}, form)
 
 
 def create_accountless_poll(
@@ -920,7 +1087,11 @@ def create_accountless_poll(
         anonymous_creator_id(), title, description, mode, timezone, slots, owner_id=None, creator_email=email
     )
     sent = send_manage_email(email, poll["title"], manage_url(request, poll["admin_token"]))
-    log.info("accountless poll %s created for %s (link mailed: %s)", poll["id"], email, sent)
+    # No address, and that is deliberate. This is the only INFO line in the mode
+    # that would have carried a stranger's address, in a log an operator ships to a
+    # third-party collector, for a poll the operator cannot see. The poll id is
+    # enough to find the row; whoever wants the address has it in the database.
+    log.info("accountless poll %s created (link mailed: %s)", poll["id"], sent)
     if not sent:
         # The row exists; the credential does not. Say exactly that, and offer
         # the one thing that can fix it, rather than a bare error.
@@ -962,20 +1133,12 @@ def boot_warnings() -> list[str]:
     deployment still boots, because refusing here would break the self-host
     topology ADR-0001/0002 protect, and every one of them shows up as a
     confusing page rather than an error the moment a creator tries to use it.
+    A missing `SESSION_SECRET` is deliberately *not* one of them — it is not
+    survivable, so it refuses to boot at import instead (see the gate above).
     """
     warnings = list(BOOT_WARNINGS)
     if not enabled():
         return warnings
-    if not os.environ.get("SESSION_SECRET", ""):
-        # The session cookie is the credential for the whole console, and it is
-        # signed with this. `settings.session_secret()` raises at first use, which
-        # presents as a 500 on every /manage and /new page — so say it here, where
-        # an operator is actually looking.
-        warnings.append(
-            "KAIROS_AUTH=capability is on but SESSION_SECRET is unset, so every "
-            "manage page will fail with a server error. The capability cookie is "
-            "signed with it; set it to a random value (openssl rand -hex 32)."
-        )
     if not is_configured():
         warnings.append(
             "KAIROS_AUTH=capability is on but outbound mail is unusable, so no "

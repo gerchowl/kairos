@@ -140,10 +140,14 @@ owner auth: oidc (issuer=…, allowlist=3 subject(s) + trusted-proxy CIDRs
 
 - [ ] Set, and generated, and **not** in git. In `header` mode Kairos refuses to
       serve authenticated requests without it (observed as a 500 on every page,
-      logged as `SESSION_SECRET is not configured`).
+      logged as `SESSION_SECRET is not configured`). In `capability` mode it
+      **refuses to boot**, because the cookie it signs is the only credential that
+      mode has and a green boot followed by 500s on `/new` is not a better answer.
 - [ ] Treat it as durable. Rotating it invalidates every session, every signed
       response-edit token and every invite signature in flight — respondents get
-      signed out mid-poll and links 403. There is no re-issue path.
+      signed out mid-poll and links 403. There is no re-issue path. In `capability`
+      mode it also invalidates every live management cookie, which is the intended
+      effect and not a bug.
 - [ ] `OAUTH2_PROXY_COOKIE_SECRET` likewise, and likewise backup-worthy.
 
 ## 4. Persistence (D5 — SQLite on a volume, #36)
@@ -202,6 +206,18 @@ owner auth: oidc (issuer=…, allowlist=3 subject(s) + trusted-proxy CIDRs
       instance is an open mail relay until they are.
 - [ ] Set `KAIROS_API_KEY` or leave it empty. Empty disables the Bearer-key API
       surface; it does not disable the public poll pages.
+- [ ] In `capability` mode, treat `{prefix}/manage/` as a credential path in your
+      access logs. The emailed manage link is a live credential until it is opened,
+      and `GET {prefix}/manage/<token>` puts it in the request line — so anything
+      logging requests has it, and a link nobody ever opens stays valid forever.
+      Redact that path, or keep those logs short-lived. Kairos writes neither tokens
+      nor creator addresses to its own logs, so this is entirely about the front end
+      in front of Kairos.
+- [ ] In `capability` mode, set `KAIROS_PUBLIC_URL`. Without it the manage-link URL
+      is built from request headers, so a caller who controls `Host` gets a mail sent
+      from your domain — with your sender and your branding — whose "manage link"
+      points at *their* host, where the credential they capture is entered on a page
+      they serve.
 
 ## 7. Cookies and consent (P1/P4)
 

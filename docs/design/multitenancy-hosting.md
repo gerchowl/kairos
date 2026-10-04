@@ -216,10 +216,25 @@ build on it rather than re-derive it:
    the per-participant cooldown and the per-poll send budget hold across surfaces
    (ADR-0012's parity invariant) instead of being re-implemented here.
 5. **Rotation needs a way back, so `POST /manage/link` exists.** It re-mails the
-   current capability to an address that already created a poll here. The response
-   is byte-identical whether or not anything matched (not an address oracle), it
-   never says how many it sent, it is capped at 10 links per request, and it draws
-   the `send` budget — the one every SMTP-opening route already shares.
+   current capability to an address that already created a poll here. It never says
+   how many it sent, it is capped at 10 links per request, and it draws the `send`
+   budget — the one every SMTP-opening route already shares. It is CSRF-bound like
+   the creation form, and it filters *before* it caps: `[:10]`-then-filter meant a
+   creator with ten recent polls and one older linkable poll got no mail at all,
+   since every poll minted since #29 has a capability and the list is newest-first.
+   **It is not an address oracle in the body, and it was one in the response time.**
+   The page is identical apart from its per-render CSRF binding (a signed token
+   carrying the second it was minted — a function of the clock, not of the address).
+   The *timing* was not identical: a match opens one SMTP connection per poll and a
+   miss opens none, which measured **87x** (0.254s vs 0.003s) against a real relay.
+   That confirms which addresses have created a poll here, and the Subject line of
+   the mail a real hit triggers then leaks the poll titles. The response is now held
+   to a 0.3s floor (`LINK_REQUEST_FLOOR_SECONDS`). A floor is a mitigation and not a
+   proof: it equalises the two cases only while the relay answers inside it, and the
+   real answer — queue the mail, answer before SMTP — is a delivery change rather
+   than a route change. Recorded here because the previous version of this sentence
+   said "byte-identical … (not an address oracle)" and was true of the body and
+   false of the response, which is how the timing channel survived review.
 6. **Outbound mail is a precondition, not a feature.** In this mode the link *is*
    the credential, so `is_configured()` is consulted before a poll is created and
    creation is **refused** (503, with the operator-facing reason) when mail cannot
@@ -237,16 +252,63 @@ build on it rather than re-derive it:
    and an unconfigured deployment still has no limits at all (ADR-0001/0002) — which
    is why boot now says, out loud, that an unconfigured capability deployment lets
    anyone who can reach the app have mail sent from its domain. That warning, plus
-   one for a missing `SESSION_SECRET` (the credential cookie is signed with it, and
-   without it every manage page is a 500 with a healthy-looking boot log) and one
-   for a missing `KAIROS_PUBLIC_URL` (a manage link's origin must not come from
-   request headers), is the whole operational contract of this mode.
+   one for a missing `KAIROS_PUBLIC_URL` (a manage link's origin must not come from
+   request headers), is the whole operational contract of this mode. A missing
+   `SESSION_SECRET` used to be on that list and no longer is: it **refuses to
+   boot**, under the mode gate, because the cookie it signs is the only credential
+   the console has and the alternative was a green boot, a 200 from `GET /manage`
+   (the no-session branch never touches the secret) and then a 500 on the two routes
+   that mint or verify a cookie. A hard requirement is #53's pattern — an OIDC
+   deployment with no owner allowlist also refuses — and the gate costs every other
+   mode nothing.
 8. **`KAIROS_AUTH` is now validated at boot.** A typo like `capabilty` resolves
    nobody in `get_user`, so every owner page 401s and the deployment looks like one
    where everybody is logged out — a control the operator believes is in force and
    is not. An unrecognised value refuses to boot, naming the variable and the
    known modes, like `_parse_networks`, `_parse_rate_limit`, `parse_keyring` and
    `_validate_config` already do. Every mode that existed before is still accepted.
+9. **The anonymous creation route is bounded before it loops, not after.** In
+   `time_slot` mode the slot list is built by `while t + timedelta(minutes=increment)
+   <= t_end`, and `increment` is a form field on a request that #30 made
+   anonymous. `increment=0` never advances `t`: measured against a real uvicorn with
+   no credential at all (the anon CSRF token is scraped off the public `/new` form),
+   one such POST took the process from 59 MB to 2.1 GB without answering, and
+   anyio's 40-thread default meant ~40 of them were enough to take the deployment
+   down — `/health` still answering, so it read as a hang. A non-numeric value was a
+   plain `ValueError` → 500 on the same line, and so was any `start_time_all` /
+   `end_time_all` that `strptime` could not parse. `increment` is now a whole number
+   of minutes in `1..1440` and the clocks must be `HH:MM`, both refused *before* the
+   loop. The distinction is the whole point: `MAX_SLOTS_PER_ACCOUNTLESS_POLL` runs
+   after the list exists, so it cannot bound what building the list costs, and a PR
+   that advertises a slot cap while the loop above it is unbounded has not bounded
+   anything.
+10. **A capability in a URL is in the access log, and that is an operator's
+    problem.** `GET /manage/<token>` puts the live token in whatever the front end
+    writes down — `INFO: 127.0.0.1:48348 - "GET /manage/6YBiM6… HTTP/1.1" 200 OK`
+    is the real shape of it. Kairos never writes a capability to its own logs (no log
+    line in `capability.py` carries one, asserted), but the access log belongs to
+    uvicorn or the reverse proxy. For a link nobody ever opens, the token is valid
+    forever *and* sits in the log forever. What exists: single use (the token dies
+    the moment it is exchanged), `Referrer-Policy: no-referrer` on the one page whose
+    URL carries it, and no creator address in any log line. What an operator should
+    do: keep request lines for `{prefix}/manage/` short-lived, or redact that path.
+11. **`KAIROS_PUBLIC_URL` unset is a phishing risk, not a cosmetic one.** With
+    `KAIROS_TRUSTED_PROXY_CIDRS` set only a trusted peer reaches the app, so the
+    origin cannot be dictated — which is why this one warns instead of refusing. But
+    a deployment without that allowlist derives the origin from caller-supplied
+    headers, and `POST /new` with `Host: evil.example` mails, **from the operator's
+    own sender and branding**, a *"Your manage link: Quarterly planning"* URL of
+    `https://evil.example/scheduler/manage/<token>`. The link works on the attacker's
+    host, the creator clicks it from a message that looks like it came from Kairos,
+    and the credential is entered on a page the attacker serves. In every other mode
+    a wrong origin means a broken link; here it means a working phishing page with
+    your domain on it. `KAIROS_PUBLIC_URL` is the fix and this mode is the reason it
+    exists.
+12. **There is no logout route.** A shared browser ends its capability session by
+    expiry or by opening a fresh link, not by a button. Deliberate for this step — a
+    logout that cannot also retire the emailed link would be a half-measure that
+    reads like a control — and worth revisiting with #32's accounts, where a session
+    and its revocation can be the same object.
 
 Deliberately **not** in this step: the `manage_verified_at` **send-gate** (#31),
 Turnstile (#31), accounts / dashboard / claim (#32 — which is also where a

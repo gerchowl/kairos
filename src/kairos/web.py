@@ -143,6 +143,101 @@ def _valid_timezone(tz: str) -> bool:
         return False
 
 
+# The slot-step bounds for `time_slot` mode, and the one place they are enforced.
+#
+# `increment` is a form field and this loop is a `while`, which is the whole
+# problem: `while t + timedelta(minutes=increment) <= t_end` with `increment == 0`
+# never advances `t`, so it appends a slot forever. In owner modes that is one
+# authenticated user's own request; since #30 this form is also the *anonymous*
+# accountless creation path, so `increment=0` (or `-5`) is a remote
+# unauthenticated OOM — measured against a real uvicorn, one such POST took the
+# process from 59 MB to 2.1 GB without answering, and anyio's 40-thread default
+# meant ~40 of them were enough to take the deployment down. A non-numeric value
+# was a plain `ValueError` → 500 on the same line.
+#
+# So the bound is *here*, before the loop, not in a size check after it: the cap in
+# `capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL` refuses a poll that is too big, but a
+# check that runs once the list exists cannot bound what building the list costs.
+# These two numbers make one loop iteration per minute of the window at worst, so
+# the loop is bounded by the day: 1440 iterations, 1440 slots, one date.
+MIN_INCREMENT_MINUTES = 1
+MAX_INCREMENT_MINUTES = 1440
+
+
+def _bounded_int(raw: str, low: int, high: int) -> int | None:
+    """`raw` as an int inside `low..high`, or None — never an exception.
+
+    One parser for both numeric form fields on this path, because a form field is
+    a string typed by a stranger: `int()` on it is a 500 waiting for a value like
+    `"1.5"`, and `max(1, int(raw))` is a 500 that a sanitizer makes worse.
+    """
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if low <= value <= high else None
+
+
+def _parse_clock(raw: str):
+    """A `HH:MM` form field as a datetime, or None.
+
+    `strptime` is the parser; the None is the part that matters. A `start_time_all`
+    of `"25:00"` raised out of the route rather than being refused, and since #30
+    the route is anonymous, so an unparseable clock was a 500 on it — the same shape
+    as the unvalidated `increment` above, on the two lines beside it, and fixed in
+    the same place.
+    """
+    try:
+        return datetime.strptime(raw.strip(), "%H:%M")
+    except (AttributeError, ValueError):
+        return None
+
+
+def _expand_time_slots(form, dates) -> tuple[list[dict], str | None]:
+    """The `time_slot` grid for `dates`, or the sentence that refuses it.
+
+    Its own function so that every bound is visibly attached to the loop it
+    protects. That is not tidiness: the loop is a `while` over a form field, the
+    route is anonymous since #30, and the two facts together are what made
+    `increment=0` an unauthenticated OOM — a check that lives in another function,
+    or after the list is built, is not a bound on the loop. The refusals are
+    returned rather than rendered so this stays free of auth-mode shape: the caller
+    owns `_fail`, which is the one thing that differs between the modes.
+    """
+    start_all = form.get("start_time_all", "09:00")
+    end_all = form.get("end_time_all", "17:00")
+    if not start_all or not end_all:
+        return [], "Start and end times are required for time slot mode."
+    t_start = _parse_clock(start_all)
+    t_end = _parse_clock(end_all)
+    if t_start is None or t_end is None:
+        return [], "Start and end times must be given as HH:MM."
+    increment = _bounded_int(form.get("increment", "30"), MIN_INCREMENT_MINUTES, MAX_INCREMENT_MINUTES)
+    if increment is None:
+        return [], (
+            f"Increment must be a whole number of minutes between "
+            f"{MIN_INCREMENT_MINUTES} and {MAX_INCREMENT_MINUTES}."
+        )
+
+    slots = []
+    for date in dates:
+        if not date:
+            continue
+        t = t_start
+        # Bounded by construction now: `increment >= 1` means `t` advances every
+        # iteration and the window is at most a day, so this is at most
+        # MAX_INCREMENT_MINUTES iterations per date.
+        while t + timedelta(minutes=increment) <= t_end:
+            t_next = t + timedelta(minutes=increment)
+            slots.append({
+                "date": date,
+                "start_time": t.strftime("%H:%M"),
+                "end_time": t_next.strftime("%H:%M"),
+            })
+            t = t_next
+    return slots, None
+
+
 def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
     """Auth + CSRF + management-authority gate shared by all owner POST actions.
 
@@ -313,25 +408,9 @@ def create_poll_submit(request: Request, form=Depends(form_data),
 
     slots = []
     if mode == "time_slot":
-        start_all = form.get("start_time_all", "09:00")
-        end_all = form.get("end_time_all", "17:00")
-        increment = int(form.get("increment", "30"))
-        if not start_all or not end_all:
-            return _fail("Start and end times are required for time slot mode.")
-        t_start = datetime.strptime(start_all, "%H:%M")
-        t_end = datetime.strptime(end_all, "%H:%M")
-        for date in dates:
-            if not date:
-                continue
-            t = t_start
-            while t + timedelta(minutes=increment) <= t_end:
-                t_next = t + timedelta(minutes=increment)
-                slots.append({
-                    "date": date,
-                    "start_time": t.strftime("%H:%M"),
-                    "end_time": t_next.strftime("%H:%M"),
-                })
-                t = t_next
+        slots, error = _expand_time_slots(form, dates)
+        if error:
+            return _fail(error)
     else:
         for date in dates:
             if not date:
