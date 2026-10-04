@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/gerchowl/kairos/compare/v0.12.0...v0.13.0) (2026-10-04)
+
+
+### Features
+
+* **abuse:** Turnstile + manage_verified_at send-gate (accountless anti-spam) ([#72](https://github.com/gerchowl/kairos/issues/72)) ([0cef7db](https://github.com/gerchowl/kairos/commit/0cef7db5ea122fa830b39ef1d2afe670015214a5))
+
 ## [0.12.0](https://github.com/gerchowl/kairos/compare/v0.11.0...v0.12.0) (2026-10-04)
 
 
