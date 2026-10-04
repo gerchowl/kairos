@@ -294,6 +294,20 @@ What that commits us to, so it is a decision and not a dodge:
 **Revisit trigger:** more than one app instance, or write contention on the
 volume.
 
+## Progress as of 2026-10-02 (v0.10.0)
+
+Shipped and merged, each after a fresh-context subagent review: #47 (S1 allowlist),
+#35 (OCI image + compose), #48 (M1 mail gate + runbook), #37 (public rate limits),
+#51 (API/MCP scopes + send budgets), #29 (`admin_token` + `require_manage`), #53
+(first-party OIDC). #36 decided (SQLite) and closed. Tests 116 -> 717.
+
+Three PRs are implemented, green and **unmerged**, pending review: #66 (#59 release
+lockfile), #67 (#63+#64 per-poll reach), #68 (#30 capability mode). See
+[`HANDOFF.md`](HANDOFF.md) for the live queue and the blocked review tooling.
+
+That leaves Phase 2 mostly done — **#31 is the last piece of the accountless
+product** and is now unblocked, since #68 landed `/manage/<token>` for it to gate.
+
 ## Phase 2 — the accountless chain (strictly serial)
 
 This is the spine of Epic #38 and the reason it was decomposed. Each step depends
