@@ -133,6 +133,15 @@ its configuration is broken when it is exactly right.
   which is a fail-open with a green suite attached: a `{pid}` route skipped the
   check and was invisible to the audit at the same time. One function, asked of
   both.
+* **The audit's question is one step wider than the guard's.** `reach.names_poll`
+  asks "is this a route *about* polls" — a `polls`/`poll` segment with something
+  after it — rather than "did I find a parameter". The narrow question had a hole
+  the second review demonstrated live: `POST /api/polls/export`, ids in the body,
+  satisfied #51's scope audit *and* the reach audit and returned
+  `{"exported": ["p1","p2","p3"]}` to a key granted `p1`. Such a route is now in
+  the audited set, and because `required_poll_id` cannot see a body, *declaring*
+  reach on it is a 500 rather than a guard — it has to authorize each id against
+  the caller's grant itself. Nothing on the live route table changes.
 * **A declared reach that cannot name its poll refuses.** `required_poll_id`
   raises rather than returning, so `reach=True` on a path with no poll id is a 500
   naming the route — not a silent pass. "I could not tell" and "you may read it"
@@ -141,9 +150,14 @@ its configuration is broken when it is exactly right.
   answers 403 and never reads the poll, so "not yours" and "does not exist" are
   one code path by construction. The web surface must read the poll to apply the
   *named on this poll* half of the rule, so it could tell the two apart — and
-  therefore answers 404 to both, with wording that names neither. That is why
-  there is no `require_reach` beside `require_manage`: one helper raising one
-  status while the route raised another *was* the oracle.
+  therefore answers with the missing poll's own 404 **byte for byte**, from one
+  function (`web._not_yours_or_gone`) that both the missing and the refusing
+  branch call. Byte-identical, not merely the same status: the first version of
+  this unified the status and gave the refusal a 60-byte sentence of its own, which
+  the second review measured on the live app as 4365 bytes against 4305 — an
+  oracle with the same status code. That is why there is no `require_reach` beside
+  `require_manage`, and why the helper carries no wording at all: an empty detail
+  is what a missing poll already answered with.
 * **The audit, on both surfaces.** `tests/test_poll_reach.py` walks the live
   `/api` route table through #51's `_api_routes` (and its fixed, both-sides-
   anchored prefix filter) and fails if a route naming a poll declares no reach.

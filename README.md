@@ -424,9 +424,11 @@ warns when it is not.
 Two things `scoped` does *not* do, both pinned by tests so a later change is
 deliberate:
 
-* a refusal on the web surface is **404**, the same answer a missing poll gets,
-  because that surface has to read the poll in order to decide and must therefore
-  not also tell a caller which of the two it was;
+* a refusal on the web surface is the missing poll's own **404, byte for byte** —
+  same status, same page, same empty detail, one function for both — because that
+  surface has to read the poll in order to decide and must therefore not also tell
+  a caller which of the two it was. The first version of this matched the status
+  and not the body, and a 60-byte sentence on the refusal only was still an oracle;
 * a key that creates a poll it cannot reach is **not** auto-granted reach over it
   (nothing in the schema says which key made the row, issue #32) — the creation
   response carries a `reach_warning` naming the grant it needs instead.

@@ -150,10 +150,17 @@ TRUSTED_PROXY_NETWORKS = _parse_networks(TRUSTED_PROXY_CIDRS, "KAIROS_TRUSTED_PR
 # must not silently disarm the gate, which is the failure mode a security control should
 # never have. An unrecognised value keeps HOSTED off (the safe direction for self-host)
 # but records itself so the boot line can WARN rather than quietly do nothing.
+#
+# The false set is spelled out for the same reason in reverse, and it includes the short
+# forms on purpose: `n` and `f` are what someone writes for "no", and both gates should
+# read them as the self-host answer rather than as a typo. Before this, `n` was
+# *unrecognised*, and reach treats unrecognised as hosted (#63/#64) — so the likeliest
+# spelling of "not hosted" was the one that turned a self-hoster's deployment strict.
 HOSTED_RAW = os.environ.get("KAIROS_HOSTED", "").strip()
-HOSTED_TRUE = ("1", "on", "true", "yes")
+HOSTED_TRUE = ("1", "on", "true", "yes", "y")
+HOSTED_FALSE = ("0", "off", "false", "no", "n", "f", "")
 HOSTED = HOSTED_RAW.lower() in HOSTED_TRUE
-HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + ("0", "off", "false", "no", "")
+HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + HOSTED_FALSE
 # Normalised, not validated: a typo must fail as a loud refusal naming this knob, not as
 # an import error that would also break self-host, where the variable is unused. See
 # kairos.email_service.sender_refusal().

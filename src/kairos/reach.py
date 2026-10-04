@@ -68,12 +68,15 @@ answers 403 and never consults the poll, so "not yours" and "does not exist" are
 literally the same code path — it cannot tell them apart, which is the whole reason
 there is no existence oracle there. The web surface *has* to read the poll to
 decide (its rule includes "named on this poll"), so it could tell them apart and
-therefore must not: both web refusals are **404, the same answer a missing poll
-gets**, and the wording says nothing about ownership. That is why there is no
-`require_reach` counterpart to `require_manage` (#29) — a helper that raised one
-status for a refusal while the route raised another for a missing poll *was* the
-oracle, and each web route renders its own 404 in whatever shape its own surface
-wants (a styled page for the poll, a bare 404 for the ICS).
+therefore must not: a web refusal is **the missing poll's own 404, byte for byte**,
+rendered by one shared function (`web._not_yours_or_gone`) that both the missing
+and the refusing branch call — same status, same heading, same empty detail, same
+body. A 60-byte sentence on the refusal only was measured on the live app by the
+second review and was still an oracle; the identity has to be in the bytes, not in
+the status code. That is also why there is no `require_reach` counterpart to
+`require_manage` (#29): a helper that raised one status for a refusal while the
+route raised another for a missing poll *was* the oracle. The ICS is the same idea
+one line long — one branch, one bare `HTTPException(404)`.
 
 **What is deliberately not modelled here.** Per-account reach (#32) and per-plan
 reach (#33). Both need an identity the data model does not have yet:
@@ -156,21 +159,22 @@ def policy() -> str:
     second notion of hosted-ness that could disagree with it.
 
     **An unrecognised `KAIROS_HOSTED` is `scoped` here, deliberately against the
-    mail gate's reading.** `settings` resolves that knob as a recognised-true set
-    (`1/on/true/yes`), so `KAIROS_HOSTED=Y` leaves `HOSTED` False and
-    `HOSTED_UNKNOWN` True, and the M1 gate reads that as *off* — the safe
-    direction for a self-hoster whose relay authenticates their own mail. This
-    function used to inherit that reading, and the consequence was that the one
-    spelling an operator actually types quietly selected `open`, the permissive
-    policy, on the deployment that had just asked to be treated as hosted: a
-    typo was a fail-open on the exact control that made HOSTED matter. The two
-    readings now differ on purpose, because the costs are not symmetric. Getting
-    the mail gate wrong costs a warning about DNS records nobody here can publish;
-    getting *this* wrong costs every respondent name on the instance. So an
-    unknown value is read as "the operator meant hosted, and misspelled it" and
-    gets the strict policy, which is also the recoverable one — a self-hoster who
-    meant otherwise sets `KAIROS_POLL_REACH=open` and gets back exactly the
-    pre-#63 behaviour, and `boot_warnings` says so by name.
+    mail gate's reading.** `settings` enumerates both spellings — `settings.HOSTED_
+    TRUE` (`1/on/true/yes/y`) and `settings.HOSTED_FALSE` (`0/off/false/no/n/f`) —
+    and anything else leaves `HOSTED` False with `HOSTED_UNKNOWN` True, which the
+    M1 gate reads as *off*: the safe direction for a self-hoster whose relay
+    authenticates their own mail. This function used to inherit that reading, and
+    the consequence was that `KAIROS_HOSTED=enabled` (and, before the sets were
+    spelled out, `Y` and `n`) quietly selected `open`, the permissive policy, on the
+    deployment that had just asked to be treated as hosted — a typo was a fail-open
+    on the exact control that made HOSTED matter, and `n`, the likeliest spelling of
+    "not hosted", made a self-hoster strict. The two readings now differ on purpose,
+    because the costs are not symmetric. Getting the mail gate wrong costs a warning
+    about DNS records nobody here can publish; getting *this* wrong costs every
+    respondent name on the instance. So an unknown value is read as "the operator
+    meant hosted, and misspelled it" and gets the strict policy, which is also the
+    recoverable one — a self-hoster who meant otherwise sets `KAIROS_POLL_REACH=open`
+    and gets back exactly the pre-#63 behaviour, and `boot_warnings` says so by name.
 
     An unrecognised `KAIROS_POLL_REACH` refuses — a `RuntimeError` here fails the
     boot, because `scoping.boot_report` calls this at startup — rather than
@@ -382,11 +386,45 @@ def only_reachable(polls: list[dict], request: Request, **kwargs) -> list[dict]:
 # `/api/polls/{...}`). Structural on purpose: the first review of this PR found
 # `poll_id_of` and the audit both matching the literal name `poll_id`, so a route
 # that spelled its parameter `{pid}` was unguarded *and* invisible to the audit.
-_POLL_SEGMENT = "polls"
+# The singular is listed too so a route spelled `/poll/{poll_id}` is not a hole of
+# the same kind; nothing on the live route table is spelled that way, and the one
+# route with a `poll` segment (`POST /api/imip/poll`) ends in it, so it reads as no
+# poll route either way.
+_POLL_SEGMENTS = ("polls", "poll")
 
 # The house spelling, used only where there is no route template to read (a
 # hand-built scope, a test). Never as the rule: the rule is `poll_param`.
 _POLL_ID = "poll_id"
+
+
+def _segments(path: str) -> list[str]:
+    return [s for s in str(path or "").split("/") if s]
+
+
+def names_poll(path: str) -> bool:
+    """Does this route's path identify a poll — one, or a set of them?
+
+    The question both audits ask, and deliberately **wider** than `poll_param`.
+    A route under a `polls` segment that is not the bare collection is a route
+    *about* polls: it names one in the path, or it names some in a body or a query
+    string, and either way it has to say where its authorization comes from. Only
+    the collection itself (`/polls`, with nothing after it) is exempt — it is the
+    one route whose whole answer is "what the caller reaches".
+
+    The wider shape exists because the narrow one had a hole the second review
+    found and demonstrated: `POST /api/polls/export`, with ids in the body,
+    satisfied #51's scope audit *and* the reach audit while being unguarded, and
+    answered 200 with `{"exported": ["p1", "p2", "p3"]}` to a key granted `p1`
+    alone. Same for `/polls/bulk/{x}` and `/polls/export`. A path shape cannot tell
+    us where such a route keeps its ids, so the rule is not "I found a parameter" —
+    it is "this is a poll route, so where is the guard?". Nothing in the live route
+    table is affected; that is what makes it safe to widen.
+    """
+    segments = _segments(path)
+    for i, segment in enumerate(segments):
+        if segment in _POLL_SEGMENTS:
+            return i + 1 < len(segments)  # the bare collection names no single poll
+    return False
 
 
 def poll_param(path: str) -> str | None:
@@ -398,13 +436,13 @@ def poll_param(path: str) -> str | None:
     `/polls/{pid}` is guarded by exactly the same predicate as one that writes
     `/polls/{poll_id}`, and the CI audit asks the same question of both.
 
-    None for a route that names no poll after `polls` (`/polls`, `/polls/{poll_id}/…`
-    aside), which is the honest answer rather than a guess: those routes reach no
-    single poll and `required_poll_id` refuses them.
+    None for a route this shape cannot resolve — `/polls`, or `/polls/export`, whose
+    ids are somewhere this cannot see. Those are the routes `required_poll_id`
+    refuses, and `names_poll` is what puts them in front of the audit.
     """
-    segments = [s for s in str(path or "").split("/") if s]
+    segments = _segments(path)
     for i, segment in enumerate(segments):
-        if segment != _POLL_SEGMENT or i + 1 >= len(segments):
+        if segment not in _POLL_SEGMENTS or i + 1 >= len(segments):
             continue
         candidate = segments[i + 1]
         if len(candidate) > 2 and candidate.startswith("{") and candidate.endswith("}"):
@@ -459,8 +497,10 @@ def required_poll_id(request: Request) -> str:
         raise RuntimeError(
             f"{route_path(request) or '(unknown route)'}: reach was declared but no poll id "
             f"resolves from this request's path — expected a '{{...}}' parameter after "
-            f"'/{_POLL_SEGMENT}/'. Refusing rather than allowing an authorization that "
-            f"cannot name its poll."
+            f"'/polls/'. If this route takes its ids from a body or a query string, "
+            f"reach cannot be declared here: authorize each id against the caller's grant "
+            f"yourself. Refusing rather than allowing an authorization that cannot name "
+            f"its poll."
         )
     return poll_id
 

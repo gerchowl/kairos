@@ -152,7 +152,18 @@ def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
 
 
 def expand_new_dates(poll: dict, dates: list[str]) -> list[dict]:
-    """Slots for genuinely-new dates; time_slot polls reuse the poll's time grid."""
+    """Slots for genuinely-new dates; time_slot polls reuse the poll's time grid.
+
+    **Per date, and it multiplies.** A `time_slot` poll expands each new date over
+    the poll's whole time grid, so the number of rows written is
+    `len(new_dates) x len(time grid)` — a one-minute grid is 1440 slots *per date*,
+    and asking for ten dates writes 14,400 of them in one `POST
+    /polls/{id}/slots`. The grid is bounded by how the poll was created and the date
+    list is not capped here, which is a pre-existing write-amplification surface on
+    a route that already requires `polls:write` **and** reach over the poll; it is
+    written down rather than changed, because a cap would be a behaviour change on
+    requests that succeed today.
+    """
     existing = {str(s["date"]) for s in poll["slots"]}
     new_dates = [d for d in dates if d and d not in existing]
     time_pairs = sorted({(fmt_time(s["start_time"]), fmt_time(s["end_time"]))
@@ -196,18 +207,25 @@ def _error_page(user: dict, heading: str, detail: str, back: str, status_code: i
                   **_nav_ctx(user))
 
 
-def _not_yours_or_gone(user: dict, back: str) -> Response:
-    """404 for a poll the caller may not read — and for one that is not there.
+def _not_yours_or_gone(user: dict) -> Response:
+    """The one 404 for a poll the caller may not read, and for one that is not there.
 
-    One answer for both, on purpose (issue #63/#64, second review). On this surface
-    reach cannot be decided without reading the poll row, so a 403 for "not yours"
-    beside a 404 for "not there" is a probe that distinguishes them for anyone
-    holding an id. The detail therefore names neither: it says the poll is not
-    available, which is true in both cases and useless as a probe.
+    **Byte-identical between the two cases, and structurally so** — this is the only
+    function either path calls, so they cannot drift. On this surface reach cannot be
+    decided without reading the poll row, which means the route *could* tell "not
+    yours" from "not there"; a refusal that differed from the missing poll's own 404
+    in any single byte would therefore be a probe for anyone holding an id. The first
+    attempt at this got the status right and the body wrong — a 60-byte sentence on
+    the refusal only — which the second review measured on the live app and this
+    module's own probe reproduces: 4365 bytes for "not mine" against 4305 for
+    "missing", same id, same status code.
+
+    So the detail is empty, exactly as it was for a missing poll before this file
+    existed — one answer, no wording, nothing to compare. The API surface needs none
+    of this (its 403 never consults the poll); `poll_ics` needs no helper either,
+    because its two cases are one branch already.
     """
-    return _error_page(user, "Poll not found",
-                       "This poll does not exist, or is not available to you.",
-                       back, status_code=404)
+    return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
 
 
 # -- Routes --
@@ -326,7 +344,10 @@ def view_poll(poll_id: str, request: Request):
 
     poll = get_poll(poll_id)
     if not poll:
-        return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
+        # The same call the refusal below makes, so the two 404s cannot differ by a
+        # byte (see `_not_yours_or_gone`): this route reads the poll in order to
+        # decide, so it could tell "not yours" from "not there" and must not.
+        return _not_yours_or_gone(user)
 
     # The rows this page renders anyway, read up front so the reach check below can
     # be handed them instead of fetching them a second time: refusing a stranger
@@ -347,12 +368,13 @@ def view_poll(poll_id: str, request: Request):
     # marked read, which is the only side effect on this path: a refused caller must
     # not leave a trace.
     #
-    # 404 and not 403, and the wording says nothing about ownership: this route has
-    # read the poll in order to decide, so 403-here/404-for-a-missing-poll would be
-    # an existence oracle for anyone holding an id (see `kairos.reach`'s module
-    # docstring). Same answer, same page, whether the poll is not yours or not there.
+    # 404 and not 403, and not merely the same status: the refusal is the *same
+    # bytes* as the missing poll's 404 above, from one function, because this route
+    # has read the poll in order to decide and must therefore not also tell a caller
+    # holding an id which of the two it was. No wording either — an empty detail is
+    # what a missing poll already answered with.
     if not can_reach(poll, request, user=user, participants=(responses, invites)):
-        return _not_yours_or_gone(user, f"{P}/")
+        return _not_yours_or_gone(user)
 
     # Mark poll notifications as read
     notifs = get_notifications(user["uid"], unread_only=True)

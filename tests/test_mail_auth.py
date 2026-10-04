@@ -744,8 +744,13 @@ def _import_settings(env: dict) -> subprocess.CompletedProcess:
         ("true", "True"),
         ("yes", "True"),
         ("TRUE", "True"),
+        ("y", "True"),
         ("0", "False"),
         ("off", "False"),
+        ("false", "False"),
+        ("no", "False"),
+        ("n", "False"),
+        ("f", "False"),
         ("", "False"),
     ],
 )
@@ -926,12 +931,14 @@ def test_repeating_the_same_reason_is_logged_once(relay, hosted, monkeypatch, ca
     assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
 
 
-@pytest.mark.parametrize("value", ["y", "t", "enabled", "ok", "2", "truthy"])
+@pytest.mark.parametrize("value", ["t", "enabled", "ok", "2", "truthy"])
 def test_an_unrecognised_hosted_value_is_reported_as_unknown(relay, monkeypatch, value):
     """A typo must not silently disarm the gate.
 
     HOSTED stays False, which is the safe direction for self-host, but the boot line says
-    so in words rather than reporting a normal self-host configuration.
+    so in words rather than reporting a normal self-host configuration. (`y` and `n` are
+    *not* typos in this list any more: they are spellings of yes and no, and both sets are
+    enumerated in settings.HOSTED_TRUE / HOSTED_FALSE.)
     """
     monkeypatch.setattr(settings, "HOSTED", False)
     monkeypatch.setattr(settings, "HOSTED_UNKNOWN", True)
@@ -958,9 +965,14 @@ def test_the_report_shows_the_normalised_domain_not_the_raw_setting(relay, hoste
 
 def test_hosted_env_typo_is_wired_through_a_subprocess():
     """HOSTED_UNKNOWN is derived in settings.py, so pin it in a real process."""
-    result = _import_settings({"KAIROS_HOSTED": "y"})
+    result = _import_settings({"KAIROS_HOSTED": "enabled"})
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "False True ''"
 
     result = _import_settings({"KAIROS_HOSTED": "1"})
     assert result.stdout.strip() == "True False ''"
+
+    # The short spellings are enumerated, not guessed: `y` is yes and `n` is no, so
+    # neither arms the gate by accident nor reports as a typo.
+    assert _import_settings({"KAIROS_HOSTED": "y"}).stdout.strip() == "True False ''"
+    assert _import_settings({"KAIROS_HOSTED": "n"}).stdout.strip() == "False False ''"

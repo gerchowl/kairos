@@ -353,20 +353,31 @@ def _policy_in_a_fresh_process(env: dict) -> str:
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        # Recognised. `Y` is not one of these, which is the whole point.
+        # Recognised hosted.
         ("on", "True False scoped"),
         ("1", "True False scoped"),
         ("yes", "True False scoped"),
         ("true", "True False scoped"),
-        # Recognised as self-host: the pre-#63 rule, unchanged.
+        # Recognised self-host: the pre-#63 rule, unchanged. `n` and `f` are here
+        # because they are what somebody writes for "no" — and they used to land on
+        # the unrecognised reading, which reach treats as *hosted*, so the likeliest
+        # spelling of "not hosted" was the one that turned a self-hoster strict.
         ("", "False False open"),
         ("0", "False False open"),
         ("off", "False False open"),
+        ("false", "False False open"),
+        ("no", "False False open"),
+        ("n", "False False open"),
+        ("f", "False False open"),
+        ("N", "False False open"),
+        ("OFF", "False False open"),
+        # Recognised hosted, short spelling: `y` is a spelling of `yes`, not a typo,
+        # so it arms the gate and reports nothing.
+        ("y", "True False scoped"),
+        ("Y", "True False scoped"),
         # Unrecognised — the reviewer's table. Every one of these used to yield
         # `open`, i.e. an operator asking to be treated as hosted and silently
         # getting the permissive policy on a control that now decides reads.
-        ("Y", "False True scoped"),
-        ("y", "False True scoped"),
         ("enabled", "False True scoped"),
         ("t", "False True scoped"),
         ("2", "False True scoped"),
@@ -698,9 +709,35 @@ def test_someone_named_on_the_poll_still_reads_it(scoped, client):
 def test_a_stranger_is_refused_the_poll_and_the_ics(scoped, client):
     page = as_person(client, STRANGER).get(WEB_POLL)
     assert page.status_code == 404
-    assert "not available to you" in page.text  # an HTML error page, like every other here
+    # No wording of its own: `test_a_refusal_is_byte_identical_to_a_missing_poll`
+    # below is what pins the shape of the body.
     feed = as_person(client, STRANGER).get(WEB_ICS)
     assert feed.status_code == 404  # a calendar feed is not a page, but it is 404 too
+
+
+def test_a_refusal_is_byte_identical_to_a_missing_poll(scoped, client):
+    """Not merely the same status — the same **bytes**. The second review's must-fix,
+    and easy to regress: the first attempt at this unification put a 60-byte sentence
+    on the refusal only, which the reviewer measured on the live app as 4369 bytes for
+    "not mine" against 4309 for "missing" from the same poll id. Same status,
+    different body — the oracle, still open.
+
+    Both surfaces, and the whole response rather than a substring, because comparing
+    substrings is exactly how the difference got through in the first place.
+    """
+    stranger = as_person(client, STRANGER)
+    refused, missing = stranger.get(WEB_POLL), stranger.get(f"{web.P}/polls/no-such-poll")
+    assert refused.status_code == missing.status_code == 404
+    assert len(refused.text) == len(missing.text)
+    assert refused.text == missing.text, "the refusal body differs from a missing poll's"
+    # The ICS needs no helper for this: its two cases are one branch, one bare raise.
+    ics_refused = stranger.get(WEB_ICS)
+    ics_missing = stranger.get(f"{web.P}/polls/no-such-poll/event.ics")
+    assert ics_refused.status_code == ics_missing.status_code == 404
+    assert ics_refused.content == ics_missing.content
+    # And nothing in a refusal names ownership, which is the other thing that would
+    # tell the two answers apart.
+    assert "owner" not in ics_refused.text.lower()
 
 
 def test_the_web_refusals_are_404_and_they_name_nothing(scoped, client):
@@ -711,23 +748,15 @@ def test_the_web_refusals_are_404_and_they_name_nothing(scoped, client):
     construction. On the web surface the rule includes *being named on the poll*,
     so the row has to be read before the decision -- which means the route could
     tell the two apart, and 403-beside-404 was exactly that tell for anyone holding
-    an id. Both refusals are now the missing poll's own 404, with wording that
-    gives an id-holder nothing either way.
+    an id. Both refusals are now the missing poll's own 404 — the same *bytes*,
+    which `test_a_refusal_is_byte_identical_to_a_missing_poll` pins.
     """
     # Two clients: `as_person` mutates the one it is given, so an "owner" view of
     # the same client would be a view of whoever was last written onto it.
     stranger = as_person(client, STRANGER)
     owner = TestClient(main.app, base_url="https://testserver", headers=dict(OWNER))
-    mine = stranger.get(WEB_POLL).status_code
-    gone = stranger.get("/scheduler/polls/no-such-poll").status_code
-    assert mine == gone == 404
-    ics_mine = stranger.get(WEB_ICS).status_code
-    ics_gone = stranger.get("/scheduler/polls/no-such-poll/event.ics").status_code
-    assert ics_mine == ics_gone == 404
-    # ...and no refusal names ownership, which is the only other thing that would
-    # distinguish them.
-    for body in (stranger.get(WEB_POLL).text, stranger.get("/scheduler/polls/no-such-poll").text):
-        assert "owner" not in body.lower()
+    assert stranger.get(WEB_POLL).status_code == 404
+    assert stranger.get("/scheduler/polls/no-such-poll").status_code == 404
     # The owner is unaffected: this is a refusal shape, not a lost page.
     assert owner.get(WEB_POLL).status_code == 200
     assert owner.get(WEB_ICS).status_code == 200
@@ -828,21 +857,39 @@ def _declared_reach(app=None):
     return declared
 
 
+def _poll_routes(declared: dict) -> dict:
+    """The subset of a declared-reach table whose routes name a poll.
+
+    **The filter is the fix, so it is a named thing and it is asked twice** — of the
+    live route table below, and of the synthetic rogue apps in the tests that follow.
+    That is not tidiness: the second review's mutation M7 reverted only this filter
+    back to the literal `"{poll_id}" in path` and left the suite green, because
+    nothing asserted that a `{pid}` route ends up in the audited set at all. A fix
+    with no test that fails without it is not a fix, so the assertions below and in
+    `test_the_audit_catches_a_route_whose_poll_parameter_is_not_spelled_poll_id` both
+    go through here.
+    """
+    return {k: v for k, v in declared.items() if reach.names_poll(k[1])}
+
+
 def test_every_api_route_that_names_a_poll_declares_its_reach():
     """The guard that pays for itself, in #51's shape: the table is read off the
     live app, so a new `/api` poll-id route without `reach=True` fails here.
 
-    "Names a poll" is asked *structurally* — `reach.poll_param` looks for the
-    parameter after the `polls` segment — and not by looking for the literal
-    `{poll_id}`. The first review of this PR matched the literal, and that half of
-    it was the same bug as the guard: a route spelling its parameter `{pid}` was
-    invisible here *and* unguarded at request time, so it was reported clean and
-    shipped the IDOR. One question, asked of both, from one function.
+    "Names a poll" is asked *structurally* (`reach.names_poll`, which is
+    "a `polls`/`poll` segment with something after it") and not by looking for the
+    literal `{poll_id}`. The first review of this PR matched the literal, and that
+    half of it was the same bug as the guard: a route spelling its parameter
+    `{pid}` was invisible here *and* unguarded at request time, so it was reported
+    clean and shipped the IDOR. One question, asked of both, from one function.
     """
     declared = _declared_reach()
-    poll_routes = {k: v for k, v in declared.items() if reach.poll_param(k[1])}
+    poll_routes = _poll_routes(declared)
     assert poll_routes, "the filter stopped finding poll-id routes at all"
-    assert set(poll_routes) == {k for k in declared if reach.poll_param(k[1])}
+    # The two collection routes are the ones the rule must *not* sweep in: they name
+    # no single poll, which is why they answer with the caller's whole reach instead.
+    assert ("GET", "/polls") not in poll_routes
+    assert ("POST", "/polls") not in poll_routes
     missing = sorted(path for (_m, path), reached in poll_routes.items() if not reached)
     assert missing == [], f"/api routes naming a poll with no declared reach: {missing}"
 
@@ -865,12 +912,87 @@ def test_poll_param_is_the_rule_and_the_name_is_only_a_spelling():
     assert reach.poll_param("/api/polls/{id}/invite") == "id"
     assert reach.poll_param("/scheduler/polls/{poll_id}/event.ics") == "poll_id"
     assert reach.poll_param("/api/polls/{poll_id}/responses/{response_id}") == "poll_id"
+    # The singular spelling resolves the same way, so `/poll/{pid}` is not the same
+    # hole with a different letter.
+    assert reach.poll_param("/scheduler/poll/{poll_id}") == "poll_id"
     # No poll after the segment: no guess.
     assert reach.poll_param("/api/polls") is None
     assert reach.poll_param("/api/polls/") is None
     assert reach.poll_param("/api/whoami") is None
     assert reach.poll_param("/api/imip/poll") is None
+    assert reach.poll_param("/api/polls/export") is None  # ids are in the body
     assert reach.poll_param("") is None
+
+
+def test_names_poll_is_wider_than_the_parameter_it_can_resolve():
+    """The question the audits ask, as a table — and it is wider on purpose.
+
+    `poll_param` answers "which parameter holds the id", which is the wrong question
+    for a route that keeps its ids in a body or a query string: the second review
+    demonstrated `POST /api/polls/export` satisfying #51's scope audit *and* the reach
+    audit while returning `{"exported": ["p1","p2","p3"]}` to a key granted `p1`
+    alone. So the audit asks "is this a route about polls", and a route that cannot
+    answer reach's question has to authorize its ids itself.
+    """
+    # A poll route, id in the path — either spelling of the collection.
+    assert reach.names_poll("/api/polls/{poll_id}") is True
+    assert reach.names_poll("/api/polls/{pid}/responses/{rid}") is True
+    assert reach.names_poll(f"{web.P}/polls/{{poll_id}}/edit") is True
+    assert reach.names_poll("/scheduler/poll/{poll_id}") is True
+    # A poll route whose ids are somewhere else: still a poll route.
+    assert reach.names_poll("/api/polls/export") is True
+    assert reach.names_poll("/api/polls/bulk/{x}") is True
+    assert reach.names_poll(f"{web.P}/polls/export") is True
+    # The collection itself, and nothing else.
+    assert reach.names_poll("/api/polls") is False
+    assert reach.names_poll("/api/polls/") is False
+    assert reach.names_poll("/api/whoami") is False
+    assert reach.names_poll("/api/imip/poll") is False  # ends in `poll`, names no poll
+    assert reach.names_poll("/api/polls-archive/{x}") is False
+    assert reach.names_poll("") is False
+
+
+def test_a_bulk_route_that_names_polls_somewhere_else_is_audited_and_cannot_declare_reach(scoped):
+    """The `/polls/export` shape, live on a synthetic app.
+
+    Two things have to hold, and neither held before: the route is in the audited set
+    (so forgetting the guard is CI red), and *declaring* reach on it is refused rather
+    than accepted — because `required_poll_id` cannot see a body, so a declaration
+    would be a lie. Such a route authorizes each id against the caller's grant itself,
+    which is what the audit forces the author to notice.
+    """
+    from fastapi import APIRouter, Depends, FastAPI
+
+    def export(body: dict, user: dict = Depends(scoping.api_scope("polls:read"))):
+        return {"exported": body.get("ids", [])}
+
+    def export_guarded(body: dict, user: dict = Depends(scoping.api_scope("polls:read", reach=True))):
+        return {"exported": body.get("ids", [])}
+
+    unguarded = APIRouter(prefix=API)
+    unguarded.post("/polls/export")(export)
+    app = FastAPI()
+    app.include_router(unguarded)
+    # It leaks: the key is granted p1 and is handed p1, p2, p3.
+    with TestClient(app) as rogue:
+        assert rogue.post(f"{API}/polls/export", json={"ids": ["p1", "p2", "p3"]},
+                          headers={"Authorization": f"Bearer {ONEPOLL}"}).json() == {
+                              "exported": ["p1", "p2", "p3"]}
+    # ...and the audit has it, with no declaration to show for itself.
+    assert set(_poll_routes(_declared_reach(app))) == {("POST", "/polls/export")}
+    assert _declared_reach(app)[("POST", "/polls/export")] is False
+
+    # Declaring reach does not make it guarded; it makes the route refuse.
+    declared_app = FastAPI()
+    declared_app.include_router(APIRouter(prefix=API))
+    guarded = APIRouter(prefix=API)
+    guarded.post("/polls/export")(export_guarded)
+    declared_app.include_router(guarded)
+    with TestClient(declared_app, raise_server_exceptions=False) as rogue:
+        got = rogue.post(f"{API}/polls/export", json={"ids": ["p1"]},
+                         headers={"Authorization": f"Bearer {WIDE}"})
+    assert got.status_code == 500
+    assert "exported" not in got.text
 
 
 def _request_for_route(path_template: str, path_params: dict, key: str | None = None):
@@ -966,18 +1088,20 @@ def test_the_audit_catches_a_route_whose_poll_parameter_is_not_spelled_poll_id(s
     assert refused.status_code == 403
     assert "Alice Victim" not in refused.text
 
-    # The audit now *sees* the route at all — the other half of the same bug. Before
-    # the fix the `{pid}` spelling did not match its `{poll_id}` filter, so the
-    # route was not in the audited set and nothing could complain about it.
-    declared = _declared_reach(guarded)
-    assert declared[("GET", "/polls/{pid}/rogue")] is True
-    assert set(declared) == {k for k in declared if reach.poll_param(k[1])}
+    # The audit now *sees* the route at all — the other half of the same bug, and the
+    # half that was unpinned: before the fix the `{pid}` spelling did not match the
+    # audit's `{poll_id}` filter, so the route was not in the audited set and nothing
+    # could complain about it. Asserted on the *set*, not on one key, so reverting
+    # `_poll_routes` to the literal filter fails here (second review's M7: it left
+    # 844 green) instead of silently auditing an empty set again.
+    assert set(_poll_routes(_declared_reach(guarded))) == {("GET", "/polls/{pid}/rogue")}
 
     # Drop the declaration and the audit has something to complain about, which is
     # the failure mode `test_every_api_route_that_names_a_poll_declares_its_reach`
     # turns into CI red for a real route.
     undeclared = _declared_reach(_rogue_app(declared_reach=False))
     assert undeclared[("GET", "/polls/{pid}/rogue")] is False
+    assert set(_poll_routes(undeclared)) == {("GET", "/polls/{pid}/rogue")}
     assert reach.poll_param("/polls/{pid}/rogue") == "pid"
 
 
@@ -1050,7 +1174,10 @@ def test_every_poll_id_read_route_is_refused_in_practice_not_just_on_paper(scope
 # every mutating route goes through, so a route calling it inherits its
 # authorization the way an owner-POST inherits the CSRF requirement.
 _WEB_MANAGE_CALLS = ("_owner_action(", "require_manage(", "can_manage(")
-_WEB_REACH_CALLS = ("can_reach(", "required_poll_id(")
+# Reach, and only `can_reach`: these are the calls the web surface makes today. A
+# future web route reaching for a different one is meant to fail here and be added,
+# rather than be quietly unaudited by a name that was never in the list.
+_WEB_REACH_CALLS = ("can_reach(",)
 
 # (method, path) -> the authorization the route asks for. Read off the live route
 # table by the test below; this table is the assertion, so a new poll-id web route
@@ -1124,7 +1251,7 @@ def test_every_web_route_that_names_a_poll_authorizes_its_poll():
     by adding a row), and a route that lists an authorization it does not ask for
     is *wrong* in the table.
     """
-    declared = {k: v for k, v in _declared_web_auth().items() if reach.poll_param(k[1])}
+    declared = {k: v for k, v in _declared_web_auth().items() if reach.names_poll(k[1])}
     expected = {k: v[0] for k, v in EXPECTED_WEB_POLL_AUTH.items()}
     assert declared, "the web filter stopped finding poll-id routes at all"
     assert set(declared) == set(expected), (
