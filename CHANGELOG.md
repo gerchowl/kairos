@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.0](https://github.com/gerchowl/kairos/compare/v0.11.0...v0.12.0) (2026-10-04)
+
+
+### Features
+
+* **auth:** KAIROS_AUTH=capability + /manage/&lt;token&gt; magic-link console ([#30](https://github.com/gerchowl/kairos/issues/30)) ([#68](https://github.com/gerchowl/kairos/issues/68)) ([5654d20](https://github.com/gerchowl/kairos/commit/5654d2042e1c1cc20c11275171ac4bd2314befbf))
+* **auth:** per-poll reach on both surfaces — one predicate, two enforcement points ([#63](https://github.com/gerchowl/kairos/issues/63), [#64](https://github.com/gerchowl/kairos/issues/64)) ([#67](https://github.com/gerchowl/kairos/issues/67)) ([cd5de2b](https://github.com/gerchowl/kairos/commit/cd5de2bab6e7b1e1f7f5e690ef43ed4b21ad11b0))
+
+
+### Documentation
+
+* refresh HANDOFF.md after merging [#66](https://github.com/gerchowl/kairos/issues/66)-[#68](https://github.com/gerchowl/kairos/issues/68) ([b57d7ad](https://github.com/gerchowl/kairos/commit/b57d7ad42c856b8f86a1adfaf8fdf3fdb838d33a))
+
 ## [0.11.0](https://github.com/gerchowl/kairos/compare/v0.10.0...v0.11.0) (2026-10-04)
 
 
