@@ -66,6 +66,14 @@
 {% call section_card("Dates") %}
 <p class="text-sm opacity-60">Click to select. Drag for rectangular selection. Click weekday headers or week numbers to toggle columns/rows.</p>
 {% include "_date_picker.html" %}
+{#- #31: the human check on the anonymous creation form, rendered only when the
+     deployment gates it (`turnstile` is {} otherwise, and the template is shared
+     with every other mode — so header/demo/oidc render not one byte of this).
+     Beside the submit button rather than above the form, because that is where
+     the person is when they hit it. -#}
+{% if turnstile %}
+{% include "_turnstile.html" %}
+{% endif %}
 <div class="card-actions">
 <button type="submit" class="btn btn-primary">Create Poll</button>
 </div>

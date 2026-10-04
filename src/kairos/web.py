@@ -3,8 +3,9 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
 
-from kairos import capability, settings
+from kairos import capability, settings, turnstile
 from kairos.auth import can_manage, get_base_url, get_user, require_manage
+from kairos.capability import require_sendable
 from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
     add_slots,
@@ -480,7 +481,7 @@ def create_poll_submit(request: Request, form=Depends(form_data),
             return _login_or_401(f"{P}/new")
         require_csrf(user, form)
 
-    def _fail(detail, heading="New Poll"):
+    def _fail(detail, heading="New Poll", status_code=400):
         """A form refusal, in whichever shape this mode has a user for.
 
         `_error_page` builds the notification navbar from an owner uid, which an
@@ -489,9 +490,34 @@ def create_poll_submit(request: Request, form=Depends(form_data),
         `_error_page`'s (heading, detail) so the four call sites read the same as
         the ones they replaced, and the page title stays "New Poll" rather than
         becoming the sentence.
+
+        `status_code` exists for #31: a human check whose verifier is *unreachable*
+        is a 503, and telling a creator it was their fault would be a lie they would
+        then retry against. Both accounts of the same refusal go through here, so the
+        two branches cannot drift on anything but the status.
         """
-        return (capability.anon_error(heading, detail, back=f"{P}/new") if accountless
+        return (capability.anon_error(heading, detail, back=f"{P}/new",
+                                      status_code=status_code) if accountless
                 else _error_page(user, heading, detail, f"{P}/new"))
+
+    # ---- issue #31: the human check, on the accountless branch only. It sits
+    # here, between the CSRF token and everything expensive, and the position is
+    # the whole reason it is not middleware: after `require_anon_csrf` because that
+    # is local and a drive-by should not cost an outbound request, and before
+    # `_expand_time_slots` because a gate that runs after the grid is built cannot
+    # bound what building it cost (the same lesson the slot cap above records,
+    # pinned by a test with `tracemalloc`). Nothing is written and no SMTP
+    # connection is opened before it answers.
+    #
+    # `capability` is the module that owns the mode, and `turnstile.verify` is
+    # self-gating: it returns "not required" in every mode and deployment that has
+    # not asked for the check, which is what keeps this line inert for header, oidc
+    # and demo rather than a second thing to remember.
+    if accountless:
+        verdict = turnstile.verify(request, form, action=turnstile.ACTION_NEW_POLL)
+        if not verdict.ok:
+            return _fail(verdict.detail, heading=verdict.heading,
+                         status_code=verdict.status_code)
 
     title = form.get("title", "").strip()
     description = form.get("description", "").strip() or None
@@ -790,7 +816,16 @@ def nudge_participants(request: Request, poll: dict, user: dict,  # noqa: C901 â
     `nudge` and `add_slots(notify=True)` and the UI's `remind` / `remind-selected`
     all draw on one per-poll allowance -- which is how ADR-0012's parity
     invariant holds: one ceiling, not two kept in step by review.
+
+    Obligation A2 (#31): `require_sendable` is the first statement, before the
+    per-poll budget is charged and before any address is read. One call here
+    covers every reminder path on every surface -- this module's `remind` and
+    `remind-selected`, the API's `nudge` and `add_slots(notify=True)`, and the
+    accountless console's `remind` -- which is the reason the gate lives at the
+    chokepoint rather than in each of them. Inert outside `KAIROS_AUTH=capability`
+    and byte-for-byte identical there (see `capability.send_allowed`).
     """
+    require_sendable(poll)
     base = get_base_url(request)
     sender, reply = user.get("name", "Someone"), user.get("email")
     now = db_now()
@@ -924,6 +959,7 @@ def poll_ics(poll_id: str, request: Request):
 def email_decision(poll_id: str, request: Request, form=Depends(form_data),
                    _=Depends(rate_limit("send"))):
     user, poll = _owner_action(request, form, poll_id)
+    require_sendable(poll)  # A2 (#31), ahead of the recipients read and the budget
     slot = decided_slot_of(poll)
     if not slot:
         raise HTTPException(400, "Poll has no decided date yet")

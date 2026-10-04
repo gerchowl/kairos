@@ -1,0 +1,36 @@
+{#- Cloudflare Turnstile, click-to-load (issue #31, obligation A1).
+
+    Nothing in this file reaches the network until the button is pressed. There is
+    no `<script src="https://challenges.cloudflare.com/...">` at page render, so
+    opening /new or /manage fetches nothing from a third party, runs no third-party
+    code and sets no third-party cookie — which is precisely what keeps obligation
+    P1 ("strictly-necessary cookies only, no consent banner") true in the
+    configuration that actually ships. ADR-0012 names this mechanism for the same
+    reason.
+
+    There is no flag to load it eagerly, deliberately: the other state is one where
+    our own /privacy page is false, and a flag that selects between "true" and
+    "false" is a flag that will be flipped.
+
+    Include it with `{% if turnstile %}`, where `turnstile` is the dict
+    `kairos.turnstile.widget_ctx()` returns — `{}` when the gate is off, which is
+    every mode and deployment that has not asked for the check. So a template that
+    does not opt in renders not one byte of this. -#}
+<div class="turnstile mt-4"
+     data-turnstile
+     data-sitekey="{{ turnstile.sitekey }}"
+     data-action="{{ turnstile.action }}"
+     data-field="{{ turnstile.field }}"
+     data-script="{{ turnstile.script_url }}">
+  {#- `defer` so this is the third-party request the page makes, never the one that
+      renders it, and so a slow Cloudflare cannot delay first paint. -#}
+  <script src="{{ P }}/static/turnstile.js?v={{ static_v }}" defer></script>
+  <button type="button" class="btn btn-primary" data-turnstile-start>I'm human</button>
+  <div data-turnstile-mount hidden></div>
+  <input type="hidden" name="{{ turnstile.field }}" value="" data-turnstile-token>
+  <p class="text-sm opacity-70 mt-2 turnstile-note">One quick check that you are a person, so nobody can turn this
+  deployment into a machine that mails strangers. Nothing is sent to Cloudflare until you press the
+  button.</p>
+  <noscript><p class="text-sm text-warning mt-2">This form needs JavaScript: the human check only
+  runs in your browser, and without it Kairos cannot tell a person from a script.</p></noscript>
+</div>

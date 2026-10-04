@@ -33,6 +33,7 @@
 <form method="post" action="{{ P }}/manage/link" class="flex flex-wrap items-end gap-2">
 <input type="hidden" name="csrf" value="{{ link_csrf }}">
 {{ text_field('email', 'Email address', type='email', required=True, input_class='w-72') }}
+{% if turnstile %}{% include "_turnstile.html" %}{% endif %}
 <button type="submit" class="btn btn-primary">Email me a link</button>
 </form>
 {% else %}
@@ -143,6 +144,7 @@
 <form method="post" action="{{ P }}/manage/link" class="flex flex-wrap items-end gap-2">
 <input type="hidden" name="csrf" value="{{ link_csrf }}">
 {{ text_field('email', 'Email address', type='email', value=poll.creator_email or '', required=True, input_class='w-72') }}
+{% if turnstile %}{% include "_turnstile.html" %}{% endif %}
 <button type="submit" class="btn btn-sm">Email me a link</button>
 </form>
 {% else %}<p class="text-sm text-error">{{ mail_note }}</p>{% endif %}

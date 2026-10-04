@@ -22,6 +22,8 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Container / self-host deployment (OCI image + compose, obligation D3/D4) | `Dockerfile`, `compose*.yaml`, `deploy/Caddyfile*`, `docs/design/self-host-hardening.md` | ADR-0008 |
 | First-party OIDC owner login (`KAIROS_AUTH=oidc` + subject allowlist) | `oidc.py`, `auth.py`, `compose.oidc.yaml`, `docs/design/oidc-login.md` | ADR-0013 |
 | Accountless management by emailed capability link (`KAIROS_AUTH=capability` + `/manage/<token>`) | `capability.py`, `email_service.py`, `db.py` | ADR-0001, ADR-0009 |
+| Cloudflare Turnstile on the anonymous creation + re-link paths (obligation A1) | `turnstile.py`, `capability.py`, `web.py`, `main.py` | ADR-0012 |
+| Verified-creator-before-third-party-mail send-gate (`manage_verified_at`, obligation A2) | `capability.py`, `web.py`, `api.py` | ADR-0009, ADR-0012 |
 | Optional accounts / multi-tenancy (planned) | — | ADR-0009 |
 | Agent surfaces: REST API, `/llms.txt`, OpenAPI, MCP, `agent.json` | `api.py`, `main.py`, `public.py`, `mcp/` | ADR-0010 |
 | Brand & hosting home (nerdmachines house brand, `kairos.nerdmachines.com`) | `docs/design/productization-obligations.md` | ADR-0011 |

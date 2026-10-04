@@ -9,7 +9,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from kairos import settings
+from kairos import settings, turnstile
 from kairos.db import get_connection, init_schema
 
 P = settings.PREFIX
@@ -83,44 +83,46 @@ def create_app() -> FastAPI:
     # sent as, and whether the gate is in force. SPF/DKIM/DMARC are DNS records the
     # app cannot read, so this line is the only place the deployment's mail identity
     # is stated — a misconfiguration that silently sends is far more expensive than
-    # a log line. Logged here rather than in cli.main because the ETH/duplet adapter
-    # calls create_app() itself and never goes through the console script.
+    # a log line.
     from kairos.email_service import mail_identity_report
 
-    logging.getLogger("kairos.mail").info("%s", mail_identity_report())
+    # **Every boot statement is this one shape**, because they are all the same
+    # question asked of a different control: *which control decided X, and is it
+    # the one you think it is?* An operator cannot infer any of it from a working
+    # page, and a state where a control is believed in force but is not — an
+    # unrecognised `KAIROS_HOSTED`, an unusable OIDC allowlist, `open` reach with
+    # scoped keys configured, a capability deployment with no limiter, a hosted
+    # deployment whose human check is off — is worth more as a WARNING than as a
+    # sentence in a green log.
+    #
+    # Logged here rather than in `cli.main` because the ETH/duplet adapter calls
+    # `create_app()` itself and never goes through the console script, and
+    # unconditionally, so a self-hoster reads "not in use" rather than silence.
+    def announce(module: str, report: str, warnings) -> None:
+        logger = logging.getLogger(f"kairos.{module}")
+        logger.info("%s", report)
+        for warning in warnings:
+            logger.warning("%s", warning)
 
-    # Issue #53: the same statement for the *inbound* identity boundary. Which
-    # control decided "who is the owner" is the one fact an operator cannot
-    # infer from a working page, so say it at every boot — and say it
-    # unconditionally, so "owner auth: header" is what a self-hoster reads on a
-    # deployment that never asked for OIDC.
-    oidc_log = logging.getLogger("kairos.oidc")
-    oidc_log.info("%s", identity_report())
-    for warning in boot_warnings():
-        oidc_log.warning("%s", warning)
-    # Issue #51: the API surface's authorisation and budgets, stated once at boot
-    # the same way — a scoped keyring an operator believes is in force but is not
-    # is the failure this line exists to make visible. Also *validates* it, so a
-    # typo'd keyring or scope name refuses the boot here instead of silently
-    # leaving every key at full capability.
-    scoping_log = logging.getLogger("kairos.scoping")
-    scoping_log.info("%s", scoping.boot_report())
-    # Issues #63/#64: the same convention as `oidc.boot_warnings` above, at the
-    # level a warning deserves — reach decides who may read which poll, so the
-    # states where it is not the rule the operator believes (an unrecognised
-    # KAIROS_HOSTED, `open` with scoped keys configured, `scoped` in header mode
-    # with no trusted-proxy CIDRs) are warnings, not a line of prose in a green log.
-    for warning in scoping.boot_warnings():
-        scoping_log.warning("%s", warning)
-# ---- issue #30: the same statement for the accountless mode. Which control
-    # decided "who may manage a poll" is the fact an operator cannot infer from a
-    # working page, and in capability mode the answer is a link in an inbox rather
-    # than a proxy — so say it, and say it unconditionally, so a self-hoster on a
-    # deployment that never asked for it still reads "not in use".
-    cap_log = logging.getLogger("kairos.capability")
-    cap_log.info("%s", capability.identity_report())
-    for warning in capability.boot_warnings():
-        cap_log.warning("%s", warning)
+    # Obligation M1 (#48): the outbound-mail identity — SPF/DKIM/DMARC are DNS
+    # records the app cannot read, so this line is the only place the deployment's
+    # mail identity is stated, and a silently-sending misconfiguration is far more
+    # expensive than a log line.
+    announce("mail", mail_identity_report(), ())
+    # Issue #53: the *inbound* identity boundary — which control decided "who is the
+    # owner".
+    announce("oidc", identity_report(), boot_warnings())
+    # Issue #51: the API surface's authorisation and budgets. Also *validates* the
+    # keyring, so a typo'd keyring or scope name refuses the boot here instead of
+    # silently leaving every key at full capability.
+    announce("scoping", scoping.boot_report(), scoping.boot_warnings())
+    # Issue #30: which control decided "who may manage a poll" — in capability mode
+    # the answer is a link in an inbox rather than a proxy.
+    announce("capability", capability.identity_report(), capability.boot_warnings())
+    # Issue #31: whether anonymous poll creation needs a human check. Its own entry
+    # because its own control, and because it is the one a hosted deployment is
+    # judged on.
+    announce("turnstile", turnstile.identity_report(), turnstile.boot_warnings())
 
     @app.middleware("http")
     async def trusted_proxy_only(request, call_next):
@@ -250,7 +252,14 @@ never reads your calendar — you (or your agent) tell it what works.
 
         @app.get(f"{P}/privacy", include_in_schema=False)
         def privacy():
-            return render(legal_env, "legal_privacy.html", title="Privacy", **legal_ctx)
+            # #31: the Turnstile paragraph is rendered from `turnstile.disclosure()`
+            # at request time, not from a flag captured at boot — the same reason the
+            # legal context is built here rather than in `settings`. An operator who
+            # flips `KAIROS_TURNSTILE` and restarts gets a page that matches what the
+            # deployment actually does, and one that does not is the failure P4 exists
+            # to prevent: a disclosure that is present but stale is not a disclosure.
+            return render(legal_env, "legal_privacy.html", title="Privacy",
+                          turnstile=turnstile.disclosure(), **legal_ctx)
 
     @app.get(f"{P}/health", include_in_schema=False)
     def health():

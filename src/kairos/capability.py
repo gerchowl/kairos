@@ -108,12 +108,15 @@ unrelated website cannot make a visitor's browser have this deployment send mail
     what keeps #63/#64 (per-poll authorization on the owner and API surfaces) from
     having to know this mode exists.
 
-**#31 owns the send-gate.** `mark_manage_verified` writes `manage_verified_at` on
-the first successful exchange — #29 handed that write to this issue, and the
-column is otherwise dead. Nothing here *refuses* a send because of it; that gate
-(obligation A2) is #31's, and #31's Turnstile check belongs on the same creation
-path, which is why the accountless branch in `web.create_poll_submit` is
-deliberately a small, obvious block for it to add one line to.
+**#31 built on this, and what it added.** `mark_manage_verified` writes
+`manage_verified_at` on the first successful exchange — #29 handed that write to
+that issue, and the column was otherwise dead. `require_sendable` below now reads
+it (obligation A2) and every outbound path consults that one predicate; and
+`POST /new` and `POST /manage/link` now run Cloudflare Turnstile server-side
+(obligation A1, `kairos.turnstile`). Neither the send-gate nor the human check
+touches the two routes that mail *the creator's own address* — creation and
+`POST /manage/link` — because those are how a creator becomes verifiable in the
+first place, and gating them would close the hole by deleting the feature.
 
 Env-only (ADR-0003) and parsed here rather than in `settings.py`, the way
 `oidc.py` keeps the whole OIDC mode in one file: a stray `KAIROS_CAPABILITY_*` in
@@ -127,6 +130,7 @@ refuses to boot and lands nowhere else.
 import logging
 import os
 import secrets
+import threading
 import time
 from itertools import islice
 
@@ -159,6 +163,9 @@ from kairos.oidc import _is_https
 from kairos.ratelimit import RateLimited, caller_key, limiter, rate_limit
 from kairos.scoping import charge_poll_recipients
 from kairos.templating import render
+from kairos.turnstile import ACTION_MANAGE_LINK, ACTION_NEW_POLL, widget_ctx
+from kairos.turnstile import required as turnstile_required
+from kairos.turnstile import verify as verify_human
 
 log = logging.getLogger("kairos.capability")
 
@@ -197,6 +204,13 @@ ANON_FORM_UID = "anon:new-poll"
 # not pretend to be more: the uid is a constant, so a direct attacker scrapes it
 # off `/manage` in one request, exactly as they scrape the creation token off
 # `/new`. What it removes is the drive-by primitive, which is what CSRF is for.
+#
+# **What it does NOT remove, and why this route still needed an owner (#31).** A
+# direct attacker scrapes that token in one request, so CSRF is a one-request
+# speed bump against a nuisance-mail cannon: with `KAIROS_RATE_LIMIT` off, posting
+# a victim's address here makes this deployment mail them manage links from the
+# operator's own domain, repeatedly, for free. Cloudflare Turnstile is what closes
+# it — see `request_link` and `KAIROS_TURNSTILE`.
 LINK_FORM_UID = "anon:manage-link"
 
 # `sched_polls.creator_id` is NOT NULL and an accountless poll has no creator to
@@ -237,6 +251,125 @@ MAX_LINKS_PER_REQUEST = 10
 # than by the attacker, and `KAIROS_RATE_LIMIT=on` — which boot already insists on
 # for this mode — puts a ceiling on it.
 LINK_REQUEST_FLOOR_SECONDS = 0.3
+
+# How long one address is left alone after asking for a link — the per-address
+# cooldown #31's review asked for, and the control that covers the exemption below.
+#
+# **The measurement that produced it.** A *verified* creator never reaches the
+# Turnstile gate (`session_verifies_creator`), so with shipped defaults — and
+# `KAIROS_RATE_LIMIT` defaults off — nothing bounded repetition on this route:
+#
+#     attacker is a verified creator; manage_verified_at = set
+#       1 POST /manage/link -> siteverify solves=0  nuisance mails to the victim=10
+#       5 POST /manage/link -> siteverify solves=0  nuisance mails to the victim=50
+#      20 POST /manage/link -> siteverify solves=0  nuisance mails to the victim=200
+#
+# Zero solves, because the gate that would have charged one per request is exactly
+# the gate a verified creator skips. The `10` is `MAX_LINKS_PER_REQUEST` — one post
+# fans out to ten polls on the address, so the multiplier is *ten nuisance mails per
+# request*, not one. And the ten polls can be planted for a victim address through
+# `POST /api/polls` with no human check at all, by design (agent-first, ADR-0010), so
+# the real cost to an attacker is one solve per ten mails at one inbox. **So the
+# residual after this cooldown is a 10x fan-out, once per hour per victim address** —
+# stated here, and in `docs/design/multitenancy-hosting.md` where the rest of the
+# residual risk is recorded, because a multiplier that lives only in a code comment
+# is a multiplier nobody plans around.
+#
+# **Why an hour.** Long enough that a creator who lost a link has their inbox back
+# before the page tells them to wait, and short enough that it is not a quota: the
+# legitimate pattern is one lost link, not ten requests in a minute.
+#
+# **Why it is keyed on the *target address*, not the caller.** The threat is one
+# attacker aiming many requests at one victim, so a caller-keyed budget is exactly
+# the wrong axis — it would bound the attacker's own throughput without bounding
+# anything the victim receives. Keying on the victim is what turns "unbounded" into
+# "10 an hour". A per-caller budget is still the right thing and is still
+# `KAIROS_RATE_LIMIT`'s `send` rule; this is the axis that rule does not cover.
+LINK_REQUEST_COOLDOWN_SECONDS = 3600
+
+# Cap on distinct addresses held in the cooldown map, for the reason
+# `ratelimit.MAX_BUCKETS` exists: the keyspace is attacker-chosen, so an unbounded
+# dict is a memory target. Eviction is oldest-first, which is the right victim — the
+# entries nearest expiry are the ones whose loss costs nothing.
+LINK_COOLDOWN_BUCKETS = 50_000
+
+# In-process on purpose, and for the same stated reason as `ratelimit`: SQLite is
+# one writer (#36) and a row written per re-link request would contend with poll
+# writes for the thing that is already the bottleneck. The honest costs, which are
+# `ratelimit`'s costs and are restated rather than inherited silently:
+#
+#   * **per-process**, so N app instances give an attacker N x the budget;
+#   * **lost on restart**, so a redeploy resets every victim's window;
+#   * **not shared** across instances, so the same address can be asked once per
+#     instance per hour rather than once per hour.
+#
+# #36's revisit trigger ("more than one app instance") is the trigger for moving
+# this next to the limiter's counter store. The seam is these three functions.
+_link_cooldowns: dict[str, float] = {}
+_link_cooldown_lock = threading.Lock()
+
+
+def link_cooldown_left(email: str) -> int:
+    """Seconds left on `email`'s re-link cooldown; 0 when it may send now.
+
+    The key is the *normalised* address (`valid_email`) — deliberately the same string
+    `list_polls_by_creator_email` matches on, and the same one `db.create_poll` stores,
+    because that identity is the property that matters: **a cooldown can never be
+    evaded for any set of rows the lookup would return.** A key derived any other way
+    would leave a spelling that reaches a victim's polls without reaching their
+    cooldown.
+
+    What normalisation does *not* fold is stated rather than glossed, because "one
+    cooldown per mailbox" is a claim this layer cannot make:
+
+      * the **local part's case** survives (`Victim@example.org` is a distinct key), and
+      * **plus-addressing** survives (`victim+1@example.org` is a distinct key).
+
+    Neither is a bypass here, and the reason is worth being explicit about: those
+    spellings are also distinct keys at the *lookup*, so they match no polls and mail
+    nothing at all. The residual is the reverse of an attack — a creator who has two
+    poll sets under two spellings waits one window per spelling. Closing the gap would
+    mean a confirmation step on the mailbox, which is #68's to own.
+    """
+    now = time.monotonic()
+    with _link_cooldown_lock:
+        until = _link_cooldowns.get(email)
+        if until is None:
+            return 0
+        remaining = until - now
+        if remaining <= 0:
+            del _link_cooldowns[email]
+            return 0
+        return int(remaining)
+
+
+def record_link_request(email: str) -> None:
+    """Note that `email` was asked for, starting its cooldown. **Hit or miss.**
+
+    Recording unconditionally is the whole trick, and it is what keeps this from
+    becoming an address oracle — the property #30 built this route's answer around.
+
+    If the cooldown were recorded only when a link actually went out, then asking
+    twice would distinguish the two cases exactly: "a link was already sent" for an
+    address with polls, and the ordinary page for one without, which is a membership
+    test for "does this person poll here". Recorded on *every* named request, the
+    second ask gets the same cooldown answer whether or not anything matched, so the
+    anti-enumeration property survives the control that was added to protect it.
+
+    The cost is that the cooldown message cannot claim a link was sent, because for a
+    miss none was. So it says what is true in both cases — *we already handled a
+    request for this address* — and tells the reader to check their inbox. A message
+    that said "already sent" would be false to a creator who mistyped their address,
+    and this page is the wrong place for that.
+    """
+    now = time.monotonic()
+    with _link_cooldown_lock:
+        if len(_link_cooldowns) >= LINK_COOLDOWN_BUCKETS:
+            for key, until in sorted(_link_cooldowns.items(), key=lambda kv: kv[1])[
+                    :len(_link_cooldowns) // 2]:
+                if until > now:
+                    del _link_cooldowns[key]
+        _link_cooldowns[email] = now + LINK_REQUEST_COOLDOWN_SECONDS
 
 # Slots one anonymous accountless creation may insert. Sized above any real
 # meeting (a full week of 15-minute slots over a 12-hour day is ~576) and below
@@ -425,6 +558,127 @@ def creator_actor(poll: dict) -> dict:
     return {"name": "The organizer", "email": poll.get("creator_email"), "source": "capability"}
 
 
+# -- The send-gate (obligation A2) ------------------------------------------
+
+# What a refusal says, to whoever is refused. One sentence pair, not one per
+# surface: a gate whose message is written twice is a gate whose two messages drift,
+# and the API caller is the audience that matters most here because they are the one
+# who can act on it.
+#
+# It names the fix rather than the rule. An agent holding a `mail:send` key is being
+# told the *poll* is not allowed to mail yet, not that its scope is wrong, and the
+# thing it can do about that is ask a human to open a link — so that is what it says.
+# No address and no poll title: this refusal lands in a log nobody here controls.
+SEND_GATE_DETAIL = (
+    "This poll may not send mail yet: nobody has opened the manage link for the "
+    "address that created it, so Kairos will not mail anyone else on its behalf. "
+    "Ask that creator to open the link Kairos mailed them — or to request a new one "
+    f"at {P}/manage — and try again. This is what stops a deployment being used to "
+    "send mail to a stranger."
+)
+
+
+def send_allowed(poll: dict) -> tuple[bool, str]:
+    """May this deployment send mail to anyone but `poll`'s own creator?
+
+    `(True, "")` or `(False, <reason>)`. The reason is for the log line; callers
+    show `SEND_GATE_DETAIL`, which is written for the person who has to fix it.
+
+    **The rule is one column, read strictly.** `manage_verified_at` is stamped by
+    `mark_manage_verified` on the first successful exchange of the manage link, and
+    it is never cleared. It is NULL on:
+
+      * **every poll that predates #30**, and
+      * **every poll created through the REST API**, which is the live hole: an
+        agent can create a poll, name any recipients and ask for the mail, with no
+        browser and no inbox anywhere in the loop.
+
+    NULL therefore means *not verified*, and a poll that cannot be verified cannot
+    send. That is the whole gate, and it ships closed by construction: the column
+    was added by #29 with no backfill, so there is no window in which a
+    pre-existing row reads as verified.
+
+    **Absent is NULL.** The row is read with `.get()`, so a poll dict that predates
+    the column — or a stub in a test — is refused, never allowed. A gate whose
+    missing input reads as "allowed" is the exact defect #29's `can_manage`
+    docstring warns about for the sibling predicate, and it is why this one is
+    `.get(...) is not None` rather than a truthiness check that a future rename
+    could invert.
+
+    **Only in this mode.** Outside `KAIROS_AUTH=capability` the answer is always
+    yes, and that is the compatibility argument rather than a gap: the creator
+    there is identified by the proxy or the IdP (ADR-0002/0013), so there is no
+    address to verify and the column is dead — while the ETH and self-host
+    deployments must keep behaving byte-for-byte (ADR-0001/0002). Gating them on a
+    column nothing can ever set would have been a silent, total outage of their
+    mail.
+
+    **`POST /manage/link` and the creation mail are not gated**, deliberately: they
+    mail the *creator's own* address, they are how a creator becomes verified in
+    the first place, and gating them would make the gate unreachable. A2 is about
+    mail to *third parties*, so a gate that blocked the verification mail would
+    close the hole by removing the feature.
+    """
+    if not enabled():
+        return True, ""
+    if poll.get("manage_verified_at") is not None:
+        return True, ""
+    return False, "manage_verified_at is NULL"
+
+
+def require_sendable(poll: dict) -> dict:
+    """`poll` if it may send mail to a third party, else 403.
+
+    The one predicate every outbound path consults, the way `auth.require_manage`
+    is the one predicate every mutating route consults (obligation S6). It returns
+    the poll so a call site reads `poll = require_sendable(poll)`.
+
+    **403, and it is the same shape on every surface**, because it is one function
+    rather than a per-surface rendering. On the API it is the useful answer: a key
+    holding `mail:send` is being told the *poll* is not yet allowed to mail, not
+    that its scope is wrong, and `SEND_GATE_DETAIL` names the fix. On the web owner
+    console it would be a bare JSON detail — that path is unreachable in this mode
+    (`get_user` returns None, so the route answers 401 first), and it is called
+    there anyway as defence in depth: a console session *cannot* exist unverified,
+    because the only way to hold one is the exchange that stamps the column.
+
+    **The check runs before the work, not after it.** Every call site is ahead of
+    the slot expansion, the row write or the SMTP connection, and a test asserts the
+    position rather than the outcome: a gate that ran after `charge_poll_recipients`
+    would spend the poll's whole mail allowance on a request it is about to refuse.
+    """
+    allowed, reason = send_allowed(poll)
+    if not allowed:
+        # Poll id, never an address: the refusal is about a poll the caller
+        # cannot see, and creator addresses do not go in this deployment's logs.
+        log.warning("send refused for poll %s: %s", poll.get("id"), reason)
+        raise HTTPException(403, SEND_GATE_DETAIL)
+    return poll
+
+
+def session_verifies_creator(request: Request) -> bool:
+    """Does this request hold a live capability for a poll whose creator is verified?
+
+    Read from the capability cookie rather than from the form, because possession
+    of the link is the whole credential model (#30) and there is nothing else to
+    ask. `can_manage` is consulted, not just a cookie parse, so a retired or
+    rotated capability does not buy an exemption — the same predicate
+    `console_route` uses, for the same reason.
+
+    True only for a poll that is *itself* verified: the answer to "may this person
+    make this deployment send mail to somebody?" is a property of the poll, not of
+    the browser. A creator who has lost their link and re-opened it in a new
+    browser therefore has to solve the check again, which is the point.
+    """
+    session = read_session(request)
+    if not session:
+        return False
+    poll = get_poll(session["pid"])
+    if not poll or not can_manage(poll, request, token=session["at"]):
+        return False
+    return send_allowed(poll)[0]
+
+
 # -- The capability cookie --------------------------------------------------
 
 
@@ -496,13 +750,51 @@ def _hold_for(floor_seconds: float, started: float) -> None:
 # -- Pages ------------------------------------------------------------------
 
 
+LINK_COOLDOWN_HEADING = "Already asked in the last hour"
+
+LINK_COOLDOWN_DETAIL = (
+    "You already asked for a link for this address in the last hour, so nothing was sent this "
+    "time. If that address created a poll here, the link from that earlier request is on its way "
+    "— it works once, so open it and keep it. You can ask again once an hour has passed. Asking "
+    "again sooner cannot make it arrive sooner."
+)
+
+
+def _link_cooldown_page(request: Request):
+    """The visible answer to a second request inside `LINK_REQUEST_COOLDOWN_SECONDS`.
+
+    **This is the fix #31's review asked for, and its whole point is that it is not
+    silent.** A per-address cooldown was rejected in the first review round because it
+    fails *quietly*: a creator who asks twice is mailed nothing and told nothing, which on
+    a recovery path is indistinguishable from a broken deployment. So the second ask gets
+    its own heading and its own sentence, saying what happened and what to do.
+
+    Three properties, each of which is a test:
+
+      * **It is not an address oracle.** The answer is the same whether or not the address
+        matched, because `record_link_request` notes every named request
+        (`LINK_REQUEST_COOLDOWN_SECONDS` explains why that matters more than the phrasing
+        does). Two asks still cannot tell you who polls here.
+      * **It is not an error.** 200, not 429 or 400: asking twice is a thing people do, and
+        a red page for it would read as a fault rather than as an answer.
+      * **It is true for a miss too.** It says a request was handled, not that a link was
+        sent — `record_link_request`'s docstring is the reason, and the difference is the
+        difference between a cooldown and a false statement to a creator who mistyped.
+
+    It is held to `LINK_REQUEST_FLOOR_SECONDS` like every other answer on this route, so
+    taking this branch is not itself a timing oracle: the fast path here is fast for a hit
+    and for a miss alike.
+    """
+    return _link_page(request, LINK_COOLDOWN_HEADING, LINK_COOLDOWN_DETAIL)
+
+
 def _mail_note() -> str:
     """Why outbound mail is unusable here, in the operator's terms.
 
      `sender_refusal()` rather than a generic "mail is off", because the two
      problems have different fixes (#48's M1 identity gate versus a missing SMTP
-    _HOST) and an operator sent to the wrong knob wastes an afternoon.
-    """
+     _HOST) and an operator sent to the wrong knob wastes an afternoon.
+     """
     if is_configured():
         return ""
     refusal = sender_refusal()
@@ -533,6 +825,9 @@ def _link_page(request: Request, heading: str, detail: str, status_code: int = 2
         # Its own binding, not the console's: there is no session on this page, and
         # the link-request form below is the one POST here (see LINK_FORM_UID).
         link_csrf=make_csrf(LINK_FORM_UID),
+        # #31: the human check that form posts. `{}` when the gate is off, which is
+        # every mode but this one and every deployment that has not asked for it.
+        turnstile=widget_ctx(ACTION_MANAGE_LINK),
         msg=msg,
     )
 
@@ -594,6 +889,13 @@ def console(poll: dict, request: Request, *, msg: str | None = None):
         # where a creator who has already spent their link is most likely to look.
         mail_ok=is_configured(),
         mail_note=_mail_note(),
+        # The same gate as the signed-out page's form, because it posts to the same
+        # route -- but waived for a console holder, who has already opened a manage
+        # link and so is exempt (`session_verifies_creator`). Rendered from the same
+        # question the route asks, so the widget is never a click that decides
+        # nothing: a control the server ignores would spend a third-party request
+        # and teach the creator that the button is decoration.
+        turnstile={} if send_allowed(poll)[0] else widget_ctx(ACTION_MANAGE_LINK),
         msg=msg,
         session_hours=SESSION_HOURS,
         noindex=True,
@@ -689,6 +991,56 @@ def request_link(request: Request, form=Depends(form_data)):
     make the operator's `send` limit ten times weaker on exactly this route. The
     route-level dependency charges the request; `charge_link_fanout` charges what
     the request goes on to send.
+
+    **The human check is here too (#31), which is where #68 said the abuse owner
+    was missing.** With shipped defaults a third party could post a victim's
+    address — the CSRF token in `LINK_FORM_UID` is on every `/manage` page and
+    scrapable in one request, and `KAIROS_RATE_LIMIT` defaults off — and have this
+    deployment mail that victim up to `MAX_LINKS_PER_REQUEST` manage links per post,
+    from the operator's own sender and domain, forever. It cannot *take* a poll
+    (the link goes to the address that owns it) and it learns nothing (the answer
+    is identical either way), so what it buys an attacker is a nuisance: our
+    reputation, the victim's inbox, and a spam-complaint rate, which A3's own note
+    calls the thing that actually destroys a domain.
+
+    Turnstile is the answer for the same reason it is the answer on `/new`: the
+    per-IP budget was measured at a 1.11x effect elsewhere in this repo, and
+    evasion by address rotation is not the problem here anyway — the axis that
+    matters is one attacker aiming many requests at *one* victim, which is what
+    `LINK_REQUEST_COOLDOWN_SECONDS` is keyed on.
+
+    **And the cooldown that was rejected is now here, because the objection to it was
+    right and the conclusion was not.** A per-address cooldown does stop the fan-out,
+    and it was rejected for failing *silently*: a creator who asks twice was mailed
+    nothing and told nothing, which on a recovery path is indistinguishable from a
+    broken deployment. So it ships **answering** — a distinct heading and a sentence
+    saying a request for that address was already handled in the last hour and to
+    check the inbox (`_link_cooldown_page`). It is recorded on every named request so
+    the cooldown answer is identical whether or not anything matched, which keeps this
+    route's anti-enumeration property intact; and it sits *after* the human check, so a
+    refused request cannot lock a real creator out of their own recovery path.
+
+    **The exemption below is the reason it exists.** A verified creator never reaches
+    the gate, so nothing bounded repetition here: measured, 1/5/20 posts from a verified
+    creator produced 10/50/200 nuisance mails at one victim inbox with zero siteverify
+    solves. The cooldown applies to everyone, checked after the exemption.
+
+    The price, stated because it is real: the recovery path now depends on a third
+    party being reachable. That is the same trade the creation path makes, it is
+    bounded by one `KAIROS_TURNSTILE=off`, and the alternative — leaving the only
+    ungated mail-triggering POST in the feature unwatched — is the thing #68 asked
+    #31 to fix.
+
+    **Verified creators skip the check** (`session_verifies_creator`). They are
+    already proof-of-human for this deployment, and asking again is friction with
+    no security gain. Note what that does *not* allow: the exemption is read off a
+    live capability, and one cannot be obtained without having received a manage
+    mail — so an attacker's first request still faces the check. What it *does* allow
+    is a verified creator posting a victim's address, and that is precisely what the
+    cooldown above bounds: it applies *after* this exemption, so the answer is
+    `LINK_REQUEST_COOLDOWN_SECONDS` of `MAX_LINKS_PER_REQUEST` nuisance mails per
+    victim address per hour, rather than one per request — the price of not making a
+    creator re-prove themselves to recover a link they legitimately lost.
     """
     _require_enabled()
     if not is_configured():
@@ -697,9 +1049,38 @@ def request_link(request: Request, form=Depends(form_data)):
     # mail from the operator's domain, and a form on a public page is exactly what
     # another site can submit on a visitor's behalf. See LINK_FORM_UID.
     require_anon_csrf(form, LINK_FORM_UID)
+    # ...and then the human check, which is a *replacement* for the per-request
+    # budget here rather than a companion to it. Order matters: CSRF first because
+    # it is local and a drive-by should not cost an outbound request, then the
+    # check, then the SMTP fan-out. Nothing is written and no connection is opened
+    # before the check answers.
+    if not session_verifies_creator(request):
+        verdict = verify_human(request, form, action=ACTION_MANAGE_LINK)
+        if not verdict.ok:
+            return _link_page(request, verdict.heading, verdict.detail, verdict.status_code)
     started = time.monotonic()
     email = valid_email(form.get("email", ""))
     if email:
+        # The per-address cooldown, and it sits **after** the human check for a
+        # reason worth stating: a request that never passed the check must not be
+        # able to start a victim's cooldown, or "fail Turnstile for an hour" becomes a
+        # denial of service against a real creator's recovery path — an attacker
+        # would not need a solve, an account or even a matching address to lock a
+        # victim out for the window. Placing it after `verify` means only a request
+        # that was allowed to send at all can consume the window.
+        #
+        # It is here, and not behind `session_verifies_creator`, because the
+        # exemption is the gap: a verified creator skips the check entirely, so a
+        # cooldown that only applied to the checked path would not have bounded the
+        # measured case at all. It applies to everyone, which is what makes it the
+        # control for the exemption rather than a companion to the check.
+        left = link_cooldown_left(email)
+        if left:
+            log.info("re-link request suppressed by the per-address cooldown "
+                     "(%ss left, address not logged)", left)
+            _hold_for(LINK_REQUEST_FLOOR_SECONDS, started)
+            return _link_cooldown_page(request)
+        record_link_request(email)
         # Filter, then cap — never cap, then filter. `list_polls_by_creator_email`
         # is newest-first and every poll minted after #29 has a token, so slicing
         # first meant a creator with ten recent polls and one older poll (a pre-#29
@@ -954,6 +1335,13 @@ def _remind(request, form, poll, web):
     # the API -- the per-peer budget has to hold here too, not only the per-poll
     # one that `nudge_participants` charges internally.
     charge(request, "send")
+    # A2, before the budget is spent: the shared `nudge_participants` charges the
+    # poll's whole recipient allowance internally, and a request that is about to
+    # be refused must not have drawn that down first. Unreachable in practice —
+    # holding a console session means having opened the manage link, which is what
+    # stamps the column — and called anyway, because "the one predicate every send
+    # path consults" is only true if the consult is really there.
+    require_sendable(poll)
     if poll["status"] != "open":
         raise HTTPException(400, "Poll is not open")
     counts = web.nudge_participants(request, poll, creator_actor(poll))
@@ -966,6 +1354,7 @@ def _email_decision(request, form, poll, web):
     from kairos.ics import build_ics
 
     charge(request, "send")  # see `_remind`: SMTP per recipient
+    require_sendable(poll)   # A2, before the per-poll allowance is spent
     slot = web.decided_slot_of(poll)
     if not slot:
         raise HTTPException(400, "Poll has no decided date yet")
@@ -1107,6 +1496,10 @@ def new_poll_context() -> dict:
         "capability": True,
         "mail_ok": is_configured(),
         "mail_note": _mail_note(),
+        # #31: the click-to-load human check on the anonymous creation form. `{}`
+        # when the gate is off, so `new_poll.html` renders byte-for-byte as it did
+        # in every mode and every deployment that does not gate.
+        "turnstile": widget_ctx(ACTION_NEW_POLL),
     }
 
 
@@ -1216,6 +1609,8 @@ def boot_warnings() -> list[str]:
     confusing page rather than an error the moment a creator tries to use it.
     A missing `SESSION_SECRET` is deliberately *not* one of them — it is not
     survivable, so it refuses to boot at import instead (see the gate above).
+    The same is true of a human check that is on without its keys, which
+    `turnstile` refuses at import for the same reason.
     """
     warnings = list(BOOT_WARNINGS)
     if not enabled():
@@ -1235,6 +1630,17 @@ def boot_warnings() -> list[str]:
             "KAIROS_RATE_LIMIT=on (and KAIROS_TRUSTED_PROXY_CIDRS, which it "
             "depends on) before exposing this deployment."
         )
+    if turnstile_required() and not settings.RATE_LIMIT_ENABLED:
+        # Not a duplicate of the warning above, and the reason is the point: the
+        # human check bounds *creating* a poll and *asking for a link*, but a
+        # verified creator's own sends are not gated by it, and every send path
+        # still draws on a per-peer budget that is currently not in force. The
+        # check is not a substitute for the limiter; it is the ceiling on top of it.
+        warnings.append(
+            "the poll-creation human check is on and KAIROS_RATE_LIMIT is off: the "
+            "check bounds who may create a poll, but not how much mail one verified "
+            "creator can send afterwards. Turn the limiter on as well."
+        )
     if not settings.PUBLIC_URL:
         # Weaker than the other three, hence a warning rather than a refusal: with
         # KAIROS_TRUSTED_PROXY_CIDRS set, only a trusted peer can reach the app at
@@ -1247,4 +1653,8 @@ def boot_warnings() -> list[str]:
             "restricts who can reach the app. A manage link IS a credential, so set "
             "both before exposing this deployment."
         )
+    # The human check's *own* states are `turnstile.boot_warnings`, logged by
+    # `main.create_app` under its own logger. This one is about this mode's
+    # operational contract, so it belongs here: the check is in force, the limiter
+    # that bounds what one verified creator can then send is not.
     return warnings

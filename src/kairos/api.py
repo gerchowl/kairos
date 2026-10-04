@@ -25,6 +25,15 @@ send budget shared with the web UI, and per-key rate limits under
 Outbound mail triggered via the API is sent as the service address with the
 poll creator's name/Reply-To by default; override per call with
 `sender_name` / `reply_to`.
+
+**Obligation A2 (#31).** A route that can open SMTP on behalf of a poll also
+consults `require_sendable(poll)`: in `KAIROS_AUTH=capability` a poll whose
+creator has never opened their manage link may not mail anyone, which is what
+keeps this surface — which has no browser and no inbox anywhere in the loop — from
+being the way a deployment becomes a mail cannon. It is inert in every other auth
+mode, where the creator is identified by a proxy or an IdP instead. Reminder
+routes reach it inside the shared `nudge_participants`; the four senders below
+call it themselves, ahead of any write and any budget charge.
 """
 
 from datetime import datetime
@@ -34,6 +43,7 @@ from pydantic import BaseModel
 
 from kairos import reach, settings
 from kairos.auth import get_base_url
+from kairos.capability import require_sendable
 from kairos.db import (
     add_response,
     add_slots,
@@ -395,6 +405,13 @@ def add_slots_endpoint(poll_id: str, body: SlotsAdd, request: Request,
     # reads the audit log afterwards. (kairos.scoping, issue #51)
     if body.notify:
         enforce(user, "mail:send")
+        # A2 (#31), before any row is written. `notify` is a *flag*, so a caller can
+        # discover whether their key may send at all by setting it -- which is the
+        # same reason the scope check above also runs before the date loop.
+        # `nudge_participants` would catch this too; asking here keeps the refusal
+        # attached to the request that asked for it, and stops the added dates being
+        # written for a request that is about to be refused.
+        require_sendable(poll)
     for d in body.dates:
         try:
             datetime.strptime(d, "%Y-%m-%d")
@@ -448,6 +465,11 @@ def invite_endpoint(poll_id: str, body: InviteCreate, request: Request,
     # before a single row is written, let alone a message sent.
     check_recipient_list(len(body.emails), what="email addresses")
     poll = _get_or_404(poll_id)
+    # Obligation A2 (#31). The only route here whose recipients come straight from
+    # the caller, so the one where an unverified poll would be the most useful tool
+    # -- and refused before the list is parsed, the budget is charged or a single
+    # invite row exists. See the module docstring for why this is inert elsewhere.
+    require_sendable(poll)
     actor = _actor(poll, body.sender_name, body.reply_to)
     base = get_base_url(request)
     results = []
@@ -510,6 +532,10 @@ def nudge_endpoint(poll_id: str, body: NudgeIn, request: Request,
     poll = _get_or_404(poll_id)
     if poll["status"] != "open":
         raise HTTPException(400, "Poll is not open")
+    # A2 (#31) is *not* consulted here: `nudge_participants` below is the one
+    # chokepoint every reminder path on every surface goes through, and it charges
+    # the gate first thing. A second call on this route would be the same check
+    # twice, which is how two copies end up disagreeing.
     only = {e.strip().lower() for e in body.emails} if body.emails else None
     # The poll's own budget is charged inside nudge_participants, so the web UI's
     # remind / remind-selected spend the same one.
@@ -528,6 +554,7 @@ def contacts_endpoint(poll_id: str, user: dict = Depends(api_scope("polls:read",
 def email_decision_endpoint(poll_id: str, body: MailIn, request: Request,
                             user: dict = Depends(api_scope("mail:send", reach=True))):
     poll = _get_or_404(poll_id)
+    require_sendable(poll)  # A2 (#31), ahead of the recipients read and the budget
     slot = decided_slot_of(poll)
     if not slot:
         raise HTTPException(400, "Poll has no decided date yet")
@@ -574,6 +601,7 @@ def imip_decision_endpoint(poll_id: str, request: Request,
     if not (settings.IMIP_ENABLED and settings.IMIP_ORGANIZER):
         raise HTTPException(400, "iMIP not configured (KAIROS_IMIP / KAIROS_IMIP_ORGANIZER)")
     poll = _get_or_404(poll_id)
+    require_sendable(poll)  # A2 (#31): a native iMIP REQUEST is still mail to a third party
     slot = decided_slot_of(poll)
     if not slot:
         raise HTTPException(400, "Poll has no decided date yet")

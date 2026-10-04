@@ -29,6 +29,17 @@ repos:
         language: system
         pass_filenames: false
         files: '^src/'
+      # The static bundle has no other gate: nothing in pytest parses it and ruff
+      # does not read it, so one wrong quote ships a file that 404s silently in the
+      # browser — every visitor sees a control that does nothing. Found exactly that
+      # way on #31's Turnstile facade: a `'` that became a `"`, which left the whole
+      # file unparseable and the widget never wired. node ships in the dev shell.
+      - id: static-js-parses
+        name: "static JS parses (node --check)"
+        entry: bash -c 'for f in src/kairos/static/*.js; do node --check "$f" || exit 1; done'
+        language: system
+        pass_filenames: false
+        files: '^src/kairos/static/.*\.js$'
       - id: gitleaks
         name: "S4 — no committed secrets (gitleaks)"
         entry: gitleaks protect --staged --redact --config .gitleaks.toml
