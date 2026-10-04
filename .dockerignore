@@ -25,7 +25,9 @@ dist
 __pycache__
 *.pyc
 .pytest_cache
-kairos.db
+# The pattern, not the one filename (see .gitignore): anything SQLite-shaped stays
+# out of the build context, whatever it is called.
+*.db
 *.db-wal
 *.db-shm
 CLAUDE.md

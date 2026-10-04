@@ -51,6 +51,7 @@ from kairos.helpers import (
 from kairos.http import form_data, valid_email
 from kairos.ics import build_ics
 from kairos.ratelimit import rate_limit
+from kairos.reach import can_reach
 from kairos.scoping import charge_poll_recipients
 from kairos.templating import render
 
@@ -378,6 +379,27 @@ def _error_page(user: dict, heading: str, detail: str, back: str, status_code: i
                   **_nav_ctx(user))
 
 
+def _not_yours_or_gone(user: dict) -> Response:
+    """The one 404 for a poll the caller may not read, and for one that is not there.
+
+    **Byte-identical between the two cases, and structurally so** — this is the only
+    function either path calls, so they cannot drift. On this surface reach cannot be
+    decided without reading the poll row, which means the route *could* tell "not
+    yours" from "not there"; a refusal that differed from the missing poll's own 404
+    in any single byte would therefore be a probe for anyone holding an id. The first
+    attempt at this got the status right and the body wrong — a 60-byte sentence on
+    the refusal only — which the second review measured on the live app and this
+    module's own probe reproduces: 4365 bytes for "not mine" against 4305 for
+    "missing", same id, same status code.
+
+    So the detail is empty, exactly as it was for a missing poll before this file
+    existed — one answer, no wording, nothing to compare. The API surface needs none
+    of this (its 403 never consults the poll); `poll_ics` needs no helper either,
+    because its two cases are one branch already.
+    """
+    return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
+
+
 # -- Routes --
 
 @router.get("/v/{code}")
@@ -521,7 +543,37 @@ def view_poll(poll_id: str, request: Request):
 
     poll = get_poll(poll_id)
     if not poll:
-        return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
+        # The same call the refusal below makes, so the two 404s cannot differ by a
+        # byte (see `_not_yours_or_gone`): this route reads the poll in order to
+        # decide, so it could tell "not yours" from "not there" and must not.
+        return _not_yours_or_gone(user)
+
+    # The rows this page renders anyway, read up front so the reach check below can
+    # be handed them instead of fetching them a second time: refusing a stranger
+    # then costs this route no statement more than serving the owner does, which is
+    # the same discipline the dashboard's query budget records
+    # (tests/test_dashboard_queries.py).
+    responses = get_responses(poll_id)
+    slots = poll["slots"]
+    invites = get_invites(poll_id)
+
+    # Reach (issue #64). Until this, any authenticated user could open any poll by
+    # id and see every respondent's name and per-slot availability -- a real IDOR in
+    # the hosted accountless product, and inconsistent with the mutating routes
+    # beside it, which have always required the owner. Under the default (`open`)
+    # policy the answer is unchanged; under `scoped` it is the owner or an identity
+    # named on the poll, which is what lets the ETH group deployment share a poll
+    # without making it public (kairos.reach). Placed before the notifications are
+    # marked read, which is the only side effect on this path: a refused caller must
+    # not leave a trace.
+    #
+    # 404 and not 403, and not merely the same status: the refusal is the *same
+    # bytes* as the missing poll's 404 above, from one function, because this route
+    # has read the poll in order to decide and must therefore not also tell a caller
+    # holding an id which of the two it was. No wording either — an empty detail is
+    # what a missing poll already answered with.
+    if not can_reach(poll, request, user=user, participants=(responses, invites)):
+        return _not_yours_or_gone(user)
 
     # Mark poll notifications as read
     notifs = get_notifications(user["uid"], unread_only=True)
@@ -529,9 +581,6 @@ def view_poll(poll_id: str, request: Request):
         if n["poll_id"] == poll_id:
             mark_notification_read(n["id"])
 
-    responses = get_responses(poll_id)
-    slots = poll["slots"]
-    invites = get_invites(poll_id)
     total, pending_n = expected_counts(invites, responses)
     share_url = f"{get_base_url(request)}{P}/p/{poll['public_token']}"
 
@@ -644,6 +693,11 @@ def edit_poll_page(poll_id: str, request: Request):
     poll = get_poll(poll_id)
     if not poll:
         return _error_page(user, "Poll not found", "", f"{P}/", status_code=404)
+    # Left at 403, not unified to 404 with the reach refusals above: this is
+    # management authority (#29), which the default configuration also serves, and
+    # changing it would alter bytes on a surface #63/#64 does not own. The
+    # management-side oracle it leaves is written down as a residual in
+    # docs/design/poll-reach.md.
     if not can_manage(poll, request, user=user):
         return _error_page(user, "Not allowed", "Only the poll owner can edit it.",
                            f"{P}/polls/{poll_id}", status_code=403)
@@ -854,7 +908,14 @@ def poll_ics(poll_id: str, request: Request):
     if not user:
         return _login_or_401(f"{P}/polls/{poll_id}")
     poll = get_poll(poll_id)
-    if not poll:
+    # Same reach rule as the poll page above (issue #64): the decided time and the
+    # title are the owner's to publish, and this route is easy to forget because it
+    # looks like a harmless read. One 404 for "not there" and "not yours", with the
+    # *same body* — this surface had to read the poll to decide, so a distinct
+    # refusal would be an existence oracle for anyone holding an id (see
+    # `kairos.reach`). The bare 404 is also exactly what a missing poll answered
+    # before this check existed.
+    if not poll or not can_reach(poll, request, user=user):
         raise HTTPException(404)
     return ics_response(poll, request)
 

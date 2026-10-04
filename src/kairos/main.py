@@ -103,8 +103,16 @@ def create_app() -> FastAPI:
     # is the failure this line exists to make visible. Also *validates* it, so a
     # typo'd keyring or scope name refuses the boot here instead of silently
     # leaving every key at full capability.
-    logging.getLogger("kairos.scoping").info("%s", scoping.boot_report())
-    # ---- issue #30: the same statement for the accountless mode. Which control
+    scoping_log = logging.getLogger("kairos.scoping")
+    scoping_log.info("%s", scoping.boot_report())
+    # Issues #63/#64: the same convention as `oidc.boot_warnings` above, at the
+    # level a warning deserves — reach decides who may read which poll, so the
+    # states where it is not the rule the operator believes (an unrecognised
+    # KAIROS_HOSTED, `open` with scoped keys configured, `scoped` in header mode
+    # with no trusted-proxy CIDRs) are warnings, not a line of prose in a green log.
+    for warning in scoping.boot_warnings():
+        scoping_log.warning("%s", warning)
+# ---- issue #30: the same statement for the accountless mode. Which control
     # decided "who may manage a poll" is the fact an operator cannot infer from a
     # working page, and in capability mode the answer is a link in an inbox rather
     # than a proxy — so say it, and say it unconditionally, so a self-hoster on a

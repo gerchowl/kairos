@@ -1060,6 +1060,15 @@ def _claims_tampered(token: str) -> str:
 @pytest.mark.parametrize(
     "mutate",
     [
+        # #67's correction, and the reason the signature mutator exists: a flip in
+        # the token's *body*, not in its last base64url character. The signature is
+        # 20 bytes = 160 bits, and 27 unpadded base64url characters carry 162, so
+        # the final character has two bits no decoder reads (the second review
+        # corrected four to two). Replacing it is therefore a byte-level no-op
+        # whenever those two bits are the only thing that changed -- 1 of the 16
+        # possible final digests, i.e. 6.25%, about one run in 16 -- and the
+        # tampered token still verified. A body flip always changes bytes the
+        # HMAC covers, which is why the two mutators differ in kind.
         _flip_a_byte_in_the_signature,
         _claims_tampered,
         lambda token: token + "x",

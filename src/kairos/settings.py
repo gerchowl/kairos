@@ -52,6 +52,16 @@ KAIROS_MAIL_PER_POLL  send budget for ONE poll as "<count>/<window>", counted in
                    recipients across every send path and charged to the poll, so
                    it holds regardless of which key asks. 0 disables. Default
                    "2000/day".
+KAIROS_POLL_REACH  who may read which poll, on BOTH surfaces (issue #63/#64):
+                   open (default) | scoped. "open" is the rule that has always
+                   existed — any authenticated caller reads any poll, which is
+                   what the ETH group deployment needs (ADR-0002). "scoped" is
+                   per-poll reach: the owner, and on the web surface anyone
+                   named on the poll; on the API surface only what the key's
+                   "~<poll-id>" grant names. Unset = "scoped" when
+                   KAIROS_HOSTED is on (a deployment WE operate is the
+                   multi-tenant case, where the open rule is an IDOR) and
+                   "open" otherwise. Parsed and enforced by kairos/reach.py.
 """
 
 import ipaddress
@@ -137,6 +147,14 @@ API_KEY = os.environ.get("KAIROS_API_KEY") or os.environ.get("SCHEDULER_API_KEY"
 # works and still reaches everything.
 API_KEYS = os.environ.get("KAIROS_API_KEYS", "")
 
+# Issues #63/#64: the reach policy — which polls a caller may read, on the web UI
+# and the API alike. Raw here, resolved and enforced in kairos.reach, which owns
+# the vocabulary and the default ("open" unless KAIROS_HOSTED says this is a
+# deployment we operate). Empty = unset = kairos.reach decides; it is read at
+# call time like every other knob here, so an operator can change it without a
+# code change and a test can set it with monkeypatch.setenv.
+POLL_REACH = os.environ.get("KAIROS_POLL_REACH", "")
+
 # Obligation S1 (issue #47): in header mode the owner identity comes from
 # request headers, so whoever can reach the port can assert any identity —
 # unless we know the request actually came through our proxy. Empty tuple =
@@ -165,10 +183,19 @@ TRUSTED_PROXY_NETWORKS = _parse_networks(TRUSTED_PROXY_CIDRS, "KAIROS_TRUSTED_PR
 # must not silently disarm the gate, which is the failure mode a security control should
 # never have. An unrecognised value keeps HOSTED off (the safe direction for self-host)
 # but records itself so the boot line can WARN rather than quietly do nothing.
+#
+# The false set is spelled out for the same reason in reverse, and it includes the short
+# forms on purpose: `n` and `f` are what someone writes for "no", and both gates should
+# read them as the self-host answer rather than as a typo. Before this, `n` was
+# *unrecognised*, and reach treats unrecognised as hosted (#63/#64) — so the likeliest
+# spelling of "not hosted" was the one that turned a self-hoster's deployment strict.
 HOSTED_RAW = os.environ.get("KAIROS_HOSTED", "").strip()
-HOSTED_TRUE = ("1", "on", "true", "yes")
+HOSTED_TRUE = ("1", "on", "true", "yes", "y")
+# No "" in it: `HOSTED_UNKNOWN` is guarded by `bool(HOSTED_RAW)`, so an empty value
+# never reaches the membership test and listing it would suggest otherwise.
+HOSTED_FALSE = ("0", "off", "false", "no", "n", "f")
 HOSTED = HOSTED_RAW.lower() in HOSTED_TRUE
-HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + ("0", "off", "false", "no", "")
+HOSTED_UNKNOWN = bool(HOSTED_RAW) and HOSTED_RAW.lower() not in HOSTED_TRUE + HOSTED_FALSE
 # Normalised, not validated: a typo must fail as a loud refusal naming this knob, not as
 # an import error that would also break self-host, where the variable is unused. See
 # kairos.email_service.sender_refusal().

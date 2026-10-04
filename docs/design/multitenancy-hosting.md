@@ -376,3 +376,63 @@ creator's several accountless polls stop being one-session-at-a-time), a
 #63/#64 are in it; `POST /manage/link` already reaches an API-created poll by its
 `creator_email`), any expiry on the link, and the token-lifetime product question.
 
+## Step 1.5 shipped (#63/#64) — reach, the question above management
+
+`can_manage` (step 1) answers *may this caller manage this poll*. It never
+answered *may this caller read this poll*, and the two surfaces answered the
+second question differently: the web UI's mutating routes demanded the owner while
+`GET /api/polls/{id}` and `GET /api/polls` handed a `polls:read` key the whole
+instance. That is now one predicate, `reach.can_reach`, on both surfaces, under a
+policy: `open` (default, byte-for-byte what header mode and self-host get) or
+`scoped` (per poll: the owner or a participant in the UI; only the granted poll
+ids on the API). Full rationale in `docs/design/poll-reach.md`.
+
+Two statements above are now narrower than the code, and #32/#33 should read them
+through this section rather than re-derive them:
+
+1. **"Single scoping helper (`list_polls(owner)` + `can_manage`) — the only places
+   that decide visibility" is no longer complete.** Reach is a third one, and it is
+   the one that guards *reads*. Reach implies management authority (a manager
+   always reaches) but not the reverse: an invited participant reaches a poll and
+   manages nothing. `list_polls(owner)` is still the dashboard's scoping helper;
+   `GET /api/polls` is scoped by `reach.only_reachable`.
+2. **"No enumeration without a token or an authenticated account" holds for the
+   hosted deployment only because `KAIROS_HOSTED=on` implies `scoped`.** Under the
+   default `open` policy an authenticated key (or any signed-in user in header
+   mode) does enumerate by `GET /api/polls` — which is the single-team model
+   ADR-0001/0002 require, and why `open` cannot be the hosted default. It is a
+   *deprecation* rather than a permanent answer: the boot log says at WARNING
+   whenever scoped keys exist under `open` (their `~` claims are inert), and an
+   unrecognised `KAIROS_HOSTED` reads as `scoped` rather than quietly selecting
+   `open`, because a typo in that knob used to do exactly that. Issues #63/#64 are
+   therefore closed by `scoped`, not by this default — see the closure note in the
+   PR.
+3. **The hosted deployment's reach also depends on how identity is asserted.** In
+   `KAIROS_AUTH=header` mode with no `KAIROS_TRUSTED_PROXY_CIDRS`, `scoped` is
+   exactly as strong as a header anyone can assert, and #31's Turnstile work is
+   about the *anonymous* surface. The boot log warns about the combination; the
+   hosted deployment runs OIDC, where the IdP is the identity.
+
+What #32 inherits, unchanged and pinned as tests in `tests/test_poll_reach.py`:
+
+* **Reach attaches to a key, not to an account, because there is no account to
+  attach it to.** `creator_id` on an API-created poll is the literal string
+  `"api"` for *every* key, so no downstream code can infer "the key that made this
+  poll" from the row. Per-account reach is one rule inside `can_reach` once
+  `session.account_id` exists — the same place `can_manage` already has a
+  `session.account_id == poll.owner_id` branch.
+* **A key that creates a poll is not auto-granted reach over it**, for the same
+  reason; auto-granting on create would hand every key every poll whose id it could
+  guess. With accounts it becomes "the creating principal's reach includes what it
+  created", which is a one-line change plus the provisioning story. Until then the
+  creation response carries a `reach_warning` naming the grant the key needs, so a
+  caller is never handed a poll id it cannot use without being told.
+* **`KAIROS_API_KEY` is the explicit instance-wide grant** rather than an exemption
+  from the scoped policy, so a deployment that tightens reach cannot lose its own
+  service credential. #33's per-plan reach slots into the same field.
+* **An invited or responding participant reaches the poll on the web surface.**
+  That is deliberate, not an oversight: it is what lets a group deployment share a
+  poll without making it public, and it is the same rule `public.py` already uses
+  to bind a response to a signed-in respondent (`user_id`). A hosted product that
+  wants participant-visibility narrowed is making a product decision about
+  participation, not an authorization one.
