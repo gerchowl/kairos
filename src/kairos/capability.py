@@ -241,7 +241,51 @@ LINK_REQUEST_FLOOR_SECONDS = 0.3
 # Slots one anonymous accountless creation may insert. Sized above any real
 # meeting (a full week of 15-minute slots over a 12-hour day is ~576) and below
 # anything a single POST should be able to write.
+#
+# Enforced **twice**, and both times matter. `web._expand_time_slots` asks
+# `slot_cap_refusal` for the verdict *before* building the grid, from the
+# multiplication of dates and per-date iterations, because that is the only
+# placement that bounds the work: the same request with 992 dates and a one-minute
+# increment is 1.4 million slot dicts, and on the pre-fix tree sixteen concurrent
+# copies of it measured **+2.2 GB** — truncated only by the 2.5 GB address-space cap
+# on that test server, ~6 GB uncapped — while every request cheerfully returned 400
+# afterwards, the refusal arriving after the memory had already been spent and
+# `/health` still answering 200 throughout. The same burst after the fix: **+4 MB**.
+# The check in `create_accountless_poll`, after the list exists, is the second line of
+# defence and the one that states the number to a creator; it can no longer be the
+# thing that bounds anything, and its comment says so.
+#
+# One function, one number, one sentence: the two call sites must not be able to
+# disagree about what "too large" means, because they are the same policy asked
+# twice about the same poll — once as a prediction and once as a fact.
 MAX_SLOTS_PER_ACCOUNTLESS_POLL = 1000
+
+
+def slot_cap_refusal(n_slots: int, n_dates: int = 0) -> str | None:
+    """The refusal sentence for an accountless poll over the slot cap, or None.
+
+    `n_slots` is a slot *count* in both call sites, which is what makes them
+    comparable: before the loop it is `dates × per-date iterations`, after it,
+    `len(slots)`. The two must agree, and a test asserts they do on the boundary.
+
+    `n_dates` only sharpens the sentence — "992 dates over that window" tells a
+    creator what to change, "too large" does not.
+
+    Not consulted outside this mode, which is the documented posture rather than an
+    oversight: the owner's own form has never been capped (`create_accountless_poll`
+    says why), an owner-mode request is authenticated, and a cap for every
+    deployment is a policy change this issue is not making. The anonymous surface is
+    what #30 created, and it is what this bounds.
+    """
+    if not enabled() or n_slots <= MAX_SLOTS_PER_ACCOUNTLESS_POLL:
+        return None
+    shape = f" {n_dates} dates over that window would create" if n_dates else " That would create"
+    return (
+        f"That poll is too large.{shape} {n_slots:,} slots, and this deployment creates "
+        f"accountless polls with up to {MAX_SLOTS_PER_ACCOUNTLESS_POLL:,}. Use fewer dates "
+        f"or a longer increment, split it into two polls, or ask the operator to raise the "
+        f"limit."
+    )
 
 
 def enabled() -> bool:
@@ -1059,22 +1103,22 @@ def create_accountless_poll(
     """
     if not is_configured():
         return _link_page(request, "Email is not available", _mail_note(), 503)
-    if len(slots) > MAX_SLOTS_PER_ACCOUNTLESS_POLL:
-        # The one input-size limit this mode adds, and it is here because the
-        # request is anonymous: `dates` is an uncapped repeated field, and in
-        # time_slot mode each date expands to (end - start) / increment rows, so a
-        # single POST can otherwise insert thousands of slots. The owner's form has
-        # no such cap and gets none — changing that for every deployment is not this
-        # issue's call, and #31's Turnstile is the real answer for the public
-        # surface. This is the cheap structural bound in the meantime.
-        return _link_page(
-            request,
-            "That poll is too large",
-            f"This deployment creates accountless polls with up to "
-            f"{MAX_SLOTS_PER_ACCOUNTLESS_POLL} slots. Split it into two polls, or "
-            "ask the operator to raise the limit.",
-            400,
-        )
+    over_cap = slot_cap_refusal(len(slots))
+    if over_cap:
+        # The *second* line of defence, and no longer the one that bounds anything.
+        # It used to be the only one, with a comment describing exactly the defect it
+        # could not prevent: an uncapped `dates` field times (end - start) / increment
+        # rows per date, from an anonymous POST, refused only once the rows existed.
+        # Sixteen concurrent 992-date requests allocated 6 GB and every one of them
+        # returned this 400. `web._expand_time_slots` now asks `slot_cap_refusal`
+        # before it builds anything, so reaching here with an over-cap list means the
+        # prediction and the fact disagree — which is why they are the same function
+        # and the same number, and why a test pins the boundary from both sides.
+        #
+        # It stays because it is the check that can see a list nobody predicted (a
+        # future caller building slots by another route), and because it is the one
+        # that states the ceiling to a creator in the console's own voice.
+        return _link_page(request, "That poll is too large", over_cap, 400)
     email = valid_email(form.get("creator_email", ""))
     if not email:
         return _link_page(

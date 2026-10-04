@@ -1016,11 +1016,19 @@ def _flip_a_byte_in_the_signature(token: str) -> str:
     That is why the earlier character-flip test read as an intermittent failure
     rather than as a test that asserts nothing: roughly one run in fifteen was
     actually testing the signature, and the rest were being refused by something
-    else. The bit chosen here is a real digest bit under any digest algorithm, so
-    this always tampers.
+    else.
+
+    **Why the first byte specifically**, since "index 0" is an assumption like any
+    other: the unused bits are an artefact of the base64 *encoding* of a digest whose
+    length is not a multiple of 3, and they land in the final character. Byte 0 is
+    load-bearing under every digest algorithm and every length, and the length is
+    asserted rather than assumed. Between the two helpers here nothing indexes a
+    *character* and nothing depends on the payload's length: `_claims_tampered`
+    re-mints through the real serializer, so a short payload is not a special case.
     """
     payload, timestamp, signature = token.rsplit(".", 2)
     digest = bytearray(_decode_segment(signature))
+    assert len(digest) >= 1, "a signature with no bytes has nothing to tamper with"
     digest[0] ^= 0x01
     return f"{payload}.{timestamp}.{_encode_segment(bytes(digest))}"
 

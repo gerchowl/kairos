@@ -232,9 +232,15 @@ build on it rather than re-derive it:
    to a 0.3s floor (`LINK_REQUEST_FLOOR_SECONDS`). A floor is a mitigation and not a
    proof: it equalises the two cases only while the relay answers inside it, and the
    real answer — queue the mail, answer before SMTP — is a delivery change rather
-   than a route change. Recorded here because the previous version of this sentence
-   said "byte-identical … (not an address oracle)" and was true of the body and
-   false of the response, which is how the timing channel survived review.
+   than a route change. **And it is a price, not only a fix**: a *miss* used to
+   answer in 3ms and now occupies a worker thread for 0.3s, so the route converts a
+   cheap refusal into a held thread. That is bounded by the constant rather than by
+   the attacker, a matching address was already paying SMTP latency, and
+   `KAIROS_RATE_LIMIT=on` — which boot already insists on for this mode — caps the
+   rate; but an operator reading this should know a miss is no longer free.
+   Recorded here because the previous version of this sentence said "byte-identical …
+   (not an address oracle)" and was true of the body and false of the response, which
+   is how the timing channel survived review.
 6. **Outbound mail is a precondition, not a feature.** In this mode the link *is*
    the credential, so `is_configured()` is consulted before a poll is created and
    creation is **refused** (503, with the operator-facing reason) when mail cannot
@@ -267,31 +273,50 @@ build on it rather than re-derive it:
    is not. An unrecognised value refuses to boot, naming the variable and the
    known modes, like `_parse_networks`, `_parse_rate_limit`, `parse_keyring` and
    `_validate_config` already do. Every mode that existed before is still accepted.
-9. **The anonymous creation route is bounded before it loops, not after.** In
-   `time_slot` mode the slot list is built by `while t + timedelta(minutes=increment)
-   <= t_end`, and `increment` is a form field on a request that #30 made
-   anonymous. `increment=0` never advances `t`: measured against a real uvicorn with
-   no credential at all (the anon CSRF token is scraped off the public `/new` form),
-   one such POST took the process from 59 MB to 2.1 GB without answering, and
-   anyio's 40-thread default meant ~40 of them were enough to take the deployment
-   down — `/health` still answering, so it read as a hang. A non-numeric value was a
-   plain `ValueError` → 500 on the same line, and so was any `start_time_all` /
-   `end_time_all` that `strptime` could not parse. `increment` is now a whole number
-   of minutes in `1..1440` and the clocks must be `HH:MM`, both refused *before* the
-   loop. The distinction is the whole point: `MAX_SLOTS_PER_ACCOUNTLESS_POLL` runs
-   after the list exists, so it cannot bound what building the list costs, and a PR
-   that advertises a slot cap while the loop above it is unbounded has not bounded
-   anything.
+9. **The anonymous creation route is bounded before it loops — and the bound is the
+   *product*, not the step.** In `time_slot` mode the grid is built by `while t +
+   timedelta(minutes=increment) <= t_end`, over an uncapped repeated `dates` field,
+   on a request #30 made anonymous. Two rounds of review found two versions of the
+   same defect here, and the second one is the more useful lesson:
+
+   * **`increment=0` never advances `t`.** With no credential at all (the anon CSRF
+     token is scraped off the public `/new` form), one such POST took a real uvicorn
+     from 59 MB to 2.1 GB without answering, and anyio's 40-thread default meant ~40
+     were enough to take the deployment down — `/health` still answering, so it read
+     as a hang. A non-numeric `increment` was a `ValueError` → 500 on the same line,
+     and so was any `start_time_all` / `end_time_all` that `strptime` could not
+     parse. Fixed by bounding `increment` to `1..1440` and the clocks to `HH:MM`,
+     before the loop.
+   * **Bounding `increment` bounds *one date*.** The grid is
+     `dates × (end - start) / increment`, `dates` is uncapped, and Starlette's
+     `max_fields` ceiling caps *fields*, not slots. A 17 KB body with 992 dates and a
+     one-minute increment is 1,427,488 slot dicts: measured at **+2.2 GB with sixteen
+     concurrent requests** (truncated only by a 2.5 GB address-space cap on the test
+     server; ~6 GB uncapped), **every one of them returning 400 "too large"
+     afterwards**, `/health` answering 200 throughout. Bounding the step had moved the
+     amplification one field to the left, not closed it.
+
+   So `web._expand_time_slots` computes the product — `dates × per-date iterations`,
+   with `per_date` being the loop's own arithmetic and `n_dates` counting the fields
+   the loop actually visits — and asks `capability.slot_cap_refusal` **before** the
+   first dict is appended. The check in `create_accountless_poll` remains as the
+   second line of defence and the one that states the ceiling to a creator, but it can
+   no longer be the thing that bounds anything, and its comment now says so. The
+   lesson worth keeping: **a size check that runs after the work is not a bound on
+   the work**, and neither is a bound on one factor of a product. `tracemalloc` in
+   the test suite is what holds the placement — the same 400 comes back either way,
+   so only the allocation distinguishes them.
 10. **A capability in a URL is in the access log, and that is an operator's
     problem.** `GET /manage/<token>` puts the live token in whatever the front end
     writes down — `INFO: 127.0.0.1:48348 - "GET /manage/6YBiM6… HTTP/1.1" 200 OK`
     is the real shape of it. Kairos never writes a capability to its own logs (no log
-    line in `capability.py` carries one, asserted), but the access log belongs to
-    uvicorn or the reverse proxy. For a link nobody ever opens, the token is valid
-    forever *and* sits in the log forever. What exists: single use (the token dies
-    the moment it is exchanged), `Referrer-Policy: no-referrer` on the one page whose
-    URL carries it, and no creator address in any log line. What an operator should
-    do: keep request lines for `{prefix}/manage/` short-lived, or redact that path.
+    line in `capability.py` carries one, asserted, and no creator address either), but
+    the access log belongs to uvicorn or the reverse proxy. For a link nobody ever
+    opens, the token is valid forever *and* sits in the log forever. What exists:
+    single use (the token dies the moment it is exchanged), `Referrer-Policy:
+    no-referrer` on the one page whose URL carries it, and no creator address in any
+    log line. What an operator should do: keep request lines for `{prefix}/manage/`
+    short-lived, or redact that path.
 11. **`KAIROS_PUBLIC_URL` unset is a phishing risk, not a cosmetic one.** With
     `KAIROS_TRUSTED_PROXY_CIDRS` set only a trusted peer reaches the app, so the
     origin cannot be dictated — which is why this one warns instead of refusing. But

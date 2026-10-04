@@ -35,6 +35,8 @@ import logging
 import re
 import sqlite3
 import time
+import tracemalloc
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -1290,22 +1292,20 @@ def test_the_console_charges_the_budgets_the_owner_ui_charges(console, monkeypat
 
 
 def test_an_anonymous_creation_refuses_a_poll_larger_than_the_slot_cap(live):
-    """The cap on the *result*, and only that.
+    """The ceiling, stated to a creator, through the route.
 
-    In `time_slot` mode each date expands into `(end - start) / increment` rows, so
-    a handful of form fields is enough to ask for thousands of writes -- and this
-    request is anonymous. (python-multipart's own 1000-field ceiling bounds the
-    field count, not the slot count, which is the one that matters here.) Turnstile
-    (#31) is the real answer for the public surface; this is the structural bound in
-    the meantime.
+    Three dates at a one-minute increment over twelve hours is 2160 slots — the shape
+    the first review round's fix used to catch *after* the grid was built. It is now
+    refused before that, by the same `slot_cap_refusal` this test's sibling
+    (`..._the_product_is_refused`) pins with a tracemalloc ceiling, because a check
+    that runs once the list exists cannot bound what building it costs.
 
-    Named for what it asserts. It used to claim the *expansion* was bounded, which
-    was false and load-bearing: the cap runs after the slot list has been built, so
-    it cannot bound what building it costs, and `increment=0` proved it — an
-    unbounded loop in front of a cap that never got a chance to run. What bounds the
-    expansion is the increment, before the loop; see
-    `test_the_slot_step_bounds_are_what_make_the_loop_terminate`. This test covers
-    the second line of defence and nothing more.
+    What is left for this test is the part that is genuinely about the *result*: that
+    the refusal reaches the creator as a 400 page naming the ceiling, that nothing is
+    written, and that a poll just under it is still created with every slot.
+
+    Turnstile (#31) is the real answer for the public surface; this is the structural
+    bound in the meantime.
     """
     payload = {"title": "Wide", "creator_email": "ada@example.org", "mode": "time_slot",
                "start_time_all": "00:00", "end_time_all": "12:00", "increment": "1",
@@ -1314,6 +1314,8 @@ def test_an_anonymous_creation_refuses_a_poll_larger_than_the_slot_cap(live):
     response = live.client.post("/scheduler/new", data=payload)
     assert response.status_code == 400
     assert "too large" in response.text
+    assert f"{capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL:,}" in response.text, \
+        "the refusal should name the ceiling the creator is up against"
     assert live.polls == [], "an over-sized poll was created anyway"
 
     payload["dates"] = ["2026-01-05"]
@@ -1564,19 +1566,33 @@ def test_an_anonymous_creation_refuses_a_clock_it_could_not_parse(live, field, v
     assert live.polls == []
 
 
-def test_the_slot_step_bounds_are_what_make_the_loop_terminate():
-    """The numbers, and where they live.
+def test_the_slot_step_bounds_are_what_make_the_loop_terminate(monkeypatch):
+    """The numbers, where they live, and that the route still goes through them.
 
-    Two properties, both load-bearing. The *values*: `increment >= 1` is the only
-    reason the `while` advances at all, and 1440 is one day, so the worst case is
-    1440 iterations and 1440 slots for one date. The *location*: the validation and
-    the loop are in one function, asserted with `inspect` rather than by reading,
-    because "the bound is over there, in the caller" is precisely how an unbounded
-    anonymous loop ships with a slot cap three frames away from it.
+    Three properties, all load-bearing.
+
+    The *values*: `increment >= 1` is the only reason the `while` advances at all,
+    and 1440 is one day, so the worst case is 1439 iterations per date.
+
+    The *location*: the validation and the loop are in one function. Asserted on the
+    source, and honestly labelled — a string check is a tripwire, not a proof. It
+    catches a bound being moved out to a caller, which is how the first version of
+    this shipped with a slot cap three frames from the loop.
+
+    The *call site*: `create_poll_submit` must actually call that function. The first
+    version of this test omitted it and was proved wrong by review — restoring the
+    original inline loop in the route, so `_expand_time_slots` was never called, left
+    every assertion here passing. A tripwire on the wrong function is a comment.
+
+    The behavioural tests are the real protection: `increment=0`, `increment=x` and the
+    unparseable clocks all fail at the route if the loop goes back to being unbounded.
     """
+    monkeypatch.setattr(settings, "AUTH_MODE", "header")  # the slot cap is another test's subject
     assert web.MIN_INCREMENT_MINUTES >= 1, "increment <= 0 makes the loop immortal"
     assert web.MAX_INCREMENT_MINUTES <= 1440, "the window is bounded by the day"
 
+    assert "_expand_time_slots(" in inspect.getsource(web.create_poll_submit), \
+        "the route no longer goes through the function that holds the bounds"
     source = inspect.getsource(web._expand_time_slots)
     assert "_bounded_int(" in source and "while " in source, \
         "the increment bound and the loop it bounds must be one function"
@@ -1585,6 +1601,9 @@ def test_the_slot_step_bounds_are_what_make_the_loop_terminate():
         {"start_time_all": "00:00", "end_time_all": "23:59", "increment": "1"}, ["2026-01-05"]
     )
     assert error is None
+    # Owner mode, deliberately uncapped: 1439 slots for one date is what an
+    # authenticated owner has always been allowed to ask for. `create_accountless_poll`
+    # says why the cap does not extend here, and the next test says where it does.
     assert len(slots) == 1439, "one slot per minute of the widest possible window"
     assert slots[0]["start_time"] == "00:00" and slots[-1]["end_time"] == "23:59"
 
@@ -1602,6 +1621,154 @@ def test_the_slot_step_bounds_are_what_make_the_loop_terminate():
             {"start_time_all": "09:00", "end_time_all": "17:00", "increment": padded}, ["2026-01-05"]
         )
         assert error is None and len(slots) == 16, f"{padded!r} should read as 30 minutes"
+
+
+def test_the_grid_is_the_product_of_dates_and_per_date_slots_and_the_product_is_refused(
+    cap_mode, live
+):
+    """**The amplification moved one field to the left, and this is the fix.**
+
+    Bounding `increment` bounded one date. The grid is `dates × per-date iterations`,
+    `dates` is an uncapped repeated field, and Starlette's `max_fields` ceiling caps
+    *fields*, not slots — so a 17 KB body with 992 dates and a one-minute increment is
+    1,427,488 slot dicts from a request with no credential. Measured against a real
+    uvicorn: **+2.2 GB at 16 concurrent** (truncated only by the 2.5 GB address-space
+    cap I put on that server to spare the machine; uncapped it is ~6 GB), every request
+    returning 400 "too large" *afterwards*, with `/health` answering 200 throughout.
+    The refusal arrived after the memory was spent. That is the defect, not the
+    wording of it. The same burst against the fixed tree: **+4 MB, 0.1s, sixteen 400s**.
+
+    So the assertions here are about **work**, not about the answer:
+
+    * `slots == []` — the function returns no grid at all, so there was nothing to
+      return after building 1.4M dicts;
+    * a `tracemalloc` peak ceiling — the measurable form of "the list was never
+      built". A check placed after the loop produces the same 400 and the same empty
+      return, and allocates half a gigabyte doing it; this fails at 10 MB.
+
+    The route-level half matters too, because `_expand_time_slots` is not the route.
+    """
+    form = {"start_time_all": "00:00", "end_time_all": "23:59", "increment": "1"}
+    dates = ["2026-01-05"] * 992
+
+    tracemalloc.start()
+    try:
+        slots, error = web._expand_time_slots(form, dates)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert slots == [], "a refused grid must not have been built"
+    assert error and "too large" in error
+    assert "992 dates" in error, "the refusal should say which field to change"
+    assert peak < 10 * 1024 * 1024, (
+        f"the refusal allocated {peak / 1024 / 1024:.0f} MB — the check is running "
+        f"after the loop, not before it"
+    )
+
+    # A smaller shape, same multiplication: 3 dates x 720 slots = 2160, which is the
+    # case the *previous* round's test used and which the post-loop cap used to catch.
+    slots, error = web._expand_time_slots(
+        {"start_time_all": "00:00", "end_time_all": "12:00", "increment": "1"}, ["2026-01-05"] * 3
+    )
+    assert slots == [] and error and "too large" in error
+
+    # And through the route, with the anon CSRF token and no credential of any kind.
+    response = _creation_post(live, {"mode": "time_slot", "start_time_all": "00:00",
+                                     "end_time_all": "23:59", "increment": "1",
+                                     "dates": ["2026-01-05"] * 992})
+    assert response.status_code == 400
+    assert "too large" in response.text
+    assert live.polls == [], "an over-wide creation still wrote a row"
+
+
+def test_the_slot_cap_boundary_is_identical_before_and_after_the_loop(cap_mode):
+    """One number, asked twice: as a prediction and as a fact.
+
+    The pre-loop check computes `dates × per-date iterations`; the post-loop check
+    counts `len(slots)`. They are the same policy about the same poll, so they must
+    agree on the boundary — otherwise a creator is refused a poll the other check
+    would have allowed, or (worse, the direction that matters) allowed one the cap
+    forbids. Both are the same function on purpose; this pins that they stay so.
+    """
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    # 125 slots per date, because 1000 = 8 x 125 and the boundary is only meaningful
+    # if some whole number of dates lands exactly on it.
+    form = {"start_time_all": "00:00", "end_time_all": "02:05", "increment": "1"}
+    per_date = 125
+    assert cap % per_date == 0, "this test needs a window that divides the cap"
+
+    at_cap, error = web._expand_time_slots(form, ["2026-01-05"] * (cap // per_date))
+    assert error is None, f"a poll of exactly {cap} slots was refused"
+    assert len(at_cap) == cap
+
+    over_cap, error = web._expand_time_slots(form, ["2026-01-05"] * (cap // per_date + 1))
+    assert over_cap == [] and error and "too large" in error
+
+    # The two call sites, asked about the same counts.
+    for n in (cap - 1, cap, cap + 1):
+        assert (capability.slot_cap_refusal(n) is None) == (n <= cap)
+        assert (capability.slot_cap_refusal(n, 5) is None) == (n <= cap)
+    # And the count the loop built is the count the pre-loop check would have been
+    # asked about — which is what makes "asked twice about the same poll" true.
+    assert capability.slot_cap_refusal(len(at_cap)) is None
+    assert capability.slot_cap_refusal(len(at_cap) + 1) is not None
+
+
+def test_no_accepted_creation_ever_exceeds_the_cap(cap_mode):
+    """The invariant the pre-loop bound exists to guarantee.
+
+    Whatever combination of dates, window and increment gets through, the grid that
+    comes back is at most the cap. A battery rather than one case, because the bug
+    was a *product* and a single case only ever proves one product.
+    """
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    windows = [("09:00", "17:00", "30"), ("00:00", "23:59", "1"), ("00:00", "12:00", "1"),
+               ("08:00", "09:00", "5"), ("00:00", "00:01", "1")]
+    for start, end, increment in windows:
+        for n_dates in (1, 2, 7, 100, 992):
+            slots, error = web._expand_time_slots(
+                {"start_time_all": start, "end_time_all": end, "increment": increment},
+                ["2026-01-05"] * n_dates,
+            )
+            if error is None:
+                assert len(slots) <= cap, (
+                    f"{n_dates} dates x {start}-{end} @ {increment}min produced "
+                    f"{len(slots)} slots, over the {cap} cap, with no refusal"
+                )
+            else:
+                assert slots == [], f"{start}-{end} @ {increment}min refused but returned slots"
+
+
+def test_the_slot_cap_is_not_consulted_outside_capability_mode(monkeypatch):
+    """`slot_cap_refusal` is asked about the anonymous surface only.
+
+    The owner's own form has never been capped, an owner-mode request is
+    authenticated, and a cap for every deployment is a policy change this issue is
+    not making — so the answer must stay "no opinion" in the other four modes, or the
+    gate would quietly become a new limit on the ETH deployment.
+    """
+    monkeypatch.setattr(settings, "AUTH_MODE", "header")
+    assert capability.slot_cap_refusal(10 ** 9, 992) is None
+    monkeypatch.setattr(settings, "AUTH_MODE", "capability")
+    assert capability.slot_cap_refusal(10 ** 9, 992) is not None
+
+
+def test_empty_date_fields_do_not_count_towards_the_product(cap_mode):
+    """The count is what the loop iterates, not what the body contained.
+
+    The loop skips an empty `dates` field, so counting those would refuse a
+    submission whose real answer is "At least one date is required" — a 400 either
+    way, but the wrong sentence, and a bound that is looser than it needs to be.
+    """
+    slots, error = web._expand_time_slots(
+        {"start_time_all": "09:00", "end_time_all": "17:00", "increment": "30"},
+        [""] * 900 + ["2026-01-05"],
+    )
+    assert error is None and len(slots) == 16
+    # The exactness that makes the pre-loop number trustworthy: predicted == built.
+    per_date = web._parse_clock("17:00") - web._parse_clock("09:00")
+    assert 1 * (per_date // timedelta(minutes=30)) == len(slots)
 
 
 def test_the_re_link_request_refuses_a_post_no_page_of_this_app_rendered(console):

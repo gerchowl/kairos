@@ -158,8 +158,19 @@ def _valid_timezone(tz: str) -> bool:
 # So the bound is *here*, before the loop, not in a size check after it: the cap in
 # `capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL` refuses a poll that is too big, but a
 # check that runs once the list exists cannot bound what building the list costs.
-# These two numbers make one loop iteration per minute of the window at worst, so
-# the loop is bounded by the day: 1440 iterations, 1440 slots, one date.
+# These two numbers make one loop iteration per minute of the window at worst, so a
+# single date is bounded by the day — 1440 iterations, 1440 slots.
+#
+# **Per date is not enough, and that was the second version of this bug.** The grid
+# is `dates × per-date iterations`, `dates` is an uncapped repeated field, and
+# Starlette's `max_fields` ceiling caps *fields*, not slots. So one 17 KB body with
+# 992 dates and a one-minute increment is 1.4 million slot dicts from a request with
+# no credential. Measured on the pre-fix tree at sixteen concurrent: **+2.2 GB**,
+# truncated only by the 2.5 GB address-space cap I put on that server to spare the
+# machine (~6 GB uncapped, per the review that found it), every request returning 400
+# "too large" afterwards and `/health` answering 200 throughout. The refusal arrived
+# after the memory was spent. Hence the product is checked before the loop, below,
+# from the same arithmetic the loop performs. After the fix, the same burst: **+4 MB**.
 MIN_INCREMENT_MINUTES = 1
 MAX_INCREMENT_MINUTES = 1440
 
@@ -219,14 +230,36 @@ def _expand_time_slots(form, dates) -> tuple[list[dict], str | None]:
             f"{MIN_INCREMENT_MINUTES} and {MAX_INCREMENT_MINUTES}."
         )
 
+    # **The product, before any of it exists.** Two facts about this loop that are
+    # easy to hold one at a time and impossible to hold separately:
+    #
+    #   * `per_date` is the loop's own arithmetic — `(t_end - t_start) // increment`
+    #     is exactly how many whole steps fit, which is how many times the `while`
+    #     below runs. No float, no estimate, and no second copy of the rule to drift
+    #     out of step with it.
+    #   * `n_dates` counts what the loop actually iterates, not what the body
+    #     contained: the loop skips empty fields, so counting those would refuse a
+    #     submission the loop was going to answer "At least one date is required".
+    #
+    # So `n_dates * per_date` is not an upper bound on the slots, it *is* the slot
+    # count this input produces, and asking `capability` whether that is allowed
+    # costs one integer multiplication. That is the entire fix: the grid below is
+    # only ever built when its size is already known to be acceptable.
+    n_dates = sum(1 for date in dates if date)
+    per_date = (t_end - t_start) // timedelta(minutes=increment)
+    refusal = capability.slot_cap_refusal(n_dates * per_date, n_dates)
+    if refusal:
+        return [], refusal
+
     slots = []
     for date in dates:
         if not date:
             continue
         t = t_start
-        # Bounded by construction now: `increment >= 1` means `t` advances every
-        # iteration and the window is at most a day, so this is at most
-        # MAX_INCREMENT_MINUTES iterations per date.
+        # Bounded twice over now, and the first bound is the load-bearing one:
+        # `increment >= 1` means `t` advances every iteration (so the `while`
+        # terminates at all), and `n_dates * per_date <= the cap` above means the
+        # list cannot exceed what was just checked.
         while t + timedelta(minutes=increment) <= t_end:
             t_next = t + timedelta(minutes=increment)
             slots.append({
