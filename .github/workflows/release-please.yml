@@ -3,6 +3,15 @@
 # (CI/Pages run on push; the duplet consumer bumps the tag pin manually).
 # One repo setting is required: Settings -> Actions -> General ->
 # "Allow GitHub Actions to create and approve pull requests".
+#
+# #59 — all release config lives in release-please-config.json, NOT in the
+# `with:` block below. That is a load-bearing constraint, not a style choice:
+# release-please-action picks Manifest.fromConfig() whenever the `release-type`
+# input is set, and that path never reads release-please-config.json at all. An
+# `extra-files` entry (the uv.lock version bump) added to the config file while
+# `release-type: python` stayed here would be silently ignored, and the next
+# release would again fail the image build on `uv sync --locked`. Remove
+# `release-type` before you add release configuration anywhere.
 name: release-please
 on:
   push:
@@ -16,5 +25,7 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v5
         with:
-          release-type: python
-          package-name: kairos-scheduler
+          # Named explicitly (they are the action's defaults) so it is obvious
+          # that this step reads config rather than carrying it. See the header.
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

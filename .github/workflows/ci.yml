@@ -13,6 +13,33 @@ jobs:
       - name: Test suite (incl. real SQLite e2e lifecycle)
         run: uv run pytest tests -q
 
+  lockfile:
+    # #59 — uv.lock records the *project* version as well as the dependency
+    # closure, so it has to move with pyproject.toml on every release. It is not
+    # a cache: the Dockerfile's `uv sync --locked` refuses to build when the two
+    # disagree, which is how the 0.10.0 release PR failed its `image` job.
+    #
+    # That guarantee is worth keeping — --locked pins the installed set to the
+    # lockfile instead of re-resolving at build time, so a stale lock fails
+    # loudly rather than shipping an unaudited tree (see Dockerfile, and the
+    # `audit` job below). The gap was never `--locked`; it was that nothing ran
+    # on the PR that introduced the skew. The `tests` job cannot cover it:
+    # `uv run` there re-locks before pytest starts, so it silently repairs the
+    # file it is supposed to be checking. Hence a separate job that never
+    # re-locks.
+    #
+    # `uv lock --check` asserts the lockfile is current, and it treats the
+    # project-version field as part of that — verified on uv 0.11: bumping only
+    # pyproject's version fails it exactly as adding a dependency does. So one
+    # command covers both halves: the #59 skew and genuine dependency drift.
+    # (`--frozen` would cover neither: it installs from the lockfile without
+    # asserting currency, which is precisely why CI never noticed.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - run: uv lock --check
+
   quickstart:
     # Executes the README quickstart verbatim against the built wheel:
     # boot with SQLite + demo auth, then exercise the live HTTP surface.
