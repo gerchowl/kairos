@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/gerchowl/kairos/compare/v0.13.0...v0.13.1) (2026-10-04)
+
+
+### Documentation
+
+* refresh HANDOFF.md and epic [#38](https://github.com/gerchowl/kairos/issues/38) after [#68](https://github.com/gerchowl/kairos/issues/68) and [#72](https://github.com/gerchowl/kairos/issues/72) land ([2c00a34](https://github.com/gerchowl/kairos/commit/2c00a349f4daa93a685afebf6f2d32d253f06226))
+
 ## [0.13.0](https://github.com/gerchowl/kairos/compare/v0.12.0...v0.13.0) (2026-10-04)
 
 
