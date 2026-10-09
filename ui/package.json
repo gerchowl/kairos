@@ -6,10 +6,10 @@
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",
-    "daisyui": "^5.7.46",
+    "daisyui": "^5.7.47",
     "tailwindcss": "^4.1.0"
   },
   "dependencies": {
-    "tabulator-tables": "^6.5.3"
+    "tabulator-tables": "^6.6.1"
   }
 }
