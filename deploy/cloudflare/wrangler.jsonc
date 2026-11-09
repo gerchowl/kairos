@@ -1,0 +1,56 @@
+// Cloudflare Python Worker + Durable Object (SQLite) deployment for Kairos.
+// Spike config (#54). workers.dev subdomain, no custom domain.
+{
+    "name": "kairos",
+    "main": "src/entry.py",
+    // Pinned pre-2026-09-08 so `python_workers_314` is OFF: the runtime shipped
+    // under python_workers_314 patches pydantic_core.validate_core_schema (a
+    // symbol pydantic-core dropped at 2.35 and never restored), and the current
+    // pyodide-314 wheels are 2.41.5. The 3.13-era runtime pairs with pyodide
+    // 0.28.3 (pydantic-core 2.27.2), which still exports the symbol — so the
+    // patch is applied and the bundle imports cleanly.
+    "compatibility_date": "2026-09-07",
+    "compatibility_flags": ["python_workers"],
+    "observability": {
+        "enabled": true
+    },
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "KAIROS_DO",
+                "class_name": "KairosDO"
+            }
+        ]
+    },
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": ["KairosDO"]
+        }
+    ],
+    "assets": {
+        "directory": "./public",
+        "binding": "ASSETS",
+        // Route every request through the Worker so FastAPI can decide — the
+        // Worker falls back to env.ASSETS.fetch() for /static/* explicitly.
+        "run_worker_first": true
+    },
+    "vars": {
+        // Spike runs KAIROS_AUTH=demo (one shared virtual user), not
+        // `capability`. Capability mode requires outbound mail to deliver the
+        // manage link — this spike has mail off — so create_accountless_poll()
+        // refuses before it ever touches the DB. Demo mode exercises the same
+        // DO-SQLite backend, the same ASGI pipeline and the same dashboard,
+        // without pretending to deliver mail. The real hosted deployment needs
+        // KAIROS_AUTH=capability plus a mail provider (#34), noted in the PR.
+        "KAIROS_AUTH": "demo",
+        "KAIROS_BRAND": "Kairos (spike)",
+        "KAIROS_POLL_REACH": "scoped",
+        "KAIROS_RATE_LIMIT": "off",
+        "KAIROS_IMIP": "off",
+        "KAIROS_FEED": "off",
+        "KAIROS_DB_URL": "do-sqlite:///kairos"
+    }
+    // SESSION_SECRET is set via `wrangler secret put SESSION_SECRET`
+    // (generated with `openssl rand -hex 32`) — never commit it.
+}
