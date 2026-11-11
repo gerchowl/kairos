@@ -877,7 +877,7 @@ def _handle_method(method: str, params: Any, request_id: Any, principal: dict | 
             return _jsonrpc_result(request_id, tool_result)
         if is_notification:
             return None
-        return _jsonrpc_error(METHOD_NOT_FOUND, f"Unknown method: {method}", request_id)
+        return _jsonrpc_error(METHOD_NOT_FOUND, f"Unknown method: {method!r}", request_id)
     except RateLimited as exc:
         # Protocol-level: transport refused. One envelope shape regardless of
         # which method tripped the budget.
@@ -914,6 +914,24 @@ def _valid_jsonrpc_id(value: Any) -> bool:
             return False
         return True
     return False
+
+
+def _valid_utf8_strings(value: Any) -> bool:
+    """Check JSON string values and keys without consuming Python's recursion limit."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return True
 
 
 def _validate_envelope(message: Any) -> tuple[bool, dict | None]:
@@ -956,6 +974,10 @@ def _validate_envelope(message: Any) -> tuple[bool, dict | None]:
                 "id must be a non-null string or finite number",
                 None,
             )
+    if not _valid_utf8_strings({k: v for k, v in message.items() if k != "params"}):
+        return False, _jsonrpc_error(INVALID_REQUEST, "request strings must be valid UTF-8", safe_id)
+    if not _valid_utf8_strings(message.get("params")):
+        return False, _jsonrpc_error(INVALID_PARAMS, "params strings must be valid UTF-8", safe_id)
     return True, None
 
 
