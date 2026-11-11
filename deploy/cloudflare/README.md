@@ -51,8 +51,15 @@ SQLite is reached through a third backend in `kairos.dbconn` (see
 ## Deploy
 
 ```sh
-npx wrangler@4 deploy
+bash scripts/deploy.sh
 ```
+
+It runs `vendor.sh`, refuses if `src/kairos` holds merge-conflict markers, dry-runs
+the build and refuses unless the gzip size is inside 2000–3000 KiB, and only then
+deploys. Don't chain `vendor.sh` and `wrangler deploy` by hand: a failed vendor step
+once shipped a 452 KiB partial bundle, and the site was down until
+`npx wrangler@4 rollback <version-id>` restored it (`npx wrangler@4 deployments list`
+shows the version ids).
 
 Expected output names the live URL (a workers.dev subdomain under your
 account). The Worker's default route is the only one; no custom domain for
