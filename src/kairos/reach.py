@@ -387,7 +387,28 @@ def _refuse_key(principal: dict, poll_id: str) -> None:
     never told about cannot plan, and an operator cannot debug a grant they never
     wrote. Never names the key — only its digest, in the log line, on the same rule
     every other credential in this app follows.
+
+    **Owner tokens get their own wording** (PR #85 round-F). The env-key text ends
+    with "ask the operator (KAIROS_API_KEYS, '~<poll-id>')", which is advice the
+    owner of an owner-minted token cannot act on: nothing in the env file governs
+    this credential, and no operator-side grant is going to make it reach another
+    owner's poll. The whole point of #82 is that a token is bounded to its minter's
+    own polls, so the 403 says exactly that -- the correct recovery is "mint a
+    token for the right account", not "nag the operator".
     """
+    if principal.get("source") == "owner_token":
+        owner = principal.get("uid") or "?"
+        log.warning(
+            "owner-token %s (owner=%s) may not reach poll %s",
+            principal.get("key_id", "?"), owner, poll_id,
+        )
+        raise HTTPException(
+            403,
+            f"This token acts for {owner} and reaches only that owner's polls. "
+            f"Poll {poll_id} belongs to another owner, so a token minted for "
+            f"{owner} cannot read it -- mint a token under that owner's account "
+            f"(the panel at /tokens) instead.",
+        )
     grant = grant_for(principal)
     held = "every poll" if grant is EVERY_POLL else ", ".join(sorted(grant)) or "no polls"
     log.warning("key %s may not reach poll %s (reach: %s)", principal.get("key_id", "?"), poll_id, held)

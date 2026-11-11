@@ -327,6 +327,12 @@ def _principal_from_row(row: dict) -> Principal:
         # a static grant is neither necessary nor correct here — a per-poll
         # frozenset would go stale the moment the owner creates another poll.
         polls=frozenset(),
+        # Carried for `/whoami`'s owner-token shape (PR #85 round-F): when an
+        # agent asks what it holds, a wall-clock answer is the thing that
+        # tells it "re-mint tomorrow". `_parse_dt` across both dialects so the
+        # value is a comparable `datetime`; `resolve_token` has already proved
+        # it is live, so this is always a future instant.
+        expires_at=_parse_dt(row.get("expires_at")),
     )
 
 

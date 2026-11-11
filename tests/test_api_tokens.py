@@ -1132,3 +1132,232 @@ def test_env_keys_are_unaffected_by_panel_unavailability(client, monkeypatch):
     monkeypatch.setattr(settings, "AUTH_MODE", "capability")
     r = as_bearer(client, LEGACY).get("/scheduler/api/whoami")
     assert r.status_code == 200, r.text
+
+
+# ===========================================================================
+# PR #85 round-F review. Two gaps surfaced after the Round-2 land:
+#
+# 1. Web-route IDOR mirror. A reviewer mutated `web.update_participant` to
+#    swap the path's poll_id for the child row's own `poll_id` -- re-opening
+#    the cross-poll edit on the web surface -- and the full suite stayed
+#    green. The Round-2 IDOR tests cover the API routes; these cover the web
+#    POST routes (/polls/{poll_id}/participants/update and /remove) so the
+#    same mutation is caught the next time around. On shipped code the
+#    data-layer guard (`WHERE id = %s AND poll_id = %s`) turns a cross-poll
+#    ref into rowcount 0; under the mutation it writes to bob's row.
+#
+# 2. Owner-token discoverability. 08377d5's 403 told the caller to "ask the
+#    operator (KAIROS_API_KEYS, '~<poll-id>')" and `/whoami` reported
+#    `polls: []` / `reach_policy: open`. Both describe env-keyring keys
+#    (operator-owned, static-grant); neither applies to an owner-minted
+#    token, whose reach is "its owner's polls" and whose recovery is "mint
+#    under the right account". Env-key shape stays byte-identical -- #63's
+#    pinned tests still assert on `polls` / `reach_policy`.
+# ===========================================================================
+
+
+# -- Round-F Finding #1: web-route IDOR mirror ------------------------------
+
+
+def _seed_two_owner_polls(client, monkeypatch):
+    """Alice and Bob each own one poll on a fresh DB; bob's poll has one
+    invite and one response for alice's /participants/* POSTs to try to
+    reach.
+
+    Seeded directly at the data layer -- this is about the web POST's
+    IDOR behaviour, not poll creation -- and under the default (OPEN) reach
+    policy, because the IDOR exists on the web surface regardless of reach:
+    the authorization step in `_owner_action` has already passed on the
+    path poll_id (alice owns alice's poll), the IDOR is one column deeper.
+    """
+    from kairos.db import add_response, create_invite, create_poll
+    monkeypatch.setattr(settings, "POLL_REACH", "")
+    monkeypatch.setenv("KAIROS_POLL_REACH", "")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", False)
+    alice_poll = create_poll(OWNER_A, "alice's", None, "full_day", "UTC",
+                             [{"date": "2026-08-01"}], owner_id=OWNER_A)
+    bob_poll = create_poll(OWNER_B, "bob's", None, "full_day", "UTC",
+                           [{"date": "2026-08-01"}], owner_id=OWNER_B)
+    bob_invite = create_invite(bob_poll["id"], "bob-invitee@example.org",
+                               required=True, name="Bob's Guest")
+    bob_response = add_response(bob_poll["id"], "Bob Respondent",
+                                "bob-resp@example.org", {})
+    return alice_poll, bob_poll, bob_invite, bob_response
+
+
+def _alice_csrf():
+    """CSRF bound to alice's uid -- the shape `require_csrf(user, form)`
+    expects on a signed-in header-mode request."""
+    from kairos.csrf import make_csrf
+    return make_csrf(OWNER_A)
+
+
+def test_web_participants_update_leaves_cross_poll_invite_untouched(
+    client, monkeypatch
+):
+    """Alice signed in, POST to her own poll's /participants/update with
+    bob's invite id in the form. The data-layer guard answers rowcount 0;
+    bob's invite row is byte-for-byte what it was before the POST.
+
+    Fails on the mutation `update_invite(invite_row.poll_id, ref, ...)`:
+    the WHERE then matches bob's row and `email`/`name`/`required` are all
+    overwritten.
+    """
+    alice_poll, bob_poll, bob_invite, _ = _seed_two_owner_polls(client, monkeypatch)
+    as_owner(client, OWNER_A)
+    r = client.post(
+        f"/scheduler/polls/{alice_poll['id']}/participants/update",
+        data={"csrf": _alice_csrf(), "kind": "invite", "ref": bob_invite["id"],
+              "name": "pwned", "email": "pwned@example.org", "optional": "on"},
+        follow_redirects=False,
+    )
+    # The route still answers 302 ?msg=updated on rowcount 0 -- "mismatch
+    # reads as no-such-row" is the contract. What the test checks is the
+    # row itself.
+    assert r.status_code == 302, r.text
+    from kairos.db import get_invites
+    [row] = [i for i in get_invites(bob_poll["id"]) if i["id"] == bob_invite["id"]]
+    assert row["email"] == "bob-invitee@example.org"
+    assert row["name"] == "Bob's Guest"
+    # `optional="on"` would have flipped `required` to False under the mutation;
+    # the shipped code's WHERE excludes bob's row, so the original stays True.
+    assert bool(row["required"]) is True
+
+
+def test_web_participants_update_leaves_cross_poll_response_untouched(
+    client, monkeypatch
+):
+    """Same cross-poll IDOR, kind=response. Bob's response lives on bob's
+    poll; alice's /participants/update on her own poll must not reach it.
+    """
+    alice_poll, bob_poll, _, bob_response = _seed_two_owner_polls(client, monkeypatch)
+    as_owner(client, OWNER_A)
+    r = client.post(
+        f"/scheduler/polls/{alice_poll['id']}/participants/update",
+        data={"csrf": _alice_csrf(), "kind": "response", "ref": bob_response["id"],
+              "name": "pwned", "email": "pwned@example.org"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 302, r.text
+    from kairos.db import find_response_by_email
+    row = find_response_by_email(bob_poll["id"], "bob-resp@example.org")
+    assert row is not None, "bob's response disappeared on an alice-path POST"
+    assert row["respondent_name"] == "Bob Respondent"
+    assert row["respondent_email"] == "bob-resp@example.org"
+
+
+def test_web_participants_remove_leaves_cross_poll_invite_in_place(
+    client, monkeypatch
+):
+    """Alice signed in, POST to her own poll's /participants/remove with
+    bob's invite id. `delete_invite` carries the same IDOR guard as
+    `update_invite`, so the row stays. Fails on the parallel mutation that
+    swaps the path's poll_id for the invite row's own poll_id in the DELETE.
+    """
+    alice_poll, bob_poll, bob_invite, _ = _seed_two_owner_polls(client, monkeypatch)
+    as_owner(client, OWNER_A)
+    r = client.post(
+        f"/scheduler/polls/{alice_poll['id']}/participants/remove",
+        data={"csrf": _alice_csrf(), "kind": "invite", "ref": bob_invite["id"]},
+        follow_redirects=False,
+    )
+    assert r.status_code == 302, r.text
+    from kairos.db import get_invites
+    assert any(i["id"] == bob_invite["id"] for i in get_invites(bob_poll["id"])), (
+        "bob's invite was deleted by an alice-path remove"
+    )
+
+
+def test_web_participants_remove_leaves_cross_poll_response_in_place(
+    client, monkeypatch
+):
+    """Alice signed in, POST to /participants/remove with bob's response
+    id. `delete_response`'s SELECT-then-DELETE guards the parent-poll match;
+    bob's response survives.
+    """
+    alice_poll, bob_poll, _, bob_response = _seed_two_owner_polls(client, monkeypatch)
+    as_owner(client, OWNER_A)
+    r = client.post(
+        f"/scheduler/polls/{alice_poll['id']}/participants/remove",
+        data={"csrf": _alice_csrf(), "kind": "response", "ref": bob_response["id"]},
+        follow_redirects=False,
+    )
+    assert r.status_code == 302, r.text
+    from kairos.db import get_response
+    assert get_response(bob_response["id"]) is not None, (
+        "bob's response was deleted by an alice-path remove"
+    )
+
+
+# -- Round-F Finding #2: owner-token discoverability -----------------------
+
+
+def test_the_owner_token_403_describes_the_owner_not_the_operator(
+    client, monkeypatch
+):
+    """Round-F finding #2: the 403 wording on 08377d5 pointed at
+    `KAIROS_API_KEYS` -- an env-file knob no owner-token user can act on --
+    and claimed the token reaches "no polls", which is the opposite of
+    what the panel told the owner at mint time. The fix names the owner
+    the token acts for and says the right recovery (mint under the right
+    account).
+
+    Verified under `scoped` reach, where the refusal is unambiguous: bob's
+    token tries to read alice's poll.
+    """
+    monkeypatch.setattr(settings, "POLL_REACH", "scoped")
+    plain_a, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    plain_b, _ = apitokens.mint(OWNER_B, "b", ["polls:read"], 3600)
+    r = as_bearer(client, plain_a).post("/scheduler/api/polls", json={
+        "title": "alice's", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    poll_id = r.json()["id"]
+    r = as_bearer(client, plain_b).get(f"/scheduler/api/polls/{poll_id}")
+    assert r.status_code == 403, r.text
+    body = r.text
+    # The owner this token acts for is named, so a caller knows what to do.
+    assert OWNER_B in body
+    # And env-key-only advice is absent -- the pre-fix wording's whole point.
+    assert "KAIROS_API_KEYS" not in body
+    assert "ask the operator" not in body.lower()
+    # And the credential itself never appears in the response.
+    assert plain_b not in body
+
+
+def test_whoami_describes_an_owner_token_truthfully(client):
+    """Round-F finding #2: `/whoami` on an owner token now reports what the
+    token is (`kind: "owner_token"`), who it acts for (`owner`), what it
+    reaches in words (`reach: "own polls"` -- a per-mint poll list would go
+    stale the moment the owner creates another), when it expires
+    (`expires_at`), and which scopes it holds. The misleading `polls: []` /
+    `reach_policy: open` fields are not emitted for this shape.
+    """
+    plain, _ = apitokens.mint(OWNER_A, "t", ["polls:read", "polls:write"], 3600)
+    body = as_bearer(client, plain).get("/scheduler/api/whoami").json()
+    assert body["kind"] == "owner_token"
+    assert body["owner"] == OWNER_A
+    assert body["reach"] == "own polls"
+    assert sorted(body["scopes"]) == ["polls:read", "polls:write"]
+    assert body["key_id"]
+    # expires_at is a future ISO instant.
+    assert body["expires_at"], body
+    parsed = datetime.fromisoformat(body["expires_at"])
+    assert parsed > datetime.utcnow()
+    # The env-key fields that read wrong for a token are absent in this shape.
+    assert "polls" not in body
+    assert "reach_policy" not in body
+
+
+def test_env_key_whoami_shape_is_byte_identical(client):
+    """The env-keyring / legacy env-key shape is unchanged by the owner-token
+    branch. `test_poll_reach.py` pins the shape for scoped/open deployments;
+    this asserts the same contract on this file so the owner-token branch
+    cannot silently regress the env-key answer.
+    """
+    body = as_bearer(client, LEGACY).get("/scheduler/api/whoami").json()
+    assert set(body) == {"scopes", "key_id", "tier", "polls", "reach_policy"}
+    assert body["polls"] == "*"  # legacy key reaches every poll.
+    # The owner-token-only fields are absent on this shape.
+    for k in ("kind", "owner", "reach", "expires_at"):
+        assert k not in body

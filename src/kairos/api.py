@@ -216,7 +216,28 @@ def whoami(user: dict = Depends(api_scope())):
     cannot plan, so the capabilities are readable over the API rather than only
     documented in an operator's env file. Reports the key's digest, never the
     key, and only what this key holds — not the whole vocabulary.
+
+    **Two shapes, one endpoint** (PR #85 round-F). Env-keyring / legacy env
+    keys keep the exact #63 shape — `scopes`, `key_id`, `tier`, `polls`,
+    `reach_policy` — byte-for-byte, because the whole-poll-list field is what
+    a scoped operator credential has to report (an agent that holds `~p1,~p2`
+    needs to see those two ids). Owner-minted tokens (`source == "owner_token"`)
+    report the truthful version: `kind`, `owner`, `scopes`, `key_id`, `reach`
+    (the words "own polls" — a per-mint poll list would go stale the moment
+    the owner creates another), and `expires_at` so an agent can plan its
+    re-mint. The field names differ deliberately so a client cannot read the
+    owner-token answer as if it were an env-key answer.
     """
+    if user.get("source") == "owner_token":
+        expires_at = user.get("expires_at")
+        return {
+            "kind": "owner_token",
+            "owner": user["uid"],
+            "scopes": sorted(user["scopes"]),
+            "key_id": user["key_id"],
+            "reach": "own polls",
+            "expires_at": expires_at.isoformat() if expires_at else None,
+        }
     reached = reach.reached_by(user)
     return {"scopes": sorted(user["scopes"]), "key_id": user["key_id"],
             "tier": user.get("tier"),
