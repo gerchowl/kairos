@@ -440,3 +440,275 @@ def test_invite_rejects_fake_email(client, owner, monkeypatch):
     r = client.post("/scheduler/polls/p1/invite",
                     data={"email": "Real.Person@example.org"}, follow_redirects=False)
     assert r.status_code == 302
+
+
+
+# -- Issue #88: public voting lives under /p/, the root stays clean --
+#
+# Two regression guards for the proxy contract the README's "Protecting owner
+# pages with a reverse proxy" section rests on: (1) every public-link
+# generator emits the `{P}/p/...` form, so a bypass policy on `/p` covers
+# every share link, and (2) no root-level catch-all exists that would turn
+# `/scheduler/<anything>` into a 301 — such a catch-all would 301 unknown
+# pages (which the client caches forever), silently rewrite POSTs to
+# GET-only routes (`POST /scheduler/health` -> `/scheduler/p/health`), and
+# make a `host/*` Cloudflare Access bypass unsafely cover the owner surface.
+
+
+def test_no_root_catch_all_shadows_literal_or_fabricates_redirects():
+    """The app must NOT register a greedy `/{token}` (or `/{token}/event.ics`,
+    or POST `/{token}`) at the root of the prefix. Three failure modes we are
+    guarding against: a bogus GET at the root path 301s to `/p/<bogus>`
+    (confuses CDN caches and SEO), a POST to an unknown root path 307s to
+    `/p/...` (silently rewrites a method a GET-only literal should 405 for),
+    and a GET `/foo.ics` 301s to `/p/foo.ics` (makes the proxy's bypass
+    policy on `/p` accidentally relevant to root paths).
+
+    Enumerated here so a future PR that re-introduces a catch-all under the
+    prefix root (however well-intentioned) breaks this test. A later route
+    that lives under `/p/...`, `/v/...`, `/api/...` is fine -- the probes
+    below only hit the bare root of the prefix.
+    """
+    probe = TestClient(main.app, base_url="https://testserver",
+                       raise_server_exceptions=False)
+
+    # Bogus one-segment root paths. Each one must either answer itself (a
+    # literal route that happens to share the name -- 200, 401, 404, 405...)
+    # or 404 -- never a 301/307 to `{P}/p/<name>`.
+    bogus = [
+        ("GET", "/scheduler/does-not-exist-abc"),
+        ("GET", "/scheduler/favicon.ico"),
+        ("GET", "/scheduler/does-not-exist-abc/event.ics"),
+        ("POST", "/scheduler/does-not-exist-abc"),
+    ]
+    for method, path in bogus:
+        resp = probe.request(method, path, follow_redirects=False)
+        loc = resp.headers.get("location", "")
+        assert not (resp.status_code in (301, 307) and loc.startswith("/scheduler/p/")), (
+            f"{method} {path} is being swallowed by a root catch-all: "
+            f"status={resp.status_code} location={loc} -- a bypass on `/p` "
+            f"must not reach arbitrary root paths through a redirect."
+        )
+        # And a truly unknown one-segment path must 404 -- not 200, not 405.
+        assert resp.status_code == 404, (
+            f"{method} {path} answered {resp.status_code}; an unknown root "
+            f"path must 404 so the reverse proxy's path-prefix policy stays "
+            f"meaningful (no catch-all under the prefix root)."
+        )
+
+
+def test_literal_single_segment_routes_answer_themselves():
+    """Walking the live route table, every literal single-segment path
+    registered under the prefix answers itself (never a redirect built from
+    its name). If a future PR adds a root catch-all that swallows these,
+    this test fails together with the one above.
+
+    Enumerated below (not just inferred from the walk) so a new literal
+    someone forgets to register also shows up here.
+    """
+    def _walk(router):
+        # This FastAPI version keeps `include_router` as an `_IncludedRouter`
+        # wrapper rather than flattening, so a plain `app.routes` walk finds
+        # no endpoints under included routers (identical pattern to the
+        # route-audit in tests/test_ratelimit.py).
+        for route in getattr(router, "routes", []):
+            inner = getattr(route, "original_router", None)
+            if inner is not None:
+                yield from _walk(inner)
+            elif getattr(route, "routes", None):
+                yield from _walk(route)
+            else:
+                yield route
+
+    literals = set()
+    for route in _walk(main.app):
+        path = getattr(route, "path", None) or ""
+        if type(route).__name__ == "Mount":
+            # The /static mount matches by prefix; it is not a single-segment
+            # literal and is probed separately below.
+            continue
+        if not path.startswith("/scheduler"):
+            continue
+        rest = path[len("/scheduler"):].lstrip("/")
+        if "/" in rest or "{" in rest:
+            continue
+        for method in getattr(route, "methods", {"GET"}) - {"HEAD"}:
+            literals.add((method, path))
+
+    expected = {
+        ("GET", "/scheduler/"),              # dashboard
+        ("GET", "/scheduler/new"),           # new poll page
+        ("POST", "/scheduler/new"),          # create poll submit
+        ("GET", "/scheduler/manage"),        # capability console entry
+        ("GET", "/scheduler/tokens"),        # owner API-token panel
+        ("POST", "/scheduler/tokens"),       # mint owner token
+        ("GET", "/scheduler/login"),         # OIDC sign-in page
+        ("GET", "/scheduler/health"),        # liveness/readiness probe
+        ("GET", "/scheduler/llms.txt"),      # agent discovery
+        ("GET", "/scheduler/robots.txt"),    # crawler policy
+    }
+    assert expected <= literals, f"missing literal routes: {sorted(expected - literals)}"
+
+    probe = TestClient(main.app, base_url="https://testserver",
+                       raise_server_exceptions=False)
+    for method, path in sorted(literals):
+        if method != "GET":
+            # GET is enough to show the route answers itself. POST literals
+            # (`/new`, `/tokens`) would need CSRF and are covered by the
+            # route-table enumeration above.
+            continue
+        resp = probe.request(method, path, follow_redirects=False)
+        # A literal route may answer 200, 401, 404, 503, ... -- the one answer
+        # it must never give is "301/307 -> /scheduler/p/<name>".
+        loc = resp.headers.get("location", "")
+        assert not (resp.status_code in (301, 307) and loc.startswith("/scheduler/p/")), (
+            f"{method} {path} is shadowed by a root catch-all: "
+            f"status={resp.status_code} location={loc}"
+        )
+
+
+def test_static_mount_serves_assets(client):
+    """Static assets serve under `/static/...`. Not directly about #88 --
+    sanity-checks that the mount isn't accidentally broken by a future root
+    change (a catch-all or a middleware)."""
+    r = client.get("/scheduler/static/grid.js", follow_redirects=False)
+    assert r.status_code == 200
+    assert "javascript" in r.headers["content-type"]
+
+
+# -- Issue #88: every public-link generator emits the /p/ form --
+
+def test_no_public_link_generator_emits_root_token_form():
+    """Audit every generator of a public poll URL -- email body, poll page,
+    ICS feed/attachment, iMIP REQUEST, agent.json, llms.txt -- and assert
+    none produces a bare `{base}/<token>` link. One regression here (a
+    template, a forgotten f-string) is how share links drift back to the
+    root and the proxy policy stops covering them.
+
+    This is the pair of `test_no_root_catch_all_shadows_literal_or_fabricates_
+    redirects`: together they say "every link is `/p/<token>`, and the root
+    is reserved for owner pages -- no redirect, no catch-all, no drift."""
+    from datetime import date as _date
+    from datetime import time as _time
+
+    from kairos import email_service, templating
+    from kairos import ics as ics_mod
+
+    base = "https://x.example"
+    prefix = "/scheduler"
+    tok = "TOKENabcXYZ"
+    inv = "INVITEabc"
+    public_url = f"{base}{prefix}/p/{tok}"
+    invite_url = f"{base}{prefix}/p/i/{inv}"
+
+    poll = {
+        "id": "p1", "title": "Retreat", "description": "d",
+        "mode": "time_slot", "timezone": "Europe/Zurich",
+        "status": "open", "decided_slot_id": None, "public_token": tok,
+    }
+    slot = {"id": "s1", "date": _date(2026, 6, 8),
+            "start_time": _time(9, 0), "end_time": _time(9, 30)}
+
+    def forbid_root_form(blob: str, label: str, *, token: str = tok) -> None:
+        """A bare `{base}{prefix}/<token>` that is NOT the leading substring
+        of `{base}{prefix}/p/<token>` is the regression we are catching."""
+        bad = f"{base}{prefix}/{token}"
+        good = f"{base}{prefix}/p/{token}"
+        idx = 0
+        while True:
+            j = blob.find(bad, idx)
+            if j < 0:
+                break
+            if blob[j: j + len(good)] == good:
+                # It IS the /p/ form -- skip past the whole `good` match.
+                idx = j + len(good)
+                continue
+            raise AssertionError(
+                f"{label}: root-level token link `{bad}` appeared "
+                f"(context: ...{blob[max(0, j - 30):j + len(bad) + 30]!r}...)"
+            )
+        assert good in blob or f"{base}{prefix}/p/i/{inv}" in blob, (
+            f"{label}: neither `{good}` nor the invite form appears"
+        )
+
+    # 1. Decided-event ICS (the one attached to the "we picked a date" email).
+    # RFC 5545 folds lines at 75 octets with `\r\n ` continuation, so unfold
+    # before substring checks for every ICS body.
+    def _unfold(ics_text: str) -> str:
+        return ics_text.replace("\r\n ", "").replace("\r\n\t", "")
+
+    decided = dict(poll, status="decided", decided_slot_id="s1")
+    decided_ics = _unfold(ics_mod.build_ics(decided, slot, public_url))
+    forbid_root_form(decided_ics, "build_ics / decided .ics URL")
+
+    # 2. Reverse-calendar candidate feed (every open-poll subscribe).
+    feed = _unfold(ics_mod.build_feed_ics(decided, [slot], [], base_url=base,
+                                          prefix=prefix, total_expected=0))
+    forbid_root_form(feed, "build_feed_ics / candidate feed")
+
+    # 3. Invite feed with deep-link vote URLs.
+    inv_feed = _unfold(ics_mod.build_feed_ics(decided, [slot], [], base_url=base,
+                                              prefix=prefix, invite_token=inv,
+                                              total_expected=0))
+    forbid_root_form(inv_feed, "build_feed_ics / invite feed")
+    for av in ("yes", "maybe", "no"):
+        assert f"{prefix}/p/i/{inv}/s/s1/{av}" in inv_feed
+
+    # 4. iMIP REQUEST (the invite .ics mail body).
+    req_ics = _unfold(ics_mod.build_request_ics(
+        decided, slot, "to@x.ch",
+        organizer_email="org@x.ch", organizer_name="Org",
+        url=public_url))
+    forbid_root_form(req_ics, "build_request_ics / iMIP REQUEST")
+
+    # 5. Decision email body (HTML + text). The outer MIMEMultipart("mixed")
+    # wraps a multipart/alternative (text + HTML) plus the .ics attachment;
+    # pull both parts out of the alternative wrapper.
+    dmsg = email_service.build_decision_message(
+        "to@x.ch", "Retreat", "2026-06-08", public_url,
+        "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "Lars", note="", reply_to="l@x.ch")
+    alt = dmsg.get_payload()[0]
+    text_part = alt.get_payload()[0].get_payload(decode=True).decode()
+    html_part = alt.get_payload()[1].get_payload(decode=True).decode()
+    forbid_root_form(text_part, "decision email text")
+    forbid_root_form(html_part, "decision email HTML")
+
+    # 6. Invite email body (multipart/alternative directly; text + HTML).
+    imsg = email_service.build_invite_message("to@x.ch", "Retreat", invite_url,
+                                              "Lars", reply_to="l@x.ch")
+    itext = imsg.get_payload()[0].get_payload(decode=True).decode()
+    ihtml = imsg.get_payload()[1].get_payload(decode=True).decode()
+    forbid_root_form(itext, "invite email text", token=inv)
+    forbid_root_form(ihtml, "invite email HTML", token=inv)
+
+    # 7. agent.json shape (invitee self-describing surface) -- the URLs the
+    # route builds, asserted at the URL-construction site so a regression is
+    # caught here even if the HTTP shape stays the same.
+    vb = f"{base}{prefix}/p/i/{inv}/s/s1"
+    agent_blob = "\n".join([
+        f"{vb}/yes", f"{vb}/maybe", f"{vb}/no",
+        f"webcal://x.example{prefix}/p/i/{inv}/feed.ics",
+    ])
+    forbid_root_form(agent_blob, "agent.json vote/subscribe URLs", token=inv)
+
+    # 8. The poll page itself (the "copy the share link" box).
+    env2 = templating.create_env()
+    rendered = templating.render(
+        env2, "poll.html", title="t", poll=decided, share_url=public_url,
+        user={"uid": "u", "name": "N", "email": "e@x.ch"},
+        now=_date(2026, 6, 8), responses=[], invites=[], contacts={},
+        total=0, pending_n=0, convergence={"state": "collecting"},
+        is_ts=True, ts_payload={"grid": [], "saved": None},
+        decided_label=None, msg=None, csrf_token="c", notif_count=0, notifs=[],
+    ).body.decode()
+    forbid_root_form(rendered, "poll.html share_url")
+
+    # 9. llms.txt -- static agent-discovery doc in main.py.
+    llms_client = TestClient(main.app, base_url="https://x.example")
+    llms_body = llms_client.get("/scheduler/llms.txt").text
+    # llms.txt documents the invitee link shape, so the /p/i/ form must be
+    # mentioned and no bare `{P}/<token>` example may appear.
+    assert "/scheduler/p/i/<token>" in llms_body
+    # A bare `/scheduler/<token>` example in the docs is exactly the kind of
+    # regression that tells agents to use the legacy form.
+    assert "/scheduler/<token>" not in llms_body
