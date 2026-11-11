@@ -84,6 +84,28 @@ SCHEMA = [
         target VARCHAR(512) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""",
+    # Owner-minted API tokens (issue #82). Each row is one bearer credential the
+    # signed-in owner minted from the admin panel, in addition to the static
+    # KAIROS_API_KEY / KAIROS_API_KEYS env grants (#51). Only the sha256 hash of
+    # the token is stored — the plaintext is shown exactly once at mint time —
+    # so a database leak does not disclose working credentials. The `prefix`
+    # column carries the first ~12 chars of the plaintext (`kai_` + 8 random
+    # chars) for a non-sensitive display handle in the panel's list. All columns
+    # are plain SQL so the schema also lands on the Durable-Object SQLite
+    # backend drafted in PR #79: no partial indexes, no JSON columns, no
+    # dialect-specific defaults beyond the shared ones.
+    """CREATE TABLE IF NOT EXISTS sched_api_tokens (
+        id VARCHAR(36) PRIMARY KEY,
+        owner_uid VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        token_hash VARCHAR(64) UNIQUE NOT NULL,
+        prefix VARCHAR(16) NOT NULL,
+        scopes VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        last_used_at TIMESTAMP NULL,
+        revoked_at TIMESTAMP NULL
+    )""",
 ]
 
 
@@ -682,8 +704,21 @@ def create_invite(poll_id: str, email: str, required: bool = True, name: str | N
             "responded": False, "required": required, "name": name}
 
 
-def update_invite(invite_id: str, name: str | None = None, email: str | None = None,
+def update_invite(poll_id: str, invite_id: str, name: str | None = None,
+                  email: str | None = None,
                   required: bool | None = None) -> bool:
+    """Update one invite's contact/required flag, iff it belongs to `poll_id`.
+
+    The `AND poll_id = %s` in the WHERE is the IDOR guard (PR #85 round-2
+    finding): every route that reaches this call has already authorized the
+    `poll_id` path parameter, but the invite id came from the same URL and is
+    not checked against the row's `poll_id` column -- so a route that forgets
+    to pass the parent would turn its own authorized caller into one that may
+    edit any invite on the instance. A mismatch answers exactly like a missing
+    id (rowcount 0, False), so callers that render 404 for "no such invite"
+    render the same 404 for "wrong parent" without a second branch -- and
+    without the existence oracle a 403-vs-404 split would create.
+    """
     sets, params = [], []
     if name is not None:
         sets.append("name = %s")
@@ -698,8 +733,9 @@ def update_invite(invite_id: str, name: str | None = None, email: str | None = N
         return False
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE sched_invites SET {', '.join(sets)} WHERE id = %s",
-                   (*params, invite_id))
+    cursor.execute(
+        f"UPDATE sched_invites SET {', '.join(sets)} WHERE id = %s AND poll_id = %s",
+        (*params, invite_id, poll_id))
     updated = cursor.rowcount > 0
     conn.commit()
     cursor.close()
@@ -707,9 +743,14 @@ def update_invite(invite_id: str, name: str | None = None, email: str | None = N
     return updated
 
 
-def update_response_contact(response_id: str, name: str | None = None,
+def update_response_contact(poll_id: str, response_id: str,
+                            name: str | None = None,
                             email: str | None = None,
                             required: bool | None = None) -> bool:
+    """Update one response's contact/required flag, iff it belongs to `poll_id`.
+
+    Same IDOR guard as `update_invite` -- see that function's docstring.
+    """
     sets, params = [], []
     if name is not None:
         sets.append("respondent_name = %s")
@@ -724,8 +765,9 @@ def update_response_contact(response_id: str, name: str | None = None,
         return False
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE sched_responses SET {', '.join(sets)} WHERE id = %s",
-                   (*params, response_id))
+    cursor.execute(
+        f"UPDATE sched_responses SET {', '.join(sets)} WHERE id = %s AND poll_id = %s",
+        (*params, response_id, poll_id))
     updated = cursor.rowcount > 0
     conn.commit()
     cursor.close()
@@ -753,10 +795,12 @@ def get_invites(poll_id: str) -> list[dict]:
     return invites
 
 
-def delete_invite(invite_id: str) -> bool:
+def delete_invite(poll_id: str, invite_id: str) -> bool:
+    """Delete one invite, iff it belongs to `poll_id`. See `update_invite`."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM sched_invites WHERE id = %s", (invite_id,))
+    cursor.execute("DELETE FROM sched_invites WHERE id = %s AND poll_id = %s",
+                   (invite_id, poll_id))
     deleted = cursor.rowcount > 0
     conn.commit()
     cursor.close()
@@ -764,11 +808,31 @@ def delete_invite(invite_id: str) -> bool:
     return deleted
 
 
-def delete_response(response_id: str) -> bool:
+def delete_response(poll_id: str, response_id: str) -> bool:
+    """Delete one response (and its response_slots), iff it belongs to `poll_id`.
+
+    The belongs-to-poll check is a SELECT, not a WHERE on each DELETE: the
+    response-slots DELETE keys on `response_id` only (its table has no poll_id
+    column, so the FK cascade from the responses row is the only link to a
+    poll), and running it unconditionally for the wrong parent would still
+    wipe the child rows even though the response row itself would not go. The
+    pre-check turns the whole call into a no-op on mismatch, so a caller sees
+    the same rowcount-0 answer as "no such response" -- same IDOR guard as
+    `update_invite`, see that docstring.
+    """
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM sched_responses WHERE id = %s AND poll_id = %s",
+        (response_id, poll_id),
+    )
+    if cursor.fetchone() is None:
+        cursor.close()
+        conn.close()
+        return False
     cursor.execute("DELETE FROM sched_response_slots WHERE response_id = %s", (response_id,))
-    cursor.execute("DELETE FROM sched_responses WHERE id = %s", (response_id,))
+    cursor.execute("DELETE FROM sched_responses WHERE id = %s AND poll_id = %s",
+                   (response_id, poll_id))
     deleted = cursor.rowcount > 0
     conn.commit()
     cursor.close()
@@ -871,3 +935,126 @@ def get_unread_notification_count(user_id: str) -> int:
     cursor.close()
     conn.close()
     return count
+
+
+# -- Owner-minted API tokens (issue #82) ------------------------------------
+#
+# The signed-in owner mints bearer credentials from the admin panel. Only the
+# sha256 hash is stored; the plaintext is shown once at mint time and the
+# `prefix` column carries 12 non-sensitive chars for the panel's list.
+#
+# The write side lives here; the authentication/hashing seam lives in
+# `kairos.apitokens` so the same resolver can back `/api` today and `/mcp`
+# tomorrow (issue #83) without a second DB module to forget.
+
+
+def insert_api_token(token_id: str, owner_uid: str, name: str, token_hash: str,
+                     prefix: str, scopes: str, expires_at, created_at=None) -> None:
+    """Persist one minted token. `expires_at` and (optional) `created_at` are
+    `datetime`s, `scopes` is a comma-joined grant string over `scoping.SCOPES`
+    (validated by the caller).
+
+    `created_at` is written explicitly rather than inheriting the column's
+    `CURRENT_TIMESTAMP` default so every time column on this row is in the
+    same dialect as `dbconn.db_now()` — the comparison `resolve_token` uses
+    for expiry. SQLite's `CURRENT_TIMESTAMP` is UTC and MySQL's is session-
+    local, so a mix of defaulted and Python-computed values would read back as
+    different clocks on MySQL/MariaDB.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    if created_at is None:
+        from kairos.dbconn import db_now
+        created_at = db_now()
+    cursor.execute(
+        "INSERT INTO sched_api_tokens (id, owner_uid, name, token_hash, prefix,"
+        " scopes, created_at, expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (token_id, owner_uid, name, token_hash, prefix, scopes, created_at, expires_at),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def get_api_token_by_hash(token_hash: str) -> dict | None:
+    """The token row for a presented credential's sha256, or None.
+
+    The caller hashed the bearer; this is a straight equality lookup on an
+    indexed (UNIQUE) column, so the query is deterministic and timing-safe at
+    the row level — the only way a lookup differs from a miss is the cost of
+    one hashing pass the caller has already paid. Nothing here compares the
+    plaintext; nothing here can, because the plaintext is not stored.
+
+    Returns the whole row (revoked/expired tokens included); the caller is
+    `kairos.apitokens.resolve_token`, which decides whether each state is a
+    401 and in what wording — the wording is deliberately the same across
+    expired / revoked / not-minted, so a probing caller cannot tell the three
+    apart.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM sched_api_tokens WHERE token_hash = %s", (token_hash,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row
+
+
+def list_api_tokens(owner_uid: str) -> list[dict]:
+    """Every token this owner has minted, newest first. Panel list."""
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM sched_api_tokens WHERE owner_uid = %s ORDER BY created_at DESC",
+        (owner_uid,),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows
+
+
+def revoke_api_token(token_id: str, owner_uid: str) -> bool:
+    """Mark a token revoked, iff it belongs to this owner and is not already revoked.
+
+    The `owner_uid` guard is in SQL rather than in a read-then-write, so an owner
+    cannot revoke someone else's token by guessing an id — the row stays unchanged
+    and the caller gets False. Idempotent on a second click: the second UPDATE
+    matches zero rows (`revoked_at IS NULL` is already false), and the API panel
+    reads that as "already revoked" rather than as a fresh action.
+    """
+    from kairos.dbconn import db_now
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sched_api_tokens SET revoked_at = %s"
+        " WHERE id = %s AND owner_uid = %s AND revoked_at IS NULL",
+        (db_now(), token_id, owner_uid),
+    )
+    conn.commit()
+    revoked = cursor.rowcount > 0
+    cursor.close()
+    conn.close()
+    return revoked
+
+
+def touch_api_token_last_used(token_id: str) -> None:
+    """Stamp `last_used_at = now()` on one row. Not idempotent; the caller throttles.
+
+    Separate from `get_api_token_by_hash` on purpose: the read happens on every
+    authenticated request and is hot; the write happens at most once per minute
+    per token (`kairos.apitokens._should_touch`) and would otherwise be the
+    second SQLite write for every API call — enough to double the surface's
+    write rate at no useful fidelity, since `last_used_at` is only for the
+    panel's "last used" column.
+    """
+    from kairos.dbconn import db_now
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sched_api_tokens SET last_used_at = %s WHERE id = %s",
+        (db_now(), token_id),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()

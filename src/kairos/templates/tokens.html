@@ -1,0 +1,166 @@
+{% extends "scheduler_base.html" %}
+{# Issue #82: owner-minted API tokens — mint form, one-time disclosure of the
+   plaintext, and the list of this owner's tokens. #}
+{% block content %}
+<div class="flex items-end justify-between gap-4 flex-wrap mt-4 mb-3">
+  <div>
+    <h1 class="text-xl font-bold">API tokens</h1>
+    <p class="text-sm opacity-60">Mint bearer credentials to drive Kairos from
+    an agent or script. A token acts as you — polls it creates land on your
+    dashboard, and it can't read other owners' polls.</p>
+  </div>
+</div>
+
+{% if minted_plaintext %}
+{# One-time disclosure. The server renders this page *once* with the plaintext
+   in it and never again: a refresh re-POSTs the form and mints *another* token
+   rather than showing this one again. The display is dismissable so a reader
+   can hide it from a shoulder-surfer; the "copy" button does not log anything. #}
+<div class="alert alert-info shadow-sm my-4" role="status">
+  <div class="w-full">
+    <div class="flex items-center gap-2 mb-2">
+      <span aria-hidden="true">🔑</span>
+      <strong>Your new token — copy it now, it will not be shown again.</strong>
+    </div>
+    <div class="flex gap-2 items-center">
+      <input id="minted-token" type="text" readonly value="{{ minted_plaintext }}"
+             class="input input-bordered w-full font-mono text-sm bg-base-100"
+             onclick="this.select()">
+      <button type="button" class="btn btn-sm"
+              onclick="var i=document.getElementById('minted-token'); i.select(); navigator.clipboard.writeText(i.value); this.textContent='Copied';">Copy</button>
+    </div>
+    <p class="text-xs opacity-70 mt-2">Use it as
+      <code>Authorization: Bearer {{ minted_plaintext }}</code>. Only the
+      hash is stored on the server, so this screen is the one chance you have
+      to save it. Revoke any token below if you lose it.</p>
+  </div>
+</div>
+{% endif %}
+
+{% if mint_error %}
+<div class="alert alert-error shadow-sm my-4" role="alert">
+  <span aria-hidden="true">⚠</span>
+  <span>{{ mint_error }}</span>
+</div>
+{% endif %}
+
+{% if message %}
+<div class="alert shadow-sm my-4" role="status">
+  <span>{{ message }}</span>
+</div>
+{% endif %}
+
+<section class="card bg-base-100 shadow-sm my-4">
+  <div class="card-body">
+    <h2 class="card-title text-lg">Mint a new token</h2>
+    <form method="post" action="{{ P }}/tokens" class="space-y-4">
+      <input type="hidden" name="csrf" value="{{ csrf_token }}">
+
+      <label class="form-control w-full max-w-md">
+        <div class="label"><span class="label-text">Name</span></div>
+        <input type="text" name="name" required maxlength="255"
+               placeholder="e.g. laptop-cli, ci-reminder-bot"
+               class="input input-bordered w-full">
+        <div class="label"><span class="label-text-alt opacity-70">For your own reference — tokens are identified by this name in the list below.</span></div>
+      </label>
+
+      <fieldset>
+        <legend class="label-text font-semibold">Scopes</legend>
+        <label class="label cursor-pointer justify-start gap-2 mt-2">
+          <input type="checkbox" name="scopes_all" value="1" class="checkbox checkbox-sm">
+          <span class="label-text"><strong>All owner permissions</strong> — grants every owner-grantable scope below. Shortcut; a grant minted today lists each scope on the row.</span>
+        </label>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-1 mt-2">
+          {% for s in scopes %}
+          <label class="label cursor-pointer justify-start gap-2">
+            <input type="checkbox" name="scopes" value="{{ s }}" class="checkbox checkbox-sm">
+            <span class="label-text"><code>{{ s }}</code></span>
+          </label>
+          {% endfor %}
+        </div>
+        <p class="text-xs opacity-70 mt-1"><code>polls:write</code> implies <code>polls:read</code>. Mail scopes are opt-in at mint time — grant <code>mail:send</code> only to tokens that actually need to send mail. Operator affordances (<code>mail:force</code>, <code>imip:poll</code>) are not owner-grantable; configure <code>KAIROS_API_KEYS</code> for those.</p>
+      </fieldset>
+
+      <label class="form-control w-full max-w-xs">
+        <div class="label"><span class="label-text">Expires</span></div>
+        <select name="expiry" class="select select-bordered">
+          {% for code, label, _secs in presets %}
+          <option value="{{ code }}"{% if code == default_preset %} selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <div class="label"><span class="label-text-alt opacity-70">No never-expiring tokens — rotation is a deliberate act.</span></div>
+      </label>
+
+      <button type="submit" class="btn btn-primary">Mint token</button>
+    </form>
+  </div>
+</section>
+
+<section class="card bg-base-100 shadow-sm my-4">
+  <div class="card-body">
+    <h2 class="card-title text-lg">Your tokens</h2>
+    {% if rows %}
+    <div class="overflow-x-auto">
+      <table class="table table-sm">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Prefix</th>
+            <th>Scopes</th>
+            <th>Created</th>
+            <th>Expires</th>
+            <th>Last used</th>
+            <th>Status</th>
+            <th class="w-16"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          <tr class="{% if row.state != 'active' %}opacity-60{% endif %}">
+            <td class="font-semibold">{{ row.name }}</td>
+            <td><code class="text-xs">{{ row.prefix }}…</code></td>
+            <td class="text-xs">
+              {% for s in row.scopes.split(',') %}
+              <span class="badge badge-ghost badge-sm me-1">{{ s }}</span>
+              {% endfor %}
+            </td>
+            <td class="text-xs whitespace-nowrap">{{ (row.created_at | string)[:16] }}</td>
+            <td class="text-xs whitespace-nowrap">{{ (row.expires_at | string)[:16] }}</td>
+            <td class="text-xs whitespace-nowrap">{{ (row.last_used_at | string)[:16] if row.last_used_at else '—' }}</td>
+            <td>
+              {% if row.state == 'active' %}
+              <span class="badge badge-success">active</span>
+              {% elif row.state == 'expired' %}
+              <span class="badge badge-warning">expired</span>
+              {% else %}
+              <span class="badge badge-error">revoked</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if row.state == 'active' %}
+              <form method="post" action="{{ P }}/tokens/{{ row.id }}/revoke" class="inline">
+                <input type="hidden" name="csrf" value="{{ csrf_token }}">
+                <button type="submit" class="btn btn-ghost btn-xs"
+                        onclick="return confirm('Revoke this token? Any client using it will stop working immediately.');">Revoke</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <p class="opacity-60">No tokens yet — mint one above.</p>
+    {% endif %}
+
+    <p class="text-xs opacity-70 mt-4">
+      Tokens start with <code>{{ prefix }}</code> so secret scanners can find
+      leaked ones. Only the SHA-256 hash is stored on the server — losing a
+      token means minting a new one, not reading the old one. See
+      <a href="{{ P }}/llms.txt" class="link">agent docs</a> and
+      <a href="{{ P }}/api/docs" class="link">API reference</a> for how to use it.
+    </p>
+  </div>
+</section>
+{% endblock %}

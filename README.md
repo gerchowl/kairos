@@ -381,6 +381,36 @@ human in the UI, so from the API it takes `mail:force` **and** its own
 `mail_force` budget of 5/hour. The web UI's `remind-selected` is unchanged: one
 click for a person, and the 24h cooldown still applies to everyone else.
 
+### Owner-minted tokens (admin panel)
+
+<!-- #82 owner tokens. Self-contained section: appended at the end of the #51
+     scoping block, so it rebases cleanly. -->
+
+`KAIROS_API_KEY` and `KAIROS_API_KEYS` are env grants — the operator decides
+once at boot. For deployments where the signed-in **owner** should mint their
+own credentials (per laptop, per bot, per CI job), the admin panel at
+**`/tokens`** is the second grantor:
+
+* Each token is a `kai_…` bearer, shown exactly once at mint time; only the
+  sha256 hash is stored, so a DB leak discloses no working credential.
+* Scopes are the same six as `KAIROS_API_KEYS` (`polls:read`, `polls:write`,
+  `respond`, `mail:send`, `mail:force`, `imip:poll`), granted per token at
+  mint time. Mail scopes are opt-in.
+* Expiry is a fixed preset: 24h / 7d / **30d** (default) / 90d / 1y — there is
+  no never-expiring option.
+* A token **acts as its owner**: polls it creates are attributed to the
+  minter and show on their dashboard, and under `KAIROS_POLL_REACH=scoped`
+  the token reaches exactly the polls the owner holds management authority
+  over. It cannot read other owners' polls.
+* Expired or revoked tokens answer 401 with the same body as a wrong token;
+  revocation is one click in the panel and takes effect immediately.
+
+Available in every owner-auth mode that yields an account (`KAIROS_AUTH=demo`,
+`header`, `oidc`). In `KAIROS_AUTH=capability` the manage link *is* the
+credential — there is no account to attribute a token to — and the panel
+self-404s with a clear message. In `KAIROS_AUTH=none` there is no owner
+surface at all.
+
 ### Mail budgets
 
 | Knob | Default | What it bounds | On exceeding it |

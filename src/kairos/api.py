@@ -216,7 +216,28 @@ def whoami(user: dict = Depends(api_scope())):
     cannot plan, so the capabilities are readable over the API rather than only
     documented in an operator's env file. Reports the key's digest, never the
     key, and only what this key holds — not the whole vocabulary.
+
+    **Two shapes, one endpoint** (PR #85 round-F). Env-keyring / legacy env
+    keys keep the exact #63 shape — `scopes`, `key_id`, `tier`, `polls`,
+    `reach_policy` — byte-for-byte, because the whole-poll-list field is what
+    a scoped operator credential has to report (an agent that holds `~p1,~p2`
+    needs to see those two ids). Owner-minted tokens (`source == "owner_token"`)
+    report the truthful version: `kind`, `owner`, `scopes`, `key_id`, `reach`
+    (the words "own polls" — a per-mint poll list would go stale the moment
+    the owner creates another), and `expires_at` so an agent can plan its
+    re-mint. The field names differ deliberately so a client cannot read the
+    owner-token answer as if it were an env-key answer.
     """
+    if user.get("source") == "owner_token":
+        expires_at = user.get("expires_at")
+        return {
+            "kind": "owner_token",
+            "owner": user["uid"],
+            "scopes": sorted(user["scopes"]),
+            "key_id": user["key_id"],
+            "reach": "own polls",
+            "expires_at": expires_at.isoformat() if expires_at else None,
+        }
     reached = reach.reached_by(user)
     return {"scopes": sorted(user["scopes"]), "key_id": user["key_id"],
             "tier": user.get("tier"),
@@ -240,6 +261,19 @@ def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depend
         for s in body.slots:
             if not s.start_time or not s.end_time:
                 raise HTTPException(400, "time_slot mode requires start_time and end_time for each slot")
+    # Issue #82: an owner-minted token acts as its owner — it cannot create a
+    # poll attributed to someone else. Reject a `creator` that is not the
+    # token's own uid (accept it when absent or equal). The env-keyring and
+    # `KAIROS_API_KEY` paths keep their behaviour: `uid == "api"` means
+    # "no account identity", and a service credential is allowed to attribute
+    # polls on behalf of a named user.
+    if (user.get("source") == "owner_token"
+            and body.creator and body.creator != user["uid"]):
+        raise HTTPException(
+            403,
+            "This token acts as its owner — it cannot attribute a poll to "
+            "another user. Omit `creator`, or set it to the token owner's uid.",
+        )
     creator_id = body.creator or user["uid"]
     from kairos.http import valid_email
 
@@ -260,7 +294,16 @@ def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depend
     # `creator_id` is the literal "api" for every key, #32), but a caller that
     # creates a poll and is then refused it has been handed an id it provably
     # cannot use, so the response says so at the moment it can still be acted on.
-    if reach.policy() == reach.SCOPED and not reach.key_reaches(user, poll["id"]):
+    # Owner tokens *do* reach what they create: the `_is_owner_token_for` branch
+    # in `kairos.reach` matches the poll's `creator_id` / `owner_id` (both set
+    # to the owner's uid above) under every policy, so there is no 403 coming
+    # and no warning to emit. The original warning was framed for the keyring
+    # case ("creating a poll does not imply reaching it"), and emitting it for
+    # an owner token would read as a contradiction of what the panel told the
+    # owner at mint time. Env-keyring and `KAIROS_API_KEY` paths are unchanged.
+    if (user.get("source") != "owner_token"
+            and reach.policy() == reach.SCOPED
+            and not reach.key_reaches(user, poll["id"])):
         created["reach_warning"] = (
             f"This key cannot reach poll {poll['id']} under KAIROS_POLL_REACH=scoped, so reads, "
             f"edits and deletes of it will be refused until an operator grants it reach "
@@ -324,7 +367,12 @@ def patch_invite_endpoint(poll_id: str, invite_id: str, body: InvitePatch,
         from kairos.http import valid_email
         if not valid_email(body.email):
             raise HTTPException(400, "Invalid email address")
-    if not update_invite(invite_id, name=body.name, email=body.email, required=body.required):
+    # The IDOR guard lives at the data layer: `update_invite` takes `poll_id`
+    # too and the UPDATE's WHERE requires the row's `poll_id` column to match,
+    # so a cross-poll invite id answers the same 404 as an invite id that does
+    # not exist -- without the existence oracle a 403-vs-404 split would make.
+    if not update_invite(poll_id, invite_id, name=body.name, email=body.email,
+                         required=body.required):
         raise HTTPException(404, "Invite not found or no fields given")
     return {"updated": True}
 
@@ -335,10 +383,14 @@ def delete_invite_endpoint(poll_id: str, invite_id: str,
     """Remove an invitee (and their linked response, if any)."""
     _get_or_404(poll_id)
     from kairos.db import delete_invite, delete_response, get_responses
+    # IDOR guard: the linked-response sweep is driven by `get_responses(poll_id)`
+    # so it is already poll-scoped; the two DB calls below additionally require
+    # `poll_id` in the WHERE, so a cross-poll invite id answers the same 404 as
+    # a missing one -- see `db.update_invite` for the pattern.
     for r in get_responses(poll_id):
         if r.get("invite_id") == invite_id:
-            delete_response(r["id"])
-    if not delete_invite(invite_id):
+            delete_response(poll_id, r["id"])
+    if not delete_invite(poll_id, invite_id):
         raise HTTPException(404, "Invite not found")
     return {"deleted": True}
 
@@ -360,8 +412,9 @@ def patch_response_endpoint(poll_id: str, response_id: str, body: ResponsePatch,
         from kairos.http import valid_email
         if not valid_email(body.email):
             raise HTTPException(400, "Invalid email address")
-    if not update_response_contact(response_id, name=body.name, email=body.email,
-                                   required=body.required):
+    # IDOR guard at the data layer -- see `db.update_invite`.
+    if not update_response_contact(poll_id, response_id, name=body.name,
+                                   email=body.email, required=body.required):
         raise HTTPException(404, "Response not found or no fields given")
     return {"updated": True}
 
@@ -372,7 +425,8 @@ def delete_response_endpoint(poll_id: str, response_id: str,
     """Remove a response (walk-in or invited)."""
     _get_or_404(poll_id)
     from kairos.db import delete_response
-    if not delete_response(response_id):
+    # IDOR guard at the data layer -- see `db.update_invite`.
+    if not delete_response(poll_id, response_id):
         raise HTTPException(404, "Response not found")
     return {"deleted": True}
 

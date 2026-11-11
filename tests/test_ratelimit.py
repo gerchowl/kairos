@@ -384,6 +384,16 @@ UNLIMITED = {
     # touches no row and no third party. Both 404 unless KAIROS_AUTH=oidc.
     ("GET", "/scheduler/login"): "renders a page; the outbound redirect is /oidc/start",
     ("POST", "/scheduler/oidc/logout"): "session+CSRF gated; clears a cookie",
+
+    # #82. The owner-minted API tokens admin panel. Owner-authenticated and
+    # CSRF-protected on both POSTs; the write (mint / revoke) touches one row
+    # the owner owns and never a third party. Capability and `none` modes
+    # self-404 — there is no account to attribute a token to. Same argument as
+    # the other owner routes above: an IP budget here would punish a shared
+    # NAT for no abuse benefit, and the real control is owner auth itself.
+    ("GET", "/scheduler/tokens"): "owner panel; reads this owner's rows",
+    ("POST", "/scheduler/tokens"): "mint one row the owner owns; shown once; no third-party send",
+    ("POST", "/scheduler/tokens/{token_id}/revoke"): "update one row the owner owns",
 }
 
 
