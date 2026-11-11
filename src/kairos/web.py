@@ -8,7 +8,7 @@ from kairos.auth import can_manage, get_base_url, get_user, require_manage
 from kairos.capability import require_sendable
 from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
-    add_slots,
+    add_slots_capped,
     create_invite,
     create_poll,
     delete_invite,
@@ -157,8 +157,8 @@ def _valid_timezone(tz: str) -> bool:
 # meant ~40 of them were enough to take the deployment down. A non-numeric value
 # was a plain `ValueError` → 500 on the same line.
 #
-# So the bound is *here*, before the loop, not in a size check after it: the cap in
-# `capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL` refuses a poll that is too big, but a
+# So the bound is *here*, before the loop, not in a size check after it: the per-poll
+# cap `settings.max_slots_per_poll()` refuses a poll that is too big, but a
 # check that runs once the list exists cannot bound what building the list costs.
 # These two numbers make one loop iteration per minute of the window at worst, so a
 # single date is bounded by the day — 1440 iterations, 1440 slots.
@@ -194,16 +194,66 @@ def _bounded_int(raw: str, low: int, high: int) -> int | None:
 def _parse_clock(raw: str):
     """A `HH:MM` form field as a datetime, or None.
 
-    `strptime` is the parser; the None is the part that matters. A `start_time_all`
-    of `"25:00"` raised out of the route rather than being refused, and since #30
-    the route is anonymous, so an unparseable clock was a 500 on it — the same shape
-    as the unvalidated `increment` above, on the two lines beside it, and fixed in
-    the same place.
+    Delegates the shape check to `kairos.validation.validate_time` -- the
+    one predicate every slot-writing surface uses (finding 4, PR #92
+    round-2). Accepts `HH:MM:SS` too (MySQL TIME round-trip) and
+    normalises to `HH:MM` before parsing. A `start_time_all` of `"25:00"`
+    or `"9:5"` returns None rather than raising.
     """
-    try:
-        return datetime.strptime(raw.strip(), "%H:%M")
-    except (AttributeError, ValueError):
+    from kairos.validation import InvalidTime, validate_time
+    if raw is None:
         return None
+    try:
+        hhmm = validate_time(raw.strip(), field="time")
+    except InvalidTime:
+        return None
+    return datetime.strptime(hhmm, "%H:%M")
+
+
+def request_cap_refusal(n_slots: int) -> str | None:
+    """The per-request memory-guard refusal sentence, or None when under cap.
+
+    The DRY counterpart to `capability.slot_cap_refusal` (the per-*poll*
+    cap). Every slot-writing surface -- /new, /polls/{id}/edit, /manage,
+    REST and MCP -- enforces the same `settings.MAX_SLOTS_PER_REQUEST`
+    ceiling arithmetically *before* any expansion, so an over-cap request
+    never allocates the list of slot dicts (finding 3 of PR #92 round-2,
+    which measured /new accepting 5,000 slots in one header-mode request).
+    0 disables the cap (operator opt-out).
+
+    "too large" appears so a client that keys on the per-poll refusal's
+    wording still matches (both refusals share the phrase on purpose: they
+    are two bounds on the same question, and a client that recognises one
+    recognises the other).
+    """
+    cap = settings.MAX_SLOTS_PER_REQUEST
+    if cap > 0 and n_slots > cap:
+        return (
+            f"That request is too large. It would add {n_slots:,} slots in one "
+            f"request, over the per-request limit of {cap:,}. Split it into "
+            f"smaller requests."
+        )
+    return None
+
+
+def _validate_dates_shape(dates: list[str]) -> str | None:
+    """Refuse a bad YYYY-MM-DD at the shape layer; one sentence or None.
+
+    Shared by /new and /polls/{id}/edit (the only web routes that accept a
+    free-text `dates` field): the capability console has its own call site
+    in `_parse_dates`, and REST/MCP validate at the Pydantic layer, but
+    every surface now goes through `kairos.validation.validate_date` so
+    the four call sites cannot drift (finding 4, PR #92 round-2).
+    """
+    from kairos.validation import InvalidDate, validate_date
+    for d in dates:
+        if not d:
+            continue
+        try:
+            validate_date(d, field="dates")
+        except InvalidDate as exc:
+            return str(exc)
+    return None
 
 
 def _expand_time_slots(form, dates) -> tuple[list[dict], str | None]:
@@ -258,9 +308,25 @@ def _expand_time_slots(form, dates) -> tuple[list[dict], str | None]:
     # prediction is never above the loop's output.
     n_dates = sum(1 for date in dates if date)
     per_date = (t_end - t_start) // timedelta(minutes=increment)
-    refusal = capability.slot_cap_refusal(n_dates * per_date, n_dates)
+    product = n_dates * per_date
+    # Two bounds, same arithmetic.
+    #
+    # Per-poll refusal first because it is the more informative sentence for a
+    # creator -- "split this in two polls" vs. "split this across requests" --
+    # and because the per-poll cap is the tighter number on the two deployment
+    # shapes that enable this mode (1,000 under capability/hosted vs. the
+    # 2,000 per-request). That order is what `expand_new_dates` records too,
+    # for the same reason.
+    refusal = capability.slot_cap_refusal(product, n_dates)
     if refusal:
         return [], refusal
+    # Finding 3 of PR #92 round-2: /new (this function's caller) did not enforce
+    # the per-request memory guard, so a 5,000-slot header-mode body was accepted.
+    # Checked *before* the loop so an over-cap request never allocates the slot
+    # dicts (the discipline #68 recorded three times over).
+    over_request = request_cap_refusal(product)
+    if over_request:
+        return [], over_request
 
     slots = []
     for date in dates:
@@ -303,27 +369,30 @@ def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
 def expand_new_dates(poll: dict, dates: list[str], *, cap: int | None = None) -> list[dict]:
     """Slots for genuinely-new dates; time_slot polls reuse the poll's time grid.
 
-    **`cap` is the ceiling on `new_dates × time-pairs`, and it is checked before the
-    comprehension rather than after it.** Both factors come from the request or from
-    the poll, and the product is what actually lands in the database:
+    **Two bounds, both arithmetic, both checked before the comprehension:**
 
-      * `dates` — on the capability console this arrives as ONE comma-separated field
-        that `_parse_dates` splits, so Starlette's `max_fields` ceiling never sees the
-        dates at all. One ~1 MB field is 95,000 valid dates; the review that found
-        this measured a 220 KB body with 20,000 dates against a poll carrying 125
-        distinct time pairs — **2,500,000 slot rows, 2,501,000 written, +1.1 GB,
-        14 s, status 302**. Not refused, because nothing here looked.
-      * `time_pairs` — the poll's *own* grid, which grows by up to one edit's worth
-        of slots every time. So even a single new date becomes expensive eventually,
-        and only the product says so.
+      1. The *per-request* memory guard -- `new_dates × time-pairs` must be
+         within `settings.MAX_SLOTS_PER_REQUEST` (default 2,000). This is the
+         ceiling on what building the slot list costs, the discipline #68
+         recorded three times over. One ~1 MB `dates` field is 95,000 valid
+         dates; a 220 KB body with 20,000 dates against a 125-time-pair poll
+         is 2.5M rows at +1.1 GB on the pre-fix tree, 14 s, status 302, not
+         refused because nothing looked.
+      2. The *per-poll* total cap -- `existing + new <= settings.max_slots_per_poll()`.
+         This is the ceiling on how large a poll may become, so the API path
+         cannot grow a small poll to over-cap one request at a time. The
+         sentence is `capability.slot_cap_refusal`, same number on every
+         surface.
 
-    The owner form and the REST API pass no `cap` and keep their existing behaviour:
-    the owner path is bounded by `max_fields` (about 90x lower per request) and the
-    API is #51/#63/#64's surface with its own budget. This parameter exists so the
-    capability console can ask for the ceiling at its own call site rather than
-    having a mode check reach into a shared helper and silently change two other
-    surfaces.
+    Since the PR #92 adversarial-review pass both bounds apply on **every**
+    slot-writing surface (owner form, capability console, REST, MCP), because
+    the agent path cannot be second-class to the human one (ADR-0012). The
+    `cap=` parameter overrides the per-request number on one call (tests,
+    future `Durable-Object` tenants that want tighter bounds); `cap=None`
+    resolves `settings.MAX_SLOTS_PER_REQUEST` at call time.
     """
+    if cap is None:
+        cap = settings.MAX_SLOTS_PER_REQUEST
     existing = {str(s["date"]) for s in poll["slots"]}
     new_dates = [d for d in dates if d and d not in existing]
     time_pairs = sorted({(fmt_time(s["start_time"]), fmt_time(s["end_time"]))
@@ -333,13 +402,32 @@ def expand_new_dates(poll: dict, dates: list[str], *, cap: int | None = None) ->
     # below can produce and never an over-estimate of it.
     per_date = len(time_pairs) if on_grid else 1
     product = len(new_dates) * per_date
-    if cap is not None and product > cap:
+    # (1) per-poll total cap — `existing + new` against
+    # `settings.max_slots_per_poll()`. Same sentence every surface uses, so
+    # the web edit, the capability console, REST and MCP all read the same;
+    # it names the dates and the total, which is what a creator needs to act
+    # on. Checked first because when both bounds trip (a 2.45M-slot edit
+    # against a 1,000-slot cap is also over the 2,000 per-request guard)
+    # the per-poll cap is the more informative refusal -- "split into
+    # smaller edits" cannot help a request that would still not fit.
+    #
+    # The atomic dispatch in `db.add_slots_capped` repeats this check inside
+    # a transaction to close the count/check/insert race the PR #92 review
+    # found on concurrent adds.
+    existing_count = len(poll["slots"])
+    total = existing_count + product
+    refusal = capability.slot_cap_refusal(total, len(new_dates))
+    if refusal:
+        raise HTTPException(400, refusal)
+    # (2) per-request memory guard — product vs. `MAX_SLOTS_PER_REQUEST`. The
+    # ceiling on what building the slot list costs; the discipline #68
+    # recorded three times over. A check that runs after the comprehension
+    # produces the right status with the memory already spent.
+    if cap > 0 and product > cap:
         raise HTTPException(
             400,
-            # `slot_cap_refusal` words it and knows the mode; the `or` is for a caller
-            # that passes a cap outside this mode, where it deliberately has no opinion.
-            capability.slot_cap_refusal(product, len(new_dates))
-            or f"That edit would add {product:,} slots, over the limit of {cap:,}.",
+            f"That edit would add {product:,} slots in one request, over the "
+            f"per-request limit of {cap:,}. Split it into smaller edits.",
         )
     if on_grid:
         return [{"date": d, "start_time": st, "end_time": et}
@@ -464,7 +552,7 @@ def new_poll_page(request: Request):
 
 
 @router.post("/new")
-def create_poll_submit(request: Request, form=Depends(form_data),
+def create_poll_submit(request: Request, form=Depends(form_data),  # noqa: C901 — one validation flow: CSRF, Turnstile, shape, mode, bounds. Splitting it would scatter the refusal path across helpers whose only shared argument is the form itself; a small over-complexity reads clearer than that fan-out.
                        _=Depends(rate_limit("create"))):
     # ---- issue #30, KAIROS_AUTH=capability --------------------------------
     # The same form, the same `create` budget, one difference: there is no identity
@@ -531,12 +619,34 @@ def create_poll_submit(request: Request, form=Depends(form_data),
 
     dates = form.getlist("dates")
 
+    # Finding 4 of PR #92 round-2: /new accepted any `dates` string, so a
+    # `"not-a-date"` lands as a DATE column that raises on the next read.
+    # The shared validator refuses what a DATE column cannot store AND does
+    # not echo the submitted value in the refusal (finding 5).
+    shape_err = _validate_dates_shape(dates)
+    if shape_err:
+        return _fail(shape_err)
+
     slots = []
     if mode == "time_slot":
         slots, error = _expand_time_slots(form, dates)
         if error:
             return _fail(error)
     else:
+        # Two bounds, before the comprehension (finding 3 of PR #92 round-2
+        # recorded /new in full_day mode as bypassing both: 5,000 dates
+        # created 5,000 slot dicts without challenge).
+        #
+        # Per-poll cap first -- it is the tighter number under capability/
+        # hosted and names the more informative split for a creator. The
+        # per-request guard is the memory ceiling and fires second.
+        n_dates = sum(1 for d in dates if d)
+        over_poll = capability.slot_cap_refusal(n_dates, n_dates)
+        if over_poll:
+            return _fail(over_poll)
+        over_request = request_cap_refusal(n_dates)
+        if over_request:
+            return _fail(over_request)
         for date in dates:
             if not date:
                 continue
@@ -747,16 +857,49 @@ def edit_poll_submit(poll_id: str, request: Request, form=Depends(form_data)):
     if not _valid_timezone(timezone):
         return _error_page(user, "Edit Poll", "Unknown timezone.",
                            f"{P}/polls/{poll_id}/edit")
+
+    # Everything validated before anything written, so a refused edit leaves
+    # the poll exactly as it was rather than half-applied. `expand_new_dates`
+    # raises on either slot bound (per-request product, per-poll total) before
+    # `update_poll` runs, which is the same "nothing written on a refusal"
+    # discipline the capability console's `_edit` records -- and the same
+    # reason `edit` on the web owner form caps too, since the PR #92 pass.
+    dates_raw = form.getlist("dates")
+    shape_err = _validate_dates_shape(dates_raw)
+    if shape_err:
+        return _error_page(user, "Edit Poll", shape_err,
+                           f"{P}/polls/{poll_id}/edit")
+    try:
+        slots = expand_new_dates(poll, dates_raw)
+    except HTTPException as exc:
+        return _error_page(user, "Edit Poll", exc.detail,
+                           f"{P}/polls/{poll_id}/edit")
+
+    # PR #92 round-3 finding 3 (LOW). The pre-fix order applied the title /
+    # description / timezone update first and then ran `add_slots_capped`:
+    # a slot-cap refusal returned 400 *after* the metadata had already
+    # landed, so the poll's title changed while the user saw an error page
+    # saying nothing was applied. Apply slots FIRST so the transactional
+    # cap check (SQLite BEGIN IMMEDIATE, MySQL SELECT ... FOR UPDATE) is the
+    # gate that decides whether any change lands; only then update the
+    # metadata, which cannot fail for a validated input. Capability console
+    # `_edit` runs the same discipline (`src/kairos/capability.py::_edit`).
+    if slots:
+        try:
+            add_slots_capped(poll_id, slots, cap=settings.max_slots_per_poll())
+        except HTTPException as exc:
+            return _error_page(user, "Edit Poll", exc.detail,
+                               f"{P}/polls/{poll_id}/edit")
+
     update_poll(poll_id, title=title,
                 description=form.get("description", "").strip() or None,
                 timezone=timezone)
 
     # Additive date edit: new dates get slots, existing slots (and their
-    # responses) are untouched.
-    slots = expand_new_dates(poll, form.getlist("dates"))
+    # responses) are untouched. `add_slots_capped` above repeats the per-poll
+    # check inside a transaction so concurrent requests cannot push it past
+    # the cap.
     if slots:
-        add_slots(poll_id, slots)
-
         if form.get("notify"):
             # Refetch so the nudge engine sees the just-added slots, then let
             # it work out who actually needs mail (idempotent, state-driven).

@@ -261,7 +261,8 @@ def owner(monkeypatch):
 def test_edit_poll_updates_and_adds_dates(client, owner, monkeypatch):
     updated, added = {}, {}
     monkeypatch.setattr(web, "update_poll", lambda pid, **f: updated.update(f) or True)
-    monkeypatch.setattr(web, "add_slots", lambda pid, slots: added.update(slots=slots) or slots)
+    monkeypatch.setattr(web, "add_slots_capped",
+                        lambda pid, slots, cap: added.update(slots=slots) or slots)
 
     r = client.post("/scheduler/polls/p1/edit", data={
         "title": "Retreat v2", "description": "new desc", "timezone": "Europe/Zurich",
@@ -277,7 +278,7 @@ def test_edit_poll_updates_and_adds_dates(client, owner, monkeypatch):
 
 def test_edit_with_notify_runs_nudge_engine(client, owner, monkeypatch):
     monkeypatch.setattr(web, "update_poll", lambda pid, **f: True)
-    monkeypatch.setattr(web, "add_slots", lambda pid, slots: slots)
+    monkeypatch.setattr(web, "add_slots_capped", lambda pid, slots, cap: slots)
     monkeypatch.setattr(web, "nudge_participants",
                         lambda req, poll, user: {"invited": 1, "updated": 2, "skipped": 0})
     r = client.post("/scheduler/polls/p1/edit", data={
@@ -297,6 +298,38 @@ def test_edit_without_new_dates_sends_nothing(client, owner, monkeypatch):
     }, follow_redirects=False)
     assert "msg=saved" in r.headers["location"]
     assert not called
+
+
+def test_round3_edit_refuses_slots_before_updating_title(client, owner, monkeypatch):
+    """**PR #92 round-3 finding 3 (LOW).** A slot-cap refusal must not leave
+    the poll's title/description/timezone changed. The pre-fix order applied
+    `update_poll(title=...)` first and then ran `add_slots_capped`, so a 400
+    from the cap refusal still committed the title change. Fixed by running
+    slots first and only touching metadata when slots succeed.
+    """
+    from fastapi import HTTPException
+
+    updated = []
+    def refuse_slots(_pid, _slots, cap):  # mimic add_slots_capped's 400
+        raise HTTPException(400, "That edit would bring the poll over the limit.")
+    monkeypatch.setattr(web, "update_poll",
+                        lambda pid, **f: updated.append(f) or True)
+    monkeypatch.setattr(web, "add_slots_capped", refuse_slots)
+    # The 400 renders _error_page, which reads notifications for the nav.
+    monkeypatch.setattr(web, "get_notifications",
+                        lambda uid, unread_only=True: [])
+
+    r = client.post("/scheduler/polls/p1/edit", data={
+        "title": "Changed Title", "description": "Changed Desc",
+        "timezone": "Europe/Berlin",
+        "dates": ["2026-06-22"],  # one new date -> add_slots_capped runs
+    }, follow_redirects=False)
+
+    assert r.status_code == 400, r.text
+    assert updated == [], (
+        "update_poll must not run when the slot cap refuses the edit — "
+        "the title/description/timezone change would leak through as 400"
+    )
 
 
 def test_reopen_poll(client, owner, monkeypatch):

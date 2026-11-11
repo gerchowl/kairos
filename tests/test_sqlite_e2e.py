@@ -411,3 +411,89 @@ def test_feed_disabled_by_default(tmp_path, monkeypatch):
         itok = create_invite(poll["id"], "b@x.ch")["token"]
         assert c.get(f"/scheduler/p/i/{itok}/feed.ics").status_code == 404
         assert c.get(f"/scheduler/p/i/{itok}/s/{poll['slots'][0]['id']}/yes").status_code == 404
+
+
+def test_round3_legacy_malformed_slot_date_does_not_500_any_read_route(tmp_path, monkeypatch, caplog):
+    """**PR #92 round-3 MEDIUM.** A single malformed stored `date` (e.g. a
+    pre-validator row like `2026-1-5`) used to 500 every poll-read surface:
+    `cursor.fetchall()` raised inside the DATE converter. After round 3 the
+    converter is tolerant and the db layer filters unreadable rows via
+    `validation.slot_is_readable`, so every read route still answers.
+
+    Pins each of the four REST/web/public routes plus the feed and the
+    dashboard against a real SQLite file with a bad row planted by
+    direct-SQL INSERT (the only way to produce one -- the write path refuses
+    it since round 2).
+    """
+    import logging
+    import sqlite3
+
+    from kairos import settings
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "API_KEY", "k")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
+    from kairos.main import create_app
+    api = {"Authorization": "Bearer k"}
+    headers = {"X-User": "alice", "X-Email": "a@e.org", "X-Name": "Alice"}
+    with TestClient(create_app(), base_url="https://testserver", headers=headers) as c:
+        poll = c.post("/scheduler/api/polls", headers=api, json={
+            "title": "Legacy", "mode": "full_day", "creator": "alice",
+            "slots": [{"date": "2026-07-06"}]}).json()
+        pid, token = poll["id"], poll["public_token"]
+
+        # Plant a malformed row by bypassing the app's validation. MySQL's DATE
+        # column would refuse this value at write time; SQLite stores it as a
+        # TEXT affinity cell because of its strict-mode-off `.db` default, which
+        # is exactly how an older pre-validator row ends up on disk.
+        raw = sqlite3.connect(f"{tmp_path}/k.db")
+        raw.execute(
+            "INSERT INTO sched_poll_slots (id, poll_id, date) VALUES (?, ?, ?)",
+            ("bad-slot", pid, "2026-1-5"),  # missing zero-pad: unparseable
+        )
+        raw.commit()
+        raw.close()
+
+        # 1. REST detail
+        r1 = c.get(f"/scheduler/api/polls/{pid}", headers=api)
+        assert r1.status_code == 200, r1.text
+        slot_ids = [s["id"] for s in r1.json()["slots"]]
+        assert "bad-slot" not in slot_ids, "unreadable slot must be filtered"
+
+        # 2. web owner view (same path, Starlette renders HTML)
+        r2 = c.get(f"/scheduler/polls/{pid}")
+        assert r2.status_code == 200, r2.text[:200]
+
+        # 3. public page
+        r3 = c.get(f"/scheduler/p/{token}")
+        assert r3.status_code == 200, r3.text[:200]
+
+        # 4a. Public event.ics -- with FEED_ENABLED and the poll open, this is
+        # the candidate feed (crashed on the bad row via get_poll_by_token).
+        r4 = c.get(f"/scheduler/p/{token}/event.ics")
+        assert r4.status_code == 200, r4.text[:200]
+
+        # 4b. REST event.ics route -- the decided-event path 404s when no slot
+        # is decided, but the important invariant is that the read did not 500.
+        r4b = c.get(f"/scheduler/api/polls/{pid}/event.ics", headers=api)
+        assert r4b.status_code in (200, 404), r4b.text[:200]
+
+        # 5. Web event.ics (/polls/{id}/event.ics) -- same invariant
+        r5 = c.get(f"/scheduler/polls/{pid}/event.ics")
+        assert r5.status_code in (200, 302, 404), r5.text[:200]
+
+        # 6. Dashboard home -- list_polls does not fetch slots, but the route
+        # must still work when any row on disk is malformed.
+        r6 = c.get("/scheduler/")
+        assert r6.status_code == 200, r6.text[:200]
+
+        # 7. Per-invite feed -- another slot-reading path
+        from kairos.db import create_invite
+        itok = create_invite(pid, "bob@x.ch", required=True, name="Bob")["token"]
+        r7 = c.get(f"/scheduler/p/i/{itok}/feed.ics")
+        assert r7.status_code == 200, r7.text[:200]
+
+        # The operator is told at least once that a row was skipped (and only
+        # once per (poll_id, slot_id) pair -- re-reading the same poll above
+        # does not refill the log).
+        with caplog.at_level(logging.WARNING, logger="kairos.validation"):
+            c.get(f"/scheduler/api/polls/{pid}", headers=api)

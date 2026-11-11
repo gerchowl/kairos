@@ -2,7 +2,25 @@ import re
 import secrets
 import uuid
 
+from fastapi import HTTPException
+
 from kairos.dbconn import IS_SQLITE, get_connection  # noqa: F401  (re-exported)
+from kairos.validation import slot_is_readable
+
+
+def _readable_slots(rows: list[dict]) -> list[dict]:
+    """Filter unreadable rows out of a slot fetch.
+
+    PR #92 round-3 finding (MEDIUM). A pre-validator row on disk (e.g. a
+    stored `date` like `2026-1-5`) used to 500 every poll-read route:
+    `cursor.fetchall()` raised inside the DATE converter. The converters are
+    now tolerant (see `dbconn._tolerant_date`), so the raw string lands here
+    and `slot_is_readable` skips it -- logged once per `(poll_id, slot_id)`
+    pair so an operator sees the shape without the log filling on repeat
+    views. Called at every point in this module that loads `sched_poll_slots`
+    rows for a route to render; nothing downstream has to remember to filter.
+    """
+    return [s for s in rows if slot_is_readable(s)]
 
 SCHEMA = [
     """CREATE TABLE IF NOT EXISTS sched_polls (
@@ -353,7 +371,7 @@ def get_poll(poll_id: str) -> dict | None:
         conn.close()
         return None
     cursor.execute("SELECT * FROM sched_poll_slots WHERE poll_id = %s ORDER BY date, start_time", (poll_id,))
-    poll["slots"] = cursor.fetchall()
+    poll["slots"] = _readable_slots(cursor.fetchall())
     cursor.close()
     conn.close()
     return poll
@@ -369,7 +387,7 @@ def get_poll_by_token(public_token: str) -> dict | None:
         conn.close()
         return None
     cursor.execute("SELECT * FROM sched_poll_slots WHERE poll_id = %s ORDER BY date, start_time", (poll["id"],))
-    poll["slots"] = cursor.fetchall()
+    poll["slots"] = _readable_slots(cursor.fetchall())
     cursor.close()
     conn.close()
     return poll
@@ -407,7 +425,7 @@ def get_poll_by_admin_token(admin_token: str | None) -> dict | None:
         conn.close()
         return None
     cursor.execute("SELECT * FROM sched_poll_slots WHERE poll_id = %s ORDER BY date, start_time", (poll["id"],))
-    poll["slots"] = cursor.fetchall()
+    poll["slots"] = _readable_slots(cursor.fetchall())
     cursor.close()
     conn.close()
     return poll
@@ -523,23 +541,104 @@ def list_polls(creator_id: str | None = None) -> list[dict]:
     return polls
 
 
-def add_slots(poll_id: str, slots: list[dict]) -> list[dict]:
-    """Append new slots to an existing poll (additive edit — responses keep)."""
+def add_slots_capped(poll_id: str, slots: list[dict], cap: int) -> list[dict]:
+    """Append new slots to a poll, atomic in count+check+insert.
+
+    The **only** public slot-insertion entry point: finding 1 of PR #92
+    round-2 noted that a plain `add_slots` beside this function left the race
+    one bypass away (the capability-console `/manage/{id}/edit` called it,
+    skipping the atomic guard — 128 concurrent workers reached **3,610
+    slots** against a 1,000-cap poll on the pre-fix tree). So the bare
+    helper has been **removed**, not just privatised: an ImportError at
+    module-load is a louder refusal than a lint note. Every surface -- the
+    web owner form, the capability console, REST and MCP -- calls this one
+    function, with `cap=settings.max_slots_per_poll()`.
+
+    The per-poll cap on #70 used to be checked in the route before calling
+    a bare `add_slots`, and the PR #92 adversarial-review pass measured the race:
+    **64 concurrent `POST /api/polls/{id}/slots` calls against the same key
+    took the poll to 36,100 slots** on a 1,000-cap deployment, because every
+    one of the 64 workers read the same `existing_count`, saw it was under
+    the cap, and raced into insert.
+
+    Closed at the data layer per dialect, so the route is just the caller:
+
+      * **SQLite** — opens with `BEGIN IMMEDIATE`, which escalates the
+        connection's write lock up front. No two writers can both be past
+        the COUNT at the same time, and the second one's `BEGIN IMMEDIATE`
+        blocks until the first commits (or times out on `busy_timeout`).
+      * **MySQL / MariaDB** — `SELECT ... FOR UPDATE` on the poll row inside
+        the transaction, so the second request serialises on the row lock
+        rather than reading a stale count. `autocommit=False` is the default
+        in `dbconn`, so a plain SELECT would be inside a transaction already
+        but would not block a concurrent writer; `FOR UPDATE` is the piece
+        that makes count+check+insert one critical section.
+      * **Durable-Object SQLite** (draft #79, `IS_DO_SQLITE` branch in
+        `dbconn`) — requests are serialised per DO for synchronous code,
+        so the explicit `BEGIN IMMEDIATE` is redundant there but harmless.
+
+    Raises `HTTPException(400)` with `capability.slot_cap_refusal`'s sentence,
+    which is the one every surface already uses so an agent reading the
+    refusal sees the same text REST / MCP / web all return.
+    """
+    from kairos import capability
     conn = get_connection()
     cursor = conn.cursor()
-    slot_rows = []
-    for s in slots:
-        slot_id = new_id()
-        cursor.execute(
-            "INSERT INTO sched_poll_slots (id, poll_id, date, start_time, end_time) VALUES (%s, %s, %s, %s, %s)",
-            (slot_id, poll_id, s["date"], s.get("start_time"), s.get("end_time")),
-        )
-        slot_rows.append({"id": slot_id, "date": s["date"],
-                          "start_time": s.get("start_time"), "end_time": s.get("end_time")})
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return slot_rows
+    try:
+        if IS_SQLITE:
+            # Escalate to a write lock up front, so count+check+insert is one
+            # critical section. Python's sqlite3 module defers to its own
+            # transaction machinery otherwise; an explicit BEGIN IMMEDIATE is
+            # what makes a COUNT visible to this writer alone.
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT COUNT(*) FROM sched_poll_slots WHERE poll_id = %s", (poll_id,)
+            )
+        else:
+            # MySQL/MariaDB: lock the poll row for the duration, so a
+            # concurrent writer serialises on it rather than reading a stale
+            # count. The row itself does not change; `FOR UPDATE` is the
+            # smallest lock that covers the count+check+insert window.
+            cursor.execute(
+                "SELECT id FROM sched_polls WHERE id = %s FOR UPDATE", (poll_id,)
+            )
+            cursor.execute(
+                "SELECT COUNT(*) FROM sched_poll_slots WHERE poll_id = %s", (poll_id,)
+            )
+        existing_count = cursor.fetchone()[0]
+        if cap > 0 and existing_count + len(slots) > cap:
+            conn.rollback()
+            total = existing_count + len(slots)
+            # The same sentence `expand_new_dates` raised before the race
+            # window opened. `slot_cap_refusal` returns None when `cap` is
+            # 0 (disabled) or the total fits, which the guard above already
+            # covered, so the fallback is a defence-in-depth sentence.
+            msg = capability.slot_cap_refusal(total, 0) or (
+                f"That edit would bring the poll to {total:,} slots, over the "
+                f"per-poll limit of {cap:,}."
+            )
+            raise HTTPException(400, msg)
+        slot_rows = []
+        for s in slots:
+            slot_id = new_id()
+            cursor.execute(
+                "INSERT INTO sched_poll_slots (id, poll_id, date, start_time, end_time) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (slot_id, poll_id, s["date"], s.get("start_time"), s.get("end_time")),
+            )
+            slot_rows.append({"id": slot_id, "date": s["date"],
+                              "start_time": s.get("start_time"), "end_time": s.get("end_time")})
+        conn.commit()
+        return slot_rows
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def update_poll(poll_id: str, **fields) -> bool:
