@@ -2320,21 +2320,24 @@ def test_the_console_edit_dates_field_cannot_smuggle_past_the_field_ceiling():
         capability._parse_dates(["2026-01-05,nope"])
 
 
-def test_the_owner_form_and_the_api_are_not_given_a_cap_they_never_had():
+def test_the_owner_form_is_not_given_a_cap_it_never_had():
     """`cap=None` means today's behaviour, and that has to stay true.
 
-    `expand_new_dates` has three callers: this console (capped), the owner's edit form
-    and the REST API's slots endpoint (both uncapped, and both owned elsewhere —
-    #51/#63/#64). A mode check inside the shared helper would have silently capped the
-    other two in capability mode, which is not this branch's call to make. So the cap
-    is a parameter, passed only where the ceiling belongs.
+    `expand_new_dates` now has three callers that *do* pass a cap (this console,
+    the REST `/api/polls/{id}/slots` endpoint since #70, and MCP's `add_dates`
+    which calls the REST function directly) and one that does not (the owner's
+    edit form). A mode check inside the shared helper would have silently capped
+    the owner form in capability mode, which is not this branch's call to make.
+    So the cap is a parameter, passed only where the ceiling belongs — at each
+    *call site*, which is also what keeps the REST ceiling equal to the console
+    one by construction rather than by two numbers that happen to match.
     """
     poll = _grid_poll(125)
     dates = [f"2026-06-{day:02d}" for day in range(1, 29)] * 100  # 2,800 dates
     assert len(web.expand_new_dates(poll, dates)) == 2_800 * 125, "the uncapped path is unchanged"
     with pytest.raises(HTTPException):
         web.expand_new_dates(poll, dates, cap=capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL)
-    # And the signature stays backward compatible for the two callers that never pass it.
+    # And the signature stays backward compatible for the one caller that never passes it.
     assert "cap" in inspect.signature(web.expand_new_dates).parameters
     assert inspect.signature(web.expand_new_dates).parameters["cap"].default is None
 

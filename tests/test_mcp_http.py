@@ -33,12 +33,13 @@ What has to hold on this surface, and why each assertion earns its place:
 """
 
 import json
+import tracemalloc
 from datetime import date, time
 
 import pytest
 from fastapi.testclient import TestClient
 
-from kairos import api, apitokens, db, main, mcp_http, ratelimit, settings
+from kairos import api, apitokens, capability, db, main, mcp_http, ratelimit, settings
 
 KEY = "test-api-key"
 MCP = "/scheduler/mcp"
@@ -1139,3 +1140,132 @@ def test_origin_bearing_request_is_403_when_no_allowlist_is_configured(monkeypat
         r = c.post(MCP, json={"jsonrpc": "2.0", "id": 2, "method": "ping"},
                    headers={"Origin": origin})
         assert r.status_code == 403, (origin, r.text)
+
+
+# -- 8. Issue #70: slot cap on every MCP slot-writing tool -----------------
+#
+# `create_poll` and `add_dates` are the MCP tools that can write slots to the
+# database. Each dispatches to the REST route function directly (see
+# `_dispatch_sync`'s "call the REST function, don't reimplement" property), so
+# the #70 ceiling on REST is the same ceiling on MCP by construction. These
+# tests pin that property by exercising the surface — not the REST function —
+# so a future refactor that broke the sharing would fail here loudly.
+
+
+def _grid_poll_mcp(n_pairs: int, mode: str = "time_slot") -> dict:
+    if mode == "full_day":
+        slots = [{"id": f"s{i}", "date": date(2025, 6, 1),
+                  "start_time": None, "end_time": None}
+                 for i in range(n_pairs)]
+    else:
+        slots = [{"id": f"s{i}", "date": date(2025, 6, 1),
+                  "start_time": time(9 + i // 60, i % 60),
+                  "end_time": time(9 + (i + 1) // 60, (i + 1) % 60)}
+                 for i in range(n_pairs)]
+    return {**POLL, "slots": slots, "mode": mode}
+
+
+def test_mcp_create_poll_refuses_a_slot_list_over_the_cap(client, monkeypatch):
+    """MCP inherits the REST `max_length` on `slots`: a Pydantic validation
+    error comes back as an `isError=true` tool result with a 400 message —
+    the same refusal shape REST returns as a 422, mapped through
+    `ValidationError` in `_run_tool`.
+    """
+    wrote = []
+    monkeypatch.setattr(api, "create_poll",
+                        lambda *a, **k: wrote.append(a) or dict(POLL))
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    _, env = call_tool(client, "create_poll", {
+        "title": "huge", "mode": "full_day",
+        "slots": [{"date": "2026-06-08"} for _ in range(cap + 1)],
+    })
+    assert env["result"]["isError"] is True, env
+    assert "400" in env["result"]["content"][0]["text"]
+    assert "slots" in env["result"]["content"][0]["text"]
+    assert wrote == [], "a refused creation must not have called create_poll"
+
+
+def test_mcp_add_dates_refuses_a_dates_list_over_the_cap(client, monkeypatch):
+    """The MCP tool for `/api/polls/{id}/slots`, same bound, same shape."""
+    added = []
+    monkeypatch.setattr(api, "add_slots",
+                        lambda pid, slots: added.append(slots) or [])
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    _, env = call_tool(client, "add_dates", {
+        "poll_id": "p1", "dates": ["2026-06-22"] * (cap + 1),
+    })
+    assert env["result"]["isError"] is True, env
+    assert "400" in env["result"]["content"][0]["text"]
+    assert added == [], "add_slots must not run for a refused edit"
+
+
+def test_mcp_add_dates_refuses_the_product_cheaply(monkeypatch, stubbed):
+    """The `tracemalloc` placement test, through `/mcp`. On a 125-pair poll,
+    20 fresh dates give a product of 2,500 — well over the cap — and the
+    refusal must come back without having built the grid.
+    """
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    poll = _grid_poll_mcp(125)
+    monkeypatch.setattr(api, "get_poll", lambda pid: dict(poll) if pid == "p1" else None)
+    added = []
+    monkeypatch.setattr(api, "add_slots",
+                        lambda pid, slots: added.append(slots) or [])
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    dates = [f"2026-07-{d:02d}" for d in range(1, 21)]
+
+    tracemalloc.start()
+    try:
+        _, env = call_tool(c, "add_dates", {"poll_id": "p1", "dates": dates})
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert env["result"]["isError"] is True, env
+    assert added == [], "no slots may be written for a refused edit"
+    assert peak < 10 * 1024 * 1024, (
+        f"the MCP refusal allocated {peak / 1024 / 1024:.0f} MB — the cap is "
+        f"being applied after the grid is built, not before it"
+    )
+
+
+def test_rest_and_mcp_refuse_the_same_over_cap_input_for_add_dates(client, monkeypatch):
+    """Parity: the two surfaces must refuse the same oversized call. The REST
+    route returns 422 for a Pydantic max_length refusal; the MCP tool returns
+    an `isError=true` result. Each is the surface's own idiom for the same
+    policy — and both are the same number in the same constant.
+    """
+    added = []
+    monkeypatch.setattr(api, "add_slots",
+                        lambda pid, slots: added.append(slots) or [])
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    r = client.post("/scheduler/api/polls/p1/slots",
+                    json={"dates": ["2026-06-22"] * (cap + 1)})
+    assert r.status_code == 422, r.text
+    _, env = call_tool(client, "add_dates", {
+        "poll_id": "p1", "dates": ["2026-06-22"] * (cap + 1),
+    })
+    assert env["result"]["isError"] is True, env
+    assert added == [], "neither surface may write slots for a refused edit"
+
+
+def test_invalid_mcp_add_dates_still_charges_the_api_write_budget(monkeypatch, stubbed):
+    """Charge-first discipline (#89) must hold on the #70 refusal too: an
+    over-cap `add_dates` is still an attempt, and the rate budget must punish
+    the loop that produces it, not just the well-formed calls. Identical to
+    the `create_poll` test above — different tool, same property.
+    """
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS",
+                        {**settings.DEFAULT_RATE_LIMITS, "api_write": (2, 3600)})
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    body = {"poll_id": "p1", "dates": ["2026-06-22"] * (cap + 1)}
+    for i in (1, 2):
+        _, env = call_tool(c, "add_dates", body, id=i)
+        assert env["result"]["isError"] is True, env
+    # Third call — budget exhausted, JSON-RPC rate-limit error.
+    _, env = call_tool(c, "add_dates", body, id=3)
+    assert env["error"]["code"] == mcp_http.RATE_LIMITED_CODE, env
+    assert env["error"]["data"]["rule"] == "api_write"

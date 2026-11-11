@@ -39,11 +39,11 @@ call it themselves, ahead of any write and any budget charge.
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from kairos import reach, settings
 from kairos.auth import get_base_url
-from kairos.capability import require_sendable
+from kairos.capability import MAX_SLOTS_PER_ACCOUNTLESS_POLL, require_sendable
 from kairos.db import (
     add_response,
     add_slots,
@@ -70,7 +70,7 @@ from kairos.email_service import (
     sender_refusal,
     webcal_from,
 )
-from kairos.helpers import convergence, format_slot
+from kairos.helpers import convergence, fmt_time, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
 from kairos.scoping import api_scope, charge_force, charge_poll_recipients, check_recipient_list, enforce
@@ -99,7 +99,18 @@ class PollCreate(BaseModel):
     description: str | None = None
     mode: str  # full_day or time_slot
     timezone: str = "Europe/Zurich"
-    slots: list[SlotIn]
+    # Issue #70: a `list[SlotIn]` with no bound is a single-request OOM — the same
+    # defect class the console and `/new` fixed three times over in #68 — so the
+    # list has a `max_length` ceiling at validation time, before any object is
+    # materialised in the route. The number is `MAX_SLOTS_PER_ACCOUNTLESS_POLL`,
+    # one truth across every surface that writes slots: the capability console, the
+    # accountless creation path, and this REST endpoint. The REST ceiling equals the
+    # web one by construction (same constant, not two numbers that happen to match
+    # today). `max_length` refuses at the Pydantic layer, but the dependency
+    # (`api_scope`) is resolved **before** body validation — verified by probe —
+    # so a rate-limit charge is still collected for a refused call, which is the
+    # shape #51/#89 pinned on the MCP side.
+    slots: list[SlotIn] = Field(..., max_length=MAX_SLOTS_PER_ACCOUNTLESS_POLL)
     creator: str | None = None  # account uid — attributes the poll to a real user
     # Where a management link may be sent for this poll (#29/#30). Recorded,
     # not acted on: nothing mails it yet, and the response never carries it.
@@ -126,7 +137,12 @@ class DecideIn(BaseModel):
     slot_id: str
 
 class SlotsAdd(BaseModel):
-    dates: list[str]  # YYYY-MM-DD; time_slot polls expand over the time grid
+    # Issue #70: `dates` bounds the *input* dimension — one dimension of the
+    # product this endpoint materialises; the other (the poll's own grid) is
+    # applied arithmetically inside `add_slots_endpoint` before any expansion.
+    # Same ceiling as every other slot-writing surface; see `PollCreate.slots`
+    # for why the number lives in one constant.
+    dates: list[str] = Field(..., max_length=MAX_SLOTS_PER_ACCOUNTLESS_POLL)
     notify: bool = False
     sender_name: str | None = None
     reply_to: str | None = None
@@ -471,7 +487,38 @@ def add_slots_endpoint(poll_id: str, body: SlotsAdd, request: Request,
             datetime.strptime(d, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(400, f"Invalid date: {d!r} (expected YYYY-MM-DD)") from None
-    slots = expand_new_dates(poll, body.dates)
+    # Issue #70: bound `new_dates × time_pairs` **and** `existing + new`
+    # arithmetically, before any grid is built — the same discipline #68 used
+    # on the web/console path, and for the same reason: a check that runs after
+    # the comprehension produces the right status but with the memory already
+    # spent. Both factors come from the poll itself, so the math costs one
+    # multiplication; neither `expand_new_dates` nor `add_slots` is called when
+    # either bound would trip, which is what keeps the refusal cheap (pinned
+    # by a `tracemalloc` peak test in `tests/test_api.py`).
+    #
+    # `expand_new_dates(cap=…)` carries the product bound into the shared helper
+    # — same parameter the capability console uses — so the single sentence in
+    # `capability.slot_cap_refusal` is reused where it applies, with the generic
+    # fallback for every other auth mode. The total bound (existing + new) is
+    # one the console never had to compute itself, because it is the API path
+    # that can grow a poll across many sessions with the same key.
+    cap = MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    existing_dates = {str(s["date"]) for s in poll["slots"]}
+    new_date_count = sum(1 for d in body.dates if d and d not in existing_dates)
+    time_pairs = {(fmt_time(s["start_time"]), fmt_time(s["end_time"]))
+                  for s in poll["slots"] if s.get("start_time")}
+    per_date = len(time_pairs) if (poll["mode"] == "time_slot" and time_pairs) else 1
+    product = new_date_count * per_date
+    existing_count = len(poll["slots"])
+    if existing_count + product > cap:
+        raise HTTPException(
+            400,
+            f"That edit would bring the poll to {existing_count + product:,} slots, "
+            f"over the limit of {cap:,}. The poll already has {existing_count:,} slots; "
+            f"this request would add {product:,} more. Add fewer dates, or split the "
+            f"edit across requests.",
+        )
+    slots = expand_new_dates(poll, body.dates, cap=cap)
     added = add_slots(poll_id, slots) if slots else []
     nudged = None
     if body.notify and added:
