@@ -82,6 +82,26 @@ RANDOM_BYTES = 32  # ≥32, as issue #82 requires
 # tests assert the plaintext never leaks anywhere else.
 PREFIX_LEN = len(TOKEN_PREFIX) + 8
 
+# Which of #51's capabilities an **owner** may mint from the panel. A strict
+# subset of `scoping.SCOPES`: an owner grants what pertains to their own polls
+# (read/write their polls, accept responses, send invites and reminders), and
+# operator affordances stay operator-only.
+#
+# `mail:force` (bypass the 24h nudge cooldown) and `imip:poll` (run the
+# instance-wide IMAP poll cycle) are deliberately out: they are operator
+# affordances in the #51 vocabulary, and leaving them in let a poll owner
+# re-run the inbox on every instance they've logged into and spam their
+# invitees out of the cooldown. Those capabilities stay on `KAIROS_API_KEYS`
+# (env-only), which the server operator controls.
+#
+# Server-side enforcement in `mint` is the belt; the panel's checkbox list
+# (built from `OWNER_GRANTABLE` in `panel._render_panel`) is the braces — a
+# form-tampering POST that names `mail:force` is a 400 even if the UI never
+# offered it.
+OWNER_GRANTABLE: frozenset[str] = frozenset({
+    "polls:read", "polls:write", "respond", "mail:send",
+})
+
 # Expiry presets. Fixed menu, no free-form expiry: an operator who wants a 2-
 # year token has to revoke and re-mint, which is the point. The default is the
 # issue's "30d", and `PRESETS` is ordered so the panel renders them in the
@@ -158,6 +178,15 @@ def mint(owner_uid: str, name: str, scopes_list: list[str], expires_in_seconds: 
         raise ValueError(f"unknown scope(s): {', '.join(unknown)}")
     if not scopes_list:
         raise ValueError("a token must grant at least one scope")
+    # Operator-only scopes stay env-key-only. See the OWNER_GRANTABLE docstring
+    # above for why `mail:force` and `imip:poll` are out of this surface.
+    not_grantable = sorted(set(scopes_list) - OWNER_GRANTABLE)
+    if not_grantable:
+        raise ValueError(
+            f"owner-grantable scopes are {', '.join(sorted(OWNER_GRANTABLE))}; "
+            f"not owner-grantable: {', '.join(not_grantable)} — configure "
+            f"KAIROS_API_KEYS to grant operator capabilities."
+        )
     if expires_in_seconds <= 0:
         raise ValueError("expires_in_seconds must be positive — no never-expiring tokens")
     expanded = expand(scopes_list)
@@ -170,7 +199,13 @@ def mint(owner_uid: str, name: str, scopes_list: list[str], expires_in_seconds: 
     token_id = secrets.token_hex(16)  # not a UUID, but the same width and shape
     token_hash = _hash(plaintext)
     prefix = plaintext[:PREFIX_LEN]
-    created_at = now or datetime.utcnow()
+    # One clock for every time column this module touches — `db_now()` — so the
+    # dialect stays consistent with every comparison in `resolve_token`, every
+    # DB-side `CURRENT_TIMESTAMP` (revoked_at, last_used_at) and every display
+    # in the panel. The first cut used `datetime.utcnow()` for `created_at`
+    # /`expires_at` while comparisons used `db_now()` (local-time on MySQL),
+    # which shaved or stretched a token's lifetime by the server's UTC offset.
+    created_at = now or _now()
     expires_at = created_at + timedelta(seconds=expires_in_seconds)
     db.insert_api_token(
         token_id=token_id,
@@ -179,6 +214,7 @@ def mint(owner_uid: str, name: str, scopes_list: list[str], expires_in_seconds: 
         token_hash=token_hash,
         prefix=prefix,
         scopes=scopes_stored,
+        created_at=created_at,
         expires_at=expires_at,
     )
     row = {

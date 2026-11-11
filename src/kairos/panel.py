@@ -11,7 +11,11 @@ and all three resolve to a `user` with a `uid`. Capability mode (#30) has no
 account — the manage link *is* the credential, there is nothing to attribute a
 token to — so the panel refuses with a clear message rather than pretending to
 work. `KAIROS_AUTH=none` has no owner surface at all, so the route 401s like
-every other owner page.
+every other owner page. **Demo on a HOSTED deployment** is also out: demo
+shares one dev identity across every visitor, which is fine as a local-dev
+affordance but not on a `KAIROS_HOSTED` instance where every visitor would
+see and revoke each other's tokens. Plain local demo (`HOSTED` off) still
+has the panel.
 
 **CSRF.** Each POST reads a `csrf` field from the form and runs
 `kairos.csrf.require_csrf(user, form)`. The same token is used throughout the
@@ -43,7 +47,7 @@ from kairos.csrf import require_csrf
 from kairos.db import list_api_tokens, revoke_api_token
 from kairos.dbconn import db_now
 from kairos.http import form_data
-from kairos.scoping import SCOPES
+from kairos.scoping import SCOPES  # noqa: F401 — kept for test monkeypatch seam
 from kairos.templating import render
 
 log = logging.getLogger("kairos.panel")
@@ -68,28 +72,57 @@ def _msg_text(request: Request) -> str | None:
     return _MSG_TEXT.get(msg)
 
 
-def _panel_unavailable_in_this_mode():
-    """The panel's refusal for capability / none modes — one answer, two uses.
+def _panel_is_unavailable() -> bool:
+    """True if the current deployment cannot serve the panel at all.
 
     The accountless (`capability`) mode has no uid to attribute a token to and
-    `none` has no owner auth at all, so neither can serve the panel. Rendered
-    as a 404, not a 401, because the page does not exist in these modes rather
-    than existing-but-forbidden: an operator who flipped to one of these modes
-    has a working deployment, and finding a Kairos API-token page lurking under
-    their URL would be the wrong answer.
+    `none` has no owner auth at all, so neither can serve the panel.
+
+    **Hosted demo is also out.** `demo` mode shares one dev identity across
+    every visitor, which is fine as a local-dev affordance but not on a
+    `KAIROS_HOSTED` deployment: any visitor would see and mint tokens under the
+    shared uid, and one visitor's token would be revocable by the next. The
+    panel therefore self-404s when `AUTH=demo` AND `HOSTED=on`. Plain local
+    `demo` (not hosted) still has the panel, so a developer poking at the
+    feature sees it.
+    """
+    if settings.AUTH_MODE in ("capability", "none"):
+        return True
+    if settings.AUTH_MODE == "demo" and settings.HOSTED:
+        return True
+    return False
+
+
+def _panel_unavailable_in_this_mode():
+    """The panel's refusal for capability / none / hosted-demo — one answer, three uses.
+
+    Rendered as a 404, not a 401, because the page does not exist in these
+    modes rather than existing-but-forbidden: an operator who flipped to one
+    of these modes has a working deployment, and finding a Kairos API-token
+    page lurking under their URL would be the wrong answer.
     """
     from kairos.templating import create_env
     env = create_env()
-    detail = (
-        "This Kairos deployment manages polls by emailed capability link, so "
-        "there are no owner accounts to mint tokens from. Use KAIROS_API_KEY / "
-        "KAIROS_API_KEYS to configure static credentials, or switch "
-        "KAIROS_AUTH to demo, header or oidc to enable owner-minted tokens."
-        if settings.AUTH_MODE == "capability"
-        else "This deployment has no owner authentication configured "
-             "(KAIROS_AUTH=none), so no account can mint API tokens. Configure "
-             "KAIROS_AUTH=demo, header or oidc to enable owner-minted tokens."
-    )
+    if settings.AUTH_MODE == "capability":
+        detail = (
+            "This Kairos deployment manages polls by emailed capability link, so "
+            "there are no owner accounts to mint tokens from. Use KAIROS_API_KEY / "
+            "KAIROS_API_KEYS to configure static credentials, or switch "
+            "KAIROS_AUTH to demo, header or oidc to enable owner-minted tokens."
+        )
+    elif settings.AUTH_MODE == "demo" and settings.HOSTED:
+        detail = (
+            "This deployment runs in demo mode on a KAIROS_HOSTED instance, so "
+            "every visitor shares one identity — not an account to mint "
+            "revocable tokens against. Configure KAIROS_AUTH=header or oidc to "
+            "enable owner-minted tokens."
+        )
+    else:
+        detail = (
+            "This deployment has no owner authentication configured "
+            "(KAIROS_AUTH=none), so no account can mint API tokens. Configure "
+            "KAIROS_AUTH=demo, header or oidc to enable owner-minted tokens."
+        )
     return render(
         env, "message.html", status_code=404,
         title="Tokens unavailable", heading="API tokens are not available here",
@@ -111,6 +144,20 @@ def _login_or_401(next_path: str):
                   heading="Sign in required", error=True, user=None,
                   detail="This page is for poll owners. Sign in via your "
                          "organization's portal or identity proxy.")
+
+
+# Response headers for every panel render. `no-store` keeps the page out of a
+# shared cache (a proxy) and the browser's history-back store, and the mint
+# response disclosing the plaintext *especially* does not belong in either.
+# `Pragma: no-cache` is for HTTP/1.0 intermediaries the typical tunnel still
+# traverses. The panel has no reason to be cached at all — the list changes on
+# every mint/revoke and the CSRF token is bound to one owner's session — so
+# this applies to every response the panel returns, not just the one with the
+# plaintext in it.
+_NO_STORE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, private",
+    "Pragma": "no-cache",
+}
 
 
 def _render_panel(request, user, *, minted_plaintext=None, mint_error=None):
@@ -143,10 +190,15 @@ def _render_panel(request, user, *, minted_plaintext=None, mint_error=None):
     return render(
         env,
         "tokens.html",
+        headers=dict(_NO_STORE_HEADERS),
         user=user,
         title="API tokens",
         rows=rows,
-        scopes=SCOPES,
+        # The checkbox list is the OWNER_GRANTABLE set only; operator-only
+        # capabilities (`mail:force`, `imip:poll`) are never offered by the
+        # UI and the server rejects them even if the form POST names one.
+        # Sorted so the rendered order matches the documented set.
+        scopes=sorted(apitokens.OWNER_GRANTABLE),
         presets=apitokens.PRESETS,
         default_preset=apitokens.DEFAULT_PRESET,
         prefix=apitokens.TOKEN_PREFIX,
@@ -179,7 +231,7 @@ def _coerce_dt(value):
 @router.get("/tokens")
 def tokens_page(request: Request):
     """List this owner's tokens + the mint form. Owner-only, CSRF-protected POSTs."""
-    if settings.AUTH_MODE in ("capability", "none"):
+    if _panel_is_unavailable():
         return _panel_unavailable_in_this_mode()
     user = get_user(request)
     if not user:
@@ -198,7 +250,7 @@ def mint_token(request: Request, form=Depends(form_data)):
     the plaintext; we hand it to the template, which puts it inside a one-time
     disclosure banner and does not persist it beyond that render.
     """
-    if settings.AUTH_MODE in ("capability", "none"):
+    if _panel_is_unavailable():
         return _panel_unavailable_in_this_mode()
     user = get_user(request)
     if not user:
@@ -207,6 +259,15 @@ def mint_token(request: Request, form=Depends(form_data)):
     name = (form.get("name") or "").strip()
     expiry_code = (form.get("expiry") or apitokens.DEFAULT_PRESET).strip()
     requested_scopes = [s for s in form.getlist("scopes") if s]
+    # Issue #82's "all" grant, expanded at mint time to the current
+    # OWNER_GRANTABLE set (not a wildcard). The checkbox is a convenience on
+    # top of the per-scope boxes; expanding here rather than storing "*" means
+    # a grant minted today cannot silently widen when a new owner-grantable
+    # capability is added — the owner's intent was the set as it was at mint,
+    # not whatever the set becomes next year. Future capabilities will need a
+    # new, deliberate mint, which is the issue's whole posture.
+    if (form.get("scopes_all") or "").strip():
+        requested_scopes = sorted(apitokens.OWNER_GRANTABLE)
     seconds = apitokens.preset_seconds(expiry_code)
     if seconds is None:
         return _render_panel(request, user,
@@ -233,7 +294,7 @@ def revoke_token_route(token_id: str, request: Request,
     rather than throwing a 404, because that would read as "it worked", not
     as "it already was gone".
     """
-    if settings.AUTH_MODE in ("capability", "none"):
+    if _panel_is_unavailable():
         return _panel_unavailable_in_this_mode()
     user = get_user(request)
     if not user:
@@ -248,7 +309,13 @@ def revoke_token_route(token_id: str, request: Request,
     if not revoked:
         rows = list_api_tokens(user["uid"])
         if any(r["id"] == token_id for r in rows):
-            return RedirectResponse(f"{P}/tokens?msg=already-revoked", status_code=302)
+            return RedirectResponse(
+                f"{P}/tokens?msg=already-revoked",
+                status_code=302, headers=dict(_NO_STORE_HEADERS),
+            )
         raise HTTPException(404, "Token not found")
     log.info("owner %s revoked token %s", user["uid"], token_id)
-    return RedirectResponse(f"{P}/tokens?msg=revoked", status_code=302)
+    return RedirectResponse(
+        f"{P}/tokens?msg=revoked",
+        status_code=302, headers=dict(_NO_STORE_HEADERS),
+    )

@@ -240,6 +240,19 @@ def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depend
         for s in body.slots:
             if not s.start_time or not s.end_time:
                 raise HTTPException(400, "time_slot mode requires start_time and end_time for each slot")
+    # Issue #82: an owner-minted token acts as its owner — it cannot create a
+    # poll attributed to someone else. Reject a `creator` that is not the
+    # token's own uid (accept it when absent or equal). The env-keyring and
+    # `KAIROS_API_KEY` paths keep their behaviour: `uid == "api"` means
+    # "no account identity", and a service credential is allowed to attribute
+    # polls on behalf of a named user.
+    if (user.get("source") == "owner_token"
+            and body.creator and body.creator != user["uid"]):
+        raise HTTPException(
+            403,
+            "This token acts as its owner — it cannot attribute a poll to "
+            "another user. Omit `creator`, or set it to the token owner's uid.",
+        )
     creator_id = body.creator or user["uid"]
     from kairos.http import valid_email
 

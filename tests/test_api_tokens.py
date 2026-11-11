@@ -509,3 +509,355 @@ def _force_expire(plaintext: str, hours_ago: int) -> None:
     conn.commit()
     cursor.close()
     conn.close()
+
+
+# ===========================================================================
+# Post-review regression tests (PR #85). Each of these FAILS on 64a8b0a and
+# passes with the fix beneath it. Named for the finding in the review, so the
+# intent and the shape of the defect are both legible in the test output.
+# ===========================================================================
+
+
+# -- Finding #1 (HIGH): owner tokens enforce ownership on every policy ------
+
+
+def test_owner_token_cannot_read_another_owners_poll_under_default_policy(
+    client, monkeypatch
+):
+    """The issue's isolation property has to hold on the *default* policy.
+
+    64a8b0a's `can_reach` returned True unconditionally when `policy() == OPEN`,
+    which is the default on ETH / self-host / header / oidc deployments. In
+    that configuration an owner token reached every poll on the instance even
+    though the panel told the owner it would act as them — bypassing exactly
+    the control #82 was supposed to add.
+    """
+    # Make sure no explicit policy is set; this is the default configuration.
+    monkeypatch.setattr(settings, "POLL_REACH", "")
+    monkeypatch.setenv("KAIROS_POLL_REACH", "")
+    # And HOSTED is not set, so `policy()` resolves to OPEN.
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", False)
+    from kairos import reach
+    assert reach.policy() == reach.OPEN
+
+    plain_a, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    plain_b, _ = apitokens.mint(OWNER_B, "b", ["polls:read"], 3600)
+    r = as_bearer(client, plain_a).post("/scheduler/api/polls", json={
+        "title": "alice's", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    assert r.status_code == 200
+    poll_id = r.json()["id"]
+
+    # Bob's token must not reach alice's poll — even though the default policy
+    # is OPEN, which is what gives every env key the run of the instance.
+    r = as_bearer(client, plain_b).get(f"/scheduler/api/polls/{poll_id}")
+    assert r.status_code == 403, r.text
+
+
+def test_owner_token_cannot_delete_another_owners_poll_under_default_policy(
+    client, monkeypatch
+):
+    """DELETE follows the same reach guard as GET. A separate test because the
+    review named GET and DELETE explicitly, and the same defect could skip one
+    while catching the other if `guard_reach` ever diverged across methods."""
+    monkeypatch.setattr(settings, "POLL_REACH", "")
+    monkeypatch.setenv("KAIROS_POLL_REACH", "")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", False)
+    from kairos import reach
+    assert reach.policy() == reach.OPEN
+
+    plain_a, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    plain_b, _ = apitokens.mint(OWNER_B, "b", ["polls:write"], 3600)
+    r = as_bearer(client, plain_a).post("/scheduler/api/polls", json={
+        "title": "alice's", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    poll_id = r.json()["id"]
+    r = as_bearer(client, plain_b).delete(f"/scheduler/api/polls/{poll_id}")
+    assert r.status_code == 403, r.text
+    # Alice's poll is still there.
+    from kairos.db import get_poll
+    assert get_poll(poll_id) is not None
+
+
+def test_owner_token_list_filters_to_own_polls_under_default_policy(
+    client, monkeypatch
+):
+    """`GET /polls` listed every poll on 64a8b0a under the default policy —
+    `only_reachable`'s OPEN fast-path returned the argument unchanged for
+    every principal, so bob saw alice's titles. Must now filter."""
+    monkeypatch.setattr(settings, "POLL_REACH", "")
+    monkeypatch.setenv("KAIROS_POLL_REACH", "")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", False)
+    from kairos import reach
+    assert reach.policy() == reach.OPEN
+
+    plain_a, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    plain_b, _ = apitokens.mint(OWNER_B, "b", ["polls:write"], 3600)
+    for name, token in (("a-poll", plain_a), ("b-poll", plain_b)):
+        as_bearer(client, token).post("/scheduler/api/polls", json={
+            "title": name, "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+        })
+    a_list = as_bearer(client, plain_a).get("/scheduler/api/polls").json()
+    b_list = as_bearer(client, plain_b).get("/scheduler/api/polls").json()
+    assert [p["title"] for p in a_list] == ["a-poll"]
+    assert [p["title"] for p in b_list] == ["b-poll"]
+
+
+def test_env_key_still_reaches_every_poll_under_open(client):
+    """Byte-identical compatibility: the operator's `KAIROS_API_KEY` under the
+    default (OPEN) policy still sees everything. The owner-token tightening
+    must not touch env-key behaviour."""
+    plain_a, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    plain_b, _ = apitokens.mint(OWNER_B, "b", ["polls:write"], 3600)
+    for name, token in (("a-poll", plain_a), ("b-poll", plain_b)):
+        as_bearer(client, token).post("/scheduler/api/polls", json={
+            "title": name, "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+        })
+    # The legacy env key reaches every poll (reach.EVERY_POLL).
+    legacy_list = as_bearer(client, LEGACY).get("/scheduler/api/polls").json()
+    titles = sorted(p["title"] for p in legacy_list)
+    assert titles == ["a-poll", "b-poll"]
+
+
+def test_owner_token_cannot_read_another_owners_poll_under_scoped(
+    client, monkeypatch
+):
+    """The same property, under the explicit `scoped` policy. 64a8b0a already
+    held this one; keep it in the regression suite to prove the fix did not
+    regress scoped reach either."""
+    monkeypatch.setattr(settings, "POLL_REACH", "scoped")
+    plain_a, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    plain_b, _ = apitokens.mint(OWNER_B, "b", ["polls:read"], 3600)
+    r = as_bearer(client, plain_a).post("/scheduler/api/polls", json={
+        "title": "alice's", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    poll_id = r.json()["id"]
+    r = as_bearer(client, plain_b).get(f"/scheduler/api/polls/{poll_id}")
+    assert r.status_code == 403
+
+
+# -- Finding #2: owner token cannot forge creator on POST /polls ------------
+
+
+def test_owner_token_refuses_to_create_a_poll_as_another_user(client):
+    """`body.creator` was `or user["uid"]`'d in 64a8b0a, so an owner token
+    minted by alice could post `{"creator": "bob"}` and have the poll
+    attributed to bob — defeating "a token acts as its owner"."""
+    plain, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    r = as_bearer(client, plain).post("/scheduler/api/polls", json={
+        "title": "forged", "mode": "full_day",
+        "slots": [{"date": "2026-08-01"}],
+        "creator": OWNER_B,
+    })
+    assert r.status_code == 403, r.text
+    # Nothing was written.
+    from kairos.db import list_polls
+    assert list_polls() == []
+
+
+def test_owner_token_may_name_its_own_uid_as_creator(client):
+    """The permissive side: `creator == token owner's uid` is accepted — the
+    refusal is per-mismatch, not per-presence-of-creator."""
+    plain, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    r = as_bearer(client, plain).post("/scheduler/api/polls", json={
+        "title": "own", "mode": "full_day",
+        "slots": [{"date": "2026-08-01"}],
+        "creator": OWNER_A,
+    })
+    assert r.status_code == 200, r.text
+
+
+def test_env_key_may_still_attribute_a_poll_to_a_named_user(client):
+    """Env keys keep today's behaviour byte-identically: a service credential
+    like `KAIROS_API_KEY` is allowed to name a creator on the body (ADR-0001).
+    Only owner tokens have the restriction."""
+    r = as_bearer(client, LEGACY).post("/scheduler/api/polls", json={
+        "title": "service", "mode": "full_day",
+        "slots": [{"date": "2026-08-01"}],
+        "creator": OWNER_B,
+    })
+    assert r.status_code == 200, r.text
+    from kairos.db import get_poll
+    assert get_poll(r.json()["id"])["creator_id"] == OWNER_B
+
+
+# -- Finding #3: operator-only scopes stay env-key-only ---------------------
+
+
+def test_the_mint_api_refuses_an_operator_only_scope():
+    """`mail:force` and `imip:poll` are operator affordances (bypassing a 24h
+    cooldown, running the instance-wide inbox poll). The panel must not let an
+    owner mint a token with either, even via a form-tampering POST."""
+    with pytest.raises(ValueError, match="not owner-grantable"):
+        apitokens.mint(OWNER_A, "n", ["mail:force"], 3600)
+    with pytest.raises(ValueError, match="not owner-grantable"):
+        apitokens.mint(OWNER_A, "n", ["imip:poll"], 3600)
+
+
+def test_the_mint_route_rejects_a_form_tampered_operator_scope(client):
+    """Belt-and-braces: even if a caller POSTs `scopes=mail:force` directly
+    (the UI never offers it), the server refuses and re-renders with the
+    error inline — no row is written."""
+    as_owner(client, OWNER_A)
+    r = client.get("/scheduler/tokens")
+    csrf = _csrf_from(r.text)
+    r = client.post("/scheduler/tokens", data={
+        "csrf": csrf, "name": "forge",
+        "scopes": ["mail:force"], "expiry": "30d",
+    })
+    assert r.status_code == 200
+    assert "not owner-grantable" in r.text
+    from kairos.db import list_api_tokens
+    assert list_api_tokens(OWNER_A) == []
+
+
+def test_the_panel_offers_only_owner_grantable_scopes(client):
+    """The mint form's checkbox list is the OWNER_GRANTABLE set only — a
+    clear UI, not relying on the server to catch tampering (the server does
+    catch it, but the panel never offers the mistake in the first place)."""
+    as_owner(client, OWNER_A)
+    r = client.get("/scheduler/tokens")
+    assert r.status_code == 200
+    assert 'value="polls:read"' in r.text
+    assert 'value="polls:write"' in r.text
+    assert 'value="respond"' in r.text
+    assert 'value="mail:send"' in r.text
+    # Operator-only scopes are not offered.
+    assert 'value="mail:force"' not in r.text
+    assert 'value="imip:poll"' not in r.text
+
+
+# -- Finding #4: one clock across all timestamp columns ---------------------
+
+
+def test_expiry_lifetime_is_exact_under_a_local_non_utc_server(
+    client, monkeypatch
+):
+    """MySQL/MariaDB writes CURRENT_TIMESTAMP in session-local time; 64a8b0a
+    wrote created_at/expires_at with `datetime.utcnow()` while comparing them
+    with `db_now()` (local time on MySQL), so the token's lifetime was off by
+    the server UTC offset. The fix uses `db_now()` for both, so lifetime stays
+    exact even when the server clock is local.
+    """
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    # Simulate a MySQL deployment in a local non-UTC timezone: `db_now()` on
+    # MySQL returns `datetime.now()`. We monkeypatch it to a fixed local-time
+    # instant, then another fixed local-time instant one hour later.
+    calls = {"n": 0}
+    # UTC "now" would be 2026-01-15 00:00, but the server's local clock is
+    # +05:00, so `db_now()` reports 05:00. The difference used to turn into
+    # an expiry shift.
+    LOCAL_NOW = _dt(2026, 1, 15, 5, 0, 0)
+
+    def fake_db_now():
+        calls["n"] += 1
+        return LOCAL_NOW
+
+    monkeypatch.setattr("kairos.dbconn.db_now", fake_db_now)
+
+    # Mint with a precise 3600s lifetime.
+    plain, row = apitokens.mint(OWNER_A, "t", ["polls:read"], 3600)
+    assert (row["expires_at"] - row["created_at"]).total_seconds() == 3600
+    # created_at matches the local clock exactly.
+    assert row["created_at"] == LOCAL_NOW
+    assert row["expires_at"] == LOCAL_NOW + _td(seconds=3600)
+
+    # And the token is still live when compared at the same local instant.
+    r = as_bearer(client, plain).get("/scheduler/api/whoami")
+    assert r.status_code == 200, r.text
+
+
+# -- Finding #5: hosted demo makes the panel unavailable --------------------
+
+
+def test_the_panel_is_unavailable_in_hosted_demo(client, monkeypatch):
+    """Demo mode shares one dev identity across every visitor. On a HOSTED
+    deployment that would mean every visitor sees and mints tokens under the
+    shared uid, and one visitor's token would be revocable by the next. The
+    panel must self-404 in that specific combination.
+    """
+    monkeypatch.setattr(settings, "AUTH_MODE", "demo")
+    monkeypatch.setattr(settings, "HOSTED", True)
+    r = client.get("/scheduler/tokens")
+    assert r.status_code == 404
+    # The copy explains why, so an operator sees something more useful than a
+    # generic "not found".
+    assert "demo" in r.text.lower() and "hosted" in r.text.lower()
+
+
+def test_the_panel_is_still_available_in_plain_local_demo(client, monkeypatch):
+    """Plain demo (not hosted) still has the panel — a developer poking at
+    the feature on their laptop sees it. The gate is specifically the
+    `demo AND hosted` combination.
+    """
+    monkeypatch.setattr(settings, "AUTH_MODE", "demo")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    # Demo mode's `get_user` synthesises a user from a fixed uid; the panel
+    # renders.
+    r = client.get("/scheduler/tokens")
+    assert r.status_code == 200
+    assert "API tokens" in r.text
+
+
+# -- Finding #6: Cache-Control: no-store on the panel -----------------------
+
+
+def test_the_mint_response_disclosing_the_plaintext_is_not_cached(client):
+    """The one response that has the plaintext in it must not land in a
+    shared cache (a proxy) or the browser history-back store."""
+    as_owner(client, OWNER_A)
+    r = client.get("/scheduler/tokens")
+    csrf = _csrf_from(r.text)
+    r = client.post("/scheduler/tokens", data={
+        "csrf": csrf, "name": "t", "scopes": ["polls:read"], "expiry": "30d",
+    })
+    assert r.status_code == 200
+    cache_control = r.headers.get("cache-control", "").lower()
+    assert "no-store" in cache_control
+    assert "no-cache" in cache_control
+    assert r.headers.get("pragma", "").lower() == "no-cache"
+
+
+def test_the_panel_list_response_is_not_cached(client):
+    """Every panel render carries the no-store headers, not just the one with
+    the plaintext — the list carries token prefixes and the CSRF token and
+    has no reason to be cached at all."""
+    as_owner(client, OWNER_A)
+    r = client.get("/scheduler/tokens")
+    assert r.status_code == 200
+    cache_control = r.headers.get("cache-control", "").lower()
+    assert "no-store" in cache_control
+
+
+# -- Finding #7: "All owner permissions" shortcut ---------------------------
+
+
+def test_the_all_owner_permissions_shortcut_expands_at_mint_time(client):
+    """A single-checkbox shortcut for the owner-grantable set — expanded to
+    the explicit scope list on the stored row (not a wildcard). A grant minted
+    today cannot silently widen when a new owner-grantable scope is added.
+    """
+    as_owner(client, OWNER_A)
+    r = client.get("/scheduler/tokens")
+    csrf = _csrf_from(r.text)
+    # Just the `scopes_all` checkbox, no per-scope boxes. 64a8b0a had no such
+    # shortcut at all — the test was impossible to write.
+    r = client.post("/scheduler/tokens", data={
+        "csrf": csrf, "name": "all", "expiry": "30d", "scopes_all": "1",
+    })
+    assert r.status_code == 200, r.text
+    from kairos.db import list_api_tokens
+    [row] = list_api_tokens(OWNER_A)
+    stored = set(row["scopes"].split(","))
+    # Expanded to exactly the OWNER_GRANTABLE set (polls:write implies
+    # polls:read, so the stored form is the closure, same as `mint` always does).
+    assert stored == apitokens.OWNER_GRANTABLE
+    # Not a wildcard: operator-only scopes are not stored.
+    assert "mail:force" not in stored
+    assert "imip:poll" not in stored
+    assert "*" not in stored

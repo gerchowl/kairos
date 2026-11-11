@@ -352,7 +352,17 @@ def can_reach(
     management authority over, so an owner's token answers the same polls that
     owner's dashboard does — including polls created *after* the token was
     minted, which a static `~` grant cannot represent.
+
+    **Owner tokens enforce ownership on every policy.** The `OPEN` fast-path is
+    for env-keyring and `KAIROS_API_KEY` callers, where the operator asked for
+    every key to reach every poll by not configuring a policy. An owner-minted
+    token is per-owner by construction — the panel attributes it to a signed-in
+    uid and the issue's promise is that it "cannot read other owners' polls".
+    An `OPEN` deployment honours that promise too, so the bypass is restricted
+    to principals whose `source` is not `owner_token`.
     """
+    if principal is not None and principal.get("source") == "owner_token":
+        return _is_owner_token_for(principal, poll)
     if policy() == OPEN:
         return True
     if principal is not None:
@@ -400,8 +410,17 @@ def only_reachable(polls: list[dict], request: Request, **kwargs) -> list[dict]:
 
     Under `open` this returns the argument unchanged without asking the predicate
     about a single row — so the default configuration does not even walk the polls.
+
+    **Owner tokens are still filtered under `open`.** An env key under `open`
+    is instance-wide by the operator's declaration (no policy configured); an
+    owner-minted token is per-owner by construction, and the issue's promise
+    that it "cannot read other owners' polls" has to hold on every policy.
+    The `open` fast-path is therefore guarded on the principal's `source`.
     """
-    if policy() == OPEN:
+    principal = kwargs.get("principal")
+    is_owner_token = (principal is not None
+                      and principal.get("source") == "owner_token")
+    if policy() == OPEN and not is_owner_token:
         return polls
     return [poll for poll in polls if can_reach(poll, request, **kwargs)]
 
@@ -558,19 +577,27 @@ def guard_reach(request: Request, principal: dict) -> None:
       parameter `{pid}` skipped the check entirely while the audit — matching the
       same literal — reported the route table clean, and a `polls:read` key read
       every respondent on the instance with the suite green.
+
+    **Owner tokens enforce ownership on every policy.** The `OPEN` fast-path is
+    for env-keyring callers, whose operator opted them into reaching everything
+    by not configuring a policy; owner-minted tokens are per-owner by issue
+    #82's construction, and the promise that one "cannot read other owners'
+    polls" has to hold on every policy — otherwise an owner token on a default
+    (`ETH/self-host/header/oidc`) deployment reaches every poll on the instance,
+    which is the opposite of what the panel told the owner it would do.
     """
-    if policy() == OPEN:
+    is_owner_token = principal.get("source") == "owner_token"
+    if policy() == OPEN and not is_owner_token:
         return
     poll_id = required_poll_id(request)
-    if key_reaches(principal, poll_id):
+    if not is_owner_token and key_reaches(principal, poll_id):
         return
     # Issue #82: an owner-minted token reaches polls its owner holds management
     # authority over. Unlike an env-keyring entry, this *is* a database read
     # (the owner uid on the row is what makes the match), so it is only
-    # consulted when the static grant above fails — and only for principals
-    # that are actually owner tokens, so an env key under `scoped` stays a
-    # pure function of its grant.
-    if principal.get("source") == "owner_token":
+    # consulted for principals that are actually owner tokens, so an env key
+    # under `scoped` stays a pure function of its grant.
+    if is_owner_token:
         from kairos.db import get_poll
         poll = get_poll(poll_id)
         if poll is not None and _is_owner_token_for(principal, poll):

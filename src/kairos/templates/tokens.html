@@ -66,6 +66,10 @@
 
       <fieldset>
         <legend class="label-text font-semibold">Scopes</legend>
+        <label class="label cursor-pointer justify-start gap-2 mt-2">
+          <input type="checkbox" name="scopes_all" value="1" class="checkbox checkbox-sm">
+          <span class="label-text"><strong>All owner permissions</strong> — grants every owner-grantable scope below. Shortcut; a grant minted today lists each scope on the row.</span>
+        </label>
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-1 mt-2">
           {% for s in scopes %}
           <label class="label cursor-pointer justify-start gap-2">
@@ -74,7 +78,7 @@
           </label>
           {% endfor %}
         </div>
-        <p class="text-xs opacity-70 mt-1"><code>polls:write</code> implies <code>polls:read</code>; <code>mail:force</code> implies <code>mail:send</code>. Mail scopes are opt-in at mint time — grant them only to tokens that actually need to send mail.</p>
+        <p class="text-xs opacity-70 mt-1"><code>polls:write</code> implies <code>polls:read</code>. Mail scopes are opt-in at mint time — grant <code>mail:send</code> only to tokens that actually need to send mail. Operator affordances (<code>mail:force</code>, <code>imip:poll</code>) are not owner-grantable; configure <code>KAIROS_API_KEYS</code> for those.</p>
       </fieldset>
 
       <label class="form-control w-full max-w-xs">

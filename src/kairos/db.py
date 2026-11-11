@@ -907,15 +907,27 @@ def get_unread_notification_count(user_id: str) -> int:
 
 
 def insert_api_token(token_id: str, owner_uid: str, name: str, token_hash: str,
-                     prefix: str, scopes: str, expires_at) -> None:
-    """Persist one minted token. `expires_at` is a `datetime`, `scopes` is a
-    comma-joined grant string over `scoping.SCOPES` (validated by the caller)."""
+                     prefix: str, scopes: str, expires_at, created_at=None) -> None:
+    """Persist one minted token. `expires_at` and (optional) `created_at` are
+    `datetime`s, `scopes` is a comma-joined grant string over `scoping.SCOPES`
+    (validated by the caller).
+
+    `created_at` is written explicitly rather than inheriting the column's
+    `CURRENT_TIMESTAMP` default so every time column on this row is in the
+    same dialect as `dbconn.db_now()` — the comparison `resolve_token` uses
+    for expiry. SQLite's `CURRENT_TIMESTAMP` is UTC and MySQL's is session-
+    local, so a mix of defaulted and Python-computed values would read back as
+    different clocks on MySQL/MariaDB.
+    """
     conn = get_connection()
     cursor = conn.cursor()
+    if created_at is None:
+        from kairos.dbconn import db_now
+        created_at = db_now()
     cursor.execute(
         "INSERT INTO sched_api_tokens (id, owner_uid, name, token_hash, prefix,"
-        " scopes, expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (token_id, owner_uid, name, token_hash, prefix, scopes, expires_at),
+        " scopes, created_at, expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        (token_id, owner_uid, name, token_hash, prefix, scopes, created_at, expires_at),
     )
     conn.commit()
     cursor.close()
@@ -969,12 +981,13 @@ def revoke_api_token(token_id: str, owner_uid: str) -> bool:
     matches zero rows (`revoked_at IS NULL` is already false), and the API panel
     reads that as "already revoked" rather than as a fresh action.
     """
+    from kairos.dbconn import db_now
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE sched_api_tokens SET revoked_at = CURRENT_TIMESTAMP"
+        "UPDATE sched_api_tokens SET revoked_at = %s"
         " WHERE id = %s AND owner_uid = %s AND revoked_at IS NULL",
-        (token_id, owner_uid),
+        (db_now(), token_id, owner_uid),
     )
     conn.commit()
     revoked = cursor.rowcount > 0
@@ -993,11 +1006,12 @@ def touch_api_token_last_used(token_id: str) -> None:
     write rate at no useful fidelity, since `last_used_at` is only for the
     panel's "last used" column.
     """
+    from kairos.dbconn import db_now
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE sched_api_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE id = %s",
-        (token_id,),
+        "UPDATE sched_api_tokens SET last_used_at = %s WHERE id = %s",
+        (db_now(), token_id),
     )
     conn.commit()
     cursor.close()
