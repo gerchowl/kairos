@@ -85,12 +85,14 @@ def _panel_is_unavailable() -> bool:
     panel therefore self-404s when `AUTH=demo` AND `HOSTED=on`. Plain local
     `demo` (not hosted) still has the panel, so a developer poking at the
     feature sees it.
+
+    One function with `apitokens.tokens_enabled()` (inverted): the panel self-
+    404s iff `resolve_token` refuses bearers, so flipping into any of these
+    modes takes down the surface *and* its credentials at the same instant.
+    Duplicating the check lets one half drift (PR #85 round-2 finding #3) --
+    tokens outlived the panel, so a mode switch left live bearers behind.
     """
-    if settings.AUTH_MODE in ("capability", "none"):
-        return True
-    if settings.AUTH_MODE == "demo" and settings.HOSTED:
-        return True
-    return False
+    return not apitokens.tokens_enabled()
 
 
 def _panel_unavailable_in_this_mode():

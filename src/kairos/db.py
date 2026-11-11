@@ -704,8 +704,21 @@ def create_invite(poll_id: str, email: str, required: bool = True, name: str | N
             "responded": False, "required": required, "name": name}
 
 
-def update_invite(invite_id: str, name: str | None = None, email: str | None = None,
+def update_invite(poll_id: str, invite_id: str, name: str | None = None,
+                  email: str | None = None,
                   required: bool | None = None) -> bool:
+    """Update one invite's contact/required flag, iff it belongs to `poll_id`.
+
+    The `AND poll_id = %s` in the WHERE is the IDOR guard (PR #85 round-2
+    finding): every route that reaches this call has already authorized the
+    `poll_id` path parameter, but the invite id came from the same URL and is
+    not checked against the row's `poll_id` column -- so a route that forgets
+    to pass the parent would turn its own authorized caller into one that may
+    edit any invite on the instance. A mismatch answers exactly like a missing
+    id (rowcount 0, False), so callers that render 404 for "no such invite"
+    render the same 404 for "wrong parent" without a second branch -- and
+    without the existence oracle a 403-vs-404 split would create.
+    """
     sets, params = [], []
     if name is not None:
         sets.append("name = %s")
@@ -720,8 +733,9 @@ def update_invite(invite_id: str, name: str | None = None, email: str | None = N
         return False
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE sched_invites SET {', '.join(sets)} WHERE id = %s",
-                   (*params, invite_id))
+    cursor.execute(
+        f"UPDATE sched_invites SET {', '.join(sets)} WHERE id = %s AND poll_id = %s",
+        (*params, invite_id, poll_id))
     updated = cursor.rowcount > 0
     conn.commit()
     cursor.close()
@@ -729,9 +743,14 @@ def update_invite(invite_id: str, name: str | None = None, email: str | None = N
     return updated
 
 
-def update_response_contact(response_id: str, name: str | None = None,
+def update_response_contact(poll_id: str, response_id: str,
+                            name: str | None = None,
                             email: str | None = None,
                             required: bool | None = None) -> bool:
+    """Update one response's contact/required flag, iff it belongs to `poll_id`.
+
+    Same IDOR guard as `update_invite` -- see that function's docstring.
+    """
     sets, params = [], []
     if name is not None:
         sets.append("respondent_name = %s")
@@ -746,8 +765,9 @@ def update_response_contact(response_id: str, name: str | None = None,
         return False
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(f"UPDATE sched_responses SET {', '.join(sets)} WHERE id = %s",
-                   (*params, response_id))
+    cursor.execute(
+        f"UPDATE sched_responses SET {', '.join(sets)} WHERE id = %s AND poll_id = %s",
+        (*params, response_id, poll_id))
     updated = cursor.rowcount > 0
     conn.commit()
     cursor.close()
@@ -775,10 +795,12 @@ def get_invites(poll_id: str) -> list[dict]:
     return invites
 
 
-def delete_invite(invite_id: str) -> bool:
+def delete_invite(poll_id: str, invite_id: str) -> bool:
+    """Delete one invite, iff it belongs to `poll_id`. See `update_invite`."""
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM sched_invites WHERE id = %s", (invite_id,))
+    cursor.execute("DELETE FROM sched_invites WHERE id = %s AND poll_id = %s",
+                   (invite_id, poll_id))
     deleted = cursor.rowcount > 0
     conn.commit()
     cursor.close()
@@ -786,11 +808,31 @@ def delete_invite(invite_id: str) -> bool:
     return deleted
 
 
-def delete_response(response_id: str) -> bool:
+def delete_response(poll_id: str, response_id: str) -> bool:
+    """Delete one response (and its response_slots), iff it belongs to `poll_id`.
+
+    The belongs-to-poll check is a SELECT, not a WHERE on each DELETE: the
+    response-slots DELETE keys on `response_id` only (its table has no poll_id
+    column, so the FK cascade from the responses row is the only link to a
+    poll), and running it unconditionally for the wrong parent would still
+    wipe the child rows even though the response row itself would not go. The
+    pre-check turns the whole call into a no-op on mismatch, so a caller sees
+    the same rowcount-0 answer as "no such response" -- same IDOR guard as
+    `update_invite`, see that docstring.
+    """
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM sched_responses WHERE id = %s AND poll_id = %s",
+        (response_id, poll_id),
+    )
+    if cursor.fetchone() is None:
+        cursor.close()
+        conn.close()
+        return False
     cursor.execute("DELETE FROM sched_response_slots WHERE response_id = %s", (response_id,))
-    cursor.execute("DELETE FROM sched_responses WHERE id = %s", (response_id,))
+    cursor.execute("DELETE FROM sched_responses WHERE id = %s AND poll_id = %s",
+                   (response_id, poll_id))
     deleted = cursor.rowcount > 0
     conn.commit()
     cursor.close()

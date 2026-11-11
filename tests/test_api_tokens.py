@@ -861,3 +861,274 @@ def test_the_all_owner_permissions_shortcut_expands_at_mint_time(client):
     assert "mail:force" not in stored
     assert "imip:poll" not in stored
     assert "*" not in stored
+
+
+# ===========================================================================
+# PR #85 round-2 review. Each test FAILS on 08377d5 and passes with the fix
+# beneath it. Three findings, one adversarial child-id IDOR and two corners
+# of the owner-token lifecycle the round-1 review missed.
+# ===========================================================================
+
+
+# -- Round-2 Finding #1 (MEDIUM): child-id IDOR on invites and responses ----
+
+
+def _mint_two_owner_polls(client, monkeypatch):
+    """Alice and Bob each mint a token and each create one poll.
+
+    Returns `(plain_a, poll_a, plain_b, poll_b)`. Default policy (OPEN) so
+    the test does not accidentally cover scoped reach, which issue #82 already
+    handles -- the IDOR we are hunting is reachable even with `open` reach,
+    because the API's cross-owner isolation (round-1 finding #1) does hold at
+    the poll-id path parameter but was not held at the child id in the URL.
+    """
+    monkeypatch.setattr(settings, "POLL_REACH", "")
+    monkeypatch.setenv("KAIROS_POLL_REACH", "")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "HOSTED_UNKNOWN", False)
+    plain_a, _ = apitokens.mint(OWNER_A, "a", ["polls:write", "mail:send"], 3600)
+    plain_b, _ = apitokens.mint(OWNER_B, "b", ["polls:write"], 3600)
+    r = as_bearer(client, plain_a).post("/scheduler/api/polls", json={
+        "title": "alice's", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    assert r.status_code == 200, r.text
+    poll_a = r.json()["id"]
+    r = as_bearer(client, plain_b).post("/scheduler/api/polls", json={
+        "title": "bob's", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    assert r.status_code == 200, r.text
+    poll_b = r.json()["id"]
+    return plain_a, poll_a, plain_b, poll_b
+
+
+def test_owner_token_cannot_patch_response_on_another_owners_poll(
+    client, monkeypatch
+):
+    """Round-2 finding #1: PATCH `/polls/{alice_poll}/responses/{bob_response_id}`
+    on 08377d5 answered 200 and mutated bob's row, because the reach guard
+    was asked about `alice_poll` (alice owns it, allowed) but the data layer
+    then used only the response id in its WHERE. With the fix the data layer
+    additionally requires the response's `poll_id` column to match, so a
+    cross-poll id is a 404 (same wording and status as a response id that
+    does not exist -- no existence oracle).
+    """
+    plain_a, poll_a, plain_b, poll_b = _mint_two_owner_polls(client, monkeypatch)
+    # Plant a response on bob's poll directly at the data layer (bypassing the
+    # API's /respond is cleaner than minting a second token just to seed the
+    # row). Alice's token holds management authority on her own poll, which
+    # the reach guard confirms by the path -- but the response id is on bob's
+    # poll.
+    from kairos.db import add_response
+    bob_resp = add_response(poll_b, "Bob Jr", "bobjr@example.org", {})
+    r = as_bearer(client, plain_a).patch(
+        f"/scheduler/api/polls/{poll_a}/responses/{bob_resp['id']}",
+        json={"name": "pwned"},
+    )
+    assert r.status_code == 404, r.text
+    # And bob's row is untouched.
+    from kairos.db import find_response_by_email
+    row = find_response_by_email(poll_b, "bobjr@example.org")
+    assert row is not None
+    assert row["respondent_name"] == "Bob Jr"
+
+
+def test_owner_token_cannot_delete_response_on_another_owners_poll(
+    client, monkeypatch
+):
+    """Same IDOR, DELETE path. 08377d5 wiped bob's response; the fix answers
+    404 and leaves the row.
+    """
+    plain_a, poll_a, _plain_b, poll_b = _mint_two_owner_polls(client, monkeypatch)
+    from kairos.db import add_response, get_response
+    bob_resp = add_response(poll_b, "Bob Jr", "bobjr@example.org", {})
+    r = as_bearer(client, plain_a).delete(
+        f"/scheduler/api/polls/{poll_a}/responses/{bob_resp['id']}"
+    )
+    assert r.status_code == 404, r.text
+    assert get_response(bob_resp["id"]) is not None
+
+
+def test_owner_token_cannot_patch_invite_on_another_owners_poll(
+    client, monkeypatch
+):
+    """Same IDOR, PATCH /invites/{invite_id}."""
+    plain_a, poll_a, _plain_b, poll_b = _mint_two_owner_polls(client, monkeypatch)
+    from kairos.db import create_invite, get_invites
+    bob_inv = create_invite(poll_b, "bobinv@example.org", required=True,
+                             name="Bob Invitee")
+    r = as_bearer(client, plain_a).patch(
+        f"/scheduler/api/polls/{poll_a}/invites/{bob_inv['id']}",
+        json={"email": "pwned@example.org"},
+    )
+    assert r.status_code == 404, r.text
+    [invite_row] = [i for i in get_invites(poll_b) if i["id"] == bob_inv["id"]]
+    assert invite_row["email"] == "bobinv@example.org"
+
+
+def test_owner_token_cannot_delete_invite_on_another_owners_poll(
+    client, monkeypatch
+):
+    """Same IDOR, DELETE /invites/{invite_id}. 08377d5 removed bob's invite;
+    the fix answers 404 and leaves the row.
+    """
+    plain_a, poll_a, _plain_b, poll_b = _mint_two_owner_polls(client, monkeypatch)
+    from kairos.db import create_invite, get_invites
+    bob_inv = create_invite(poll_b, "bobinv@example.org", required=True)
+    r = as_bearer(client, plain_a).delete(
+        f"/scheduler/api/polls/{poll_a}/invites/{bob_inv['id']}"
+    )
+    assert r.status_code == 404, r.text
+    assert any(i["id"] == bob_inv["id"] for i in get_invites(poll_b))
+
+
+def test_same_poll_child_id_edits_still_work(client, monkeypatch):
+    """The permissive side: alice's token editing alice's own response and
+    invite still passes -- the guard narrows to cross-poll, not to no edits
+    at all."""
+    plain_a, poll_a, _plain_b, _poll_b = _mint_two_owner_polls(client, monkeypatch)
+    from kairos.db import add_response, create_invite, find_response_by_email
+    resp = add_response(poll_a, "Alice Jr", "aj@example.org", {})
+    inv = create_invite(poll_a, "ai@example.org", required=True)
+    r = as_bearer(client, plain_a).patch(
+        f"/scheduler/api/polls/{poll_a}/responses/{resp['id']}",
+        json={"name": "Alice Renamed"},
+    )
+    assert r.status_code == 200, r.text
+    row = find_response_by_email(poll_a, "aj@example.org")
+    assert row["respondent_name"] == "Alice Renamed"
+    r = as_bearer(client, plain_a).patch(
+        f"/scheduler/api/polls/{poll_a}/invites/{inv['id']}",
+        json={"required": False},
+    )
+    assert r.status_code == 200, r.text
+    r = as_bearer(client, plain_a).delete(
+        f"/scheduler/api/polls/{poll_a}/responses/{resp['id']}"
+    )
+    assert r.status_code == 200, r.text
+    r = as_bearer(client, plain_a).delete(
+        f"/scheduler/api/polls/{poll_a}/invites/{inv['id']}"
+    )
+    assert r.status_code == 200, r.text
+
+
+# -- Round-2 Finding #2 (LOW): no reach_warning for owner tokens -------------
+
+
+def test_owner_token_poll_create_does_not_emit_reach_warning_under_scoped(
+    client, monkeypatch
+):
+    """08377d5 emitted `reach_warning` on every `scoped` mint, including for
+    owner tokens -- even though the owner-token branch in `can_reach` /
+    `guard_reach` lets the token reach what it just created (uid matches the
+    row's `creator_id` / `owner_id`). The warning read as "your edits will be
+    refused" and was the opposite of true, so the fix suppresses it for
+    `source == "owner_token"`. Env-key callers keep the warning unchanged
+    (asserted by the next test)."""
+    monkeypatch.setattr(settings, "POLL_REACH", "scoped")
+    plain, _ = apitokens.mint(OWNER_A, "a", ["polls:write"], 3600)
+    r = as_bearer(client, plain).post("/scheduler/api/polls", json={
+        "title": "t", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "reach_warning" not in body, body
+    # And the token really does reach the poll -- the warning would have
+    # claimed otherwise.
+    poll_id = body["id"]
+    r = as_bearer(client, plain).get(f"/scheduler/api/polls/{poll_id}")
+    assert r.status_code == 200, r.text
+
+
+def test_env_key_without_grant_still_sees_reach_warning_under_scoped(
+    client, monkeypatch
+):
+    """The env-keyring side: a key without an explicit `~<poll>` grant under
+    scoped reach keeps its warning. The owner-token suppression above must
+    not bleed into env-key behaviour.
+    """
+    monkeypatch.setattr(settings, "POLL_REACH", "scoped")
+    # Configure a keyring entry that holds `polls:write` but no reach grant --
+    # exactly the env-key equivalent of the owner-token case above.
+    monkeypatch.setattr(settings, "API_KEYS", "env-rw-key:polls:write")
+    monkeypatch.setenv("KAIROS_API_KEYS", "env-rw-key:polls:write")
+    r = as_bearer(client, "env-rw-key").post("/scheduler/api/polls", json={
+        "title": "t", "mode": "full_day", "slots": [{"date": "2026-08-01"}],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "reach_warning" in body, body
+
+
+# -- Round-2 Finding #3 (LOW): tokens outlive the panel ---------------------
+
+
+def test_owner_token_stops_authenticating_when_panel_unavailable(
+    client, monkeypatch
+):
+    """When the deployment mode makes the panel unavailable (capability /
+    none / hosted-demo), `resolve_token` must also answer None so an operator
+    cannot leave live bearer credentials behind by flipping modes. On 08377d5
+    the panel self-404'd but every outstanding owner token kept working.
+
+    Tested in all three "panel-off" modes and in both directions (off, then
+    back on) to prove that tokens are suspended rather than destroyed: a bad
+    mode toggle is recoverable without a re-mint.
+    """
+    plain, _ = apitokens.mint(OWNER_A, "t", ["polls:read"], 3600)
+    # Baseline: works under header mode (the test's default).
+    assert as_bearer(client, plain).get(
+        "/scheduler/api/whoami"
+    ).status_code == 200
+
+    # capability mode: panel gone, tokens gone.
+    monkeypatch.setattr(settings, "AUTH_MODE", "capability")
+    r = as_bearer(client, plain).get("/scheduler/api/whoami")
+    assert r.status_code == 401, r.text
+    # Same wording as a revoked/expired/unknown bearer -- no new oracle.
+    assert "Invalid" in r.text
+
+    # none mode: same answer.
+    monkeypatch.setattr(settings, "AUTH_MODE", "none")
+    assert as_bearer(client, plain).get(
+        "/scheduler/api/whoami"
+    ).status_code == 401
+
+    # demo + HOSTED: same answer. Plain local demo (HOSTED=False) still
+    # authenticates (the panel is available for a developer poking at it), so
+    # the gate is specifically the demo+HOSTED combination -- mirroring
+    # `_panel_is_unavailable`.
+    monkeypatch.setattr(settings, "AUTH_MODE", "demo")
+    monkeypatch.setattr(settings, "HOSTED", True)
+    assert as_bearer(client, plain).get(
+        "/scheduler/api/whoami"
+    ).status_code == 401
+
+    # Flip back: tokens resume. Suspended, not destroyed.
+    monkeypatch.setattr(settings, "AUTH_MODE", "header")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    assert as_bearer(client, plain).get(
+        "/scheduler/api/whoami"
+    ).status_code == 200
+
+
+def test_plain_local_demo_still_resolves_owner_tokens(client, monkeypatch):
+    """The permissive side of finding #3: plain `demo` (HOSTED=False) still
+    authenticates owner tokens, because `_panel_is_unavailable` only closes
+    the panel in the `demo AND hosted` combination. A developer poking at
+    the feature on their laptop keeps their tokens live."""
+    plain, _ = apitokens.mint(OWNER_A, "t", ["polls:read"], 3600)
+    monkeypatch.setattr(settings, "AUTH_MODE", "demo")
+    monkeypatch.setattr(settings, "HOSTED", False)
+    r = as_bearer(client, plain).get("/scheduler/api/whoami")
+    assert r.status_code == 200, r.text
+
+
+def test_env_keys_are_unaffected_by_panel_unavailability(client, monkeypatch):
+    """Env keyring / `KAIROS_API_KEY` are operator-controlled credentials
+    whose lifecycle is the deployment's config, not the panel's. The
+    suspend-tokens-when-panel-unavailable rule applies only to owner-minted
+    bearers.
+    """
+    monkeypatch.setattr(settings, "AUTH_MODE", "capability")
+    r = as_bearer(client, LEGACY).get("/scheduler/api/whoami")
+    assert r.status_code == 200, r.text

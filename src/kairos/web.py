@@ -1012,11 +1012,15 @@ def update_participant(poll_id: str, request: Request, form=Depends(form_data)):
     email = valid_email(form.get("email", "")) if form.get("email") else None
     if form.get("email") and not email:
         raise HTTPException(400, "Not a valid email address")
+    # IDOR guard at the data layer: `update_invite` / `update_response_contact`
+    # additionally require the child row's `poll_id` column to match the path
+    # parameter, so a cross-poll ref is a no-op (rowcount 0) rather than a
+    # silent edit of another owner's row -- see `db.update_invite`.
     if kind == "invite" and ref:
-        update_invite(ref, name=name, email=email,
+        update_invite(poll_id, ref, name=name, email=email,
                       required=not form.get("optional"))
     elif kind == "response" and ref:
-        update_response_contact(ref, name=name or None, email=email,
+        update_response_contact(poll_id, ref, name=name or None, email=email,
                                 required=not form.get("optional"))
     else:
         raise HTTPException(400, "Bad participant reference")
@@ -1027,14 +1031,15 @@ def update_participant(poll_id: str, request: Request, form=Depends(form_data)):
 def remove_participant(poll_id: str, request: Request, form=Depends(form_data)):
     _user, _poll = _owner_action(request, form, poll_id)
     kind, ref = form.get("kind", ""), form.get("ref", "")
+    # IDOR guard at the data layer -- see the matching note in `update_participant`.
     if kind == "invite" and ref:
         # an invite's linked response (if any) goes too — the person was uninvited
         for r in get_responses(poll_id):
             if r.get("invite_id") == ref:
-                delete_response(r["id"])
-        delete_invite(ref)
+                delete_response(poll_id, r["id"])
+        delete_invite(poll_id, ref)
     elif kind == "response" and ref:
-        delete_response(ref)
+        delete_response(poll_id, ref)
     else:
         raise HTTPException(400, "Bad participant reference")
     return RedirectResponse(f"{P}/polls/{poll_id}?msg=removed", status_code=302)

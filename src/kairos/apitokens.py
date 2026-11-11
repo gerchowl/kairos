@@ -64,7 +64,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from kairos import db
+from kairos import db, settings
 from kairos.scoping import Principal, expand, key_id
 
 log = logging.getLogger("kairos.apitokens")
@@ -115,6 +115,39 @@ PRESETS: tuple[tuple[str, str, int], ...] = (
 )
 DEFAULT_PRESET = "30d"
 _PRESET_SECONDS = {code: seconds for code, _, seconds in PRESETS}
+
+
+def tokens_enabled() -> bool:
+    """True iff this deployment's auth mode can mint and resolve owner tokens.
+
+    The three modes with no stable owner identity to attribute a token to --
+    `capability` (no account), `none` (no owner auth), and `demo` on HOSTED
+    (one dev identity shared across every visitor) -- cannot. Both the panel's
+    self-404 and `resolve_token`'s refusal read off this one function so a
+    mode switch that makes the panel unavailable also stops outstanding
+    tokens from authenticating: tokens outlive the panel only when the two
+    answers disagree. An operator wanting to invalidate an owner's live
+    tokens by flipping modes used to have no effect on the tokens (the panel
+    was gone but every bearer kept working); now the credential dies with
+    the surface that minted it.
+
+    Deliberately pure-settings and no DB read: called on every authenticated
+    API request (the `resolve_token` gate), so it has to be free. A mode
+    change made after a process started reads here the moment the next
+    request runs, so no restart is required for the gate to take effect.
+
+    `resolve_token` returning None for these modes means a bearer that was
+    valid yesterday answers 401 today -- same wording as revoked/expired, so
+    a probing caller cannot distinguish "credentials cannot be resolved right
+    now" from "this token never existed". Flipping back restores
+    authentication: tokens are *suspended* by an unavailable panel, not
+    destroyed, so a bad mode toggle is recoverable without a re-mint.
+    """
+    if settings.AUTH_MODE in ("capability", "none"):
+        return False
+    if settings.AUTH_MODE == "demo" and settings.HOSTED:
+        return False
+    return True
 
 
 def preset_seconds(code: str) -> int | None:
@@ -317,8 +350,16 @@ def resolve_token(bearer: str) -> Principal | None:
     cost the same `SELECT`. We additionally run `hmac.compare_digest` over the
     row's stored hash against the computed one, which is redundant after an
     equality lookup but cheap and unmistakable in the next review.
+
+    **Tied to the panel's lifecycle.** A mode switch that makes the panel
+    unavailable (capability / none / hosted-demo) also makes `resolve_token`
+    answer None -- same wording as revoked/expired, so a bearer that was live
+    yesterday answers 401 today, and an operator can invalidate every
+    outstanding owner token by flipping modes. See `tokens_enabled()`.
     """
     if not bearer or not bearer.startswith(TOKEN_PREFIX):
+        return None
+    if not tokens_enabled():
         return None
     presented_hash = _hash(bearer)
     row = db.get_api_token_by_hash(presented_hash)
