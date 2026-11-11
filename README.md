@@ -58,8 +58,9 @@ retention).
 Every URL a poll is *supposed* to answer without a login lives under one of
 these prefixes. Everything else is owner surface and the proxy should require
 auth for it. The list is pinned by
-`tests/test_routes.py::test_no_public_link_generator_emits_root_token_form`
-(every link generator emits `/p/<token>` or `/p/i/<token>`) and by
+`tests/test_routes.py::test_link_generators_through_real_code_paths` (drive
+the real routes with a captured SMTP, assert every emitted URL carrying a
+poll-scoped token is under `/p/` or `/p/i/`) and by
 `test_no_root_catch_all_shadows_literal_or_fabricates_redirects` (nothing
 answers at the bare root of the prefix that would make `/<anything>` a public
 path):
@@ -86,43 +87,47 @@ poll creation + emailed single-use owner links — #30):
 | `/manage`  | Capability console: `GET /manage/<token>` (single-use link exchange), `POST /manage/link` (mail a fresh link) |
 
 There is no `/i` or `/ping` at the root of the prefix. Invite pages live
-under `/p/i/<token>`, and the health probe is `/api/ping` under `/api` —
-listing them separately would leak a bypass onto non-routes a future PR
-might claim.
+under `/p/i/<token>`; the probe above is `/health` (SELECT 1 + `{status,
+app}`), and the API carries its own unauth-free liveness ping at `/api/ping`
+inside the `/api` bypass — neither needs a separate rule, so listing them
+would only leak a bypass onto non-routes a future PR might claim.
 
 ### Cloudflare Access example
 
-Policy order matters — the bypass app has to sit **above** the allow-all, and
-each app's **Path** list has to enumerate the specific public prefixes. The
-example assumes Kairos at `kairos.example.com`, mounted at root (no
-`KAIROS_PREFIX`); for a prefix mount, add it to every path below. It also
-assumes default `KAIROS_AUTH`, so `/new` and `/manage` are owner routes;
-with `KAIROS_AUTH=capability`, move `/new` and `/manage/*` to the bypass
-app's **Path** list.
+Two self-hosted applications on the same host, each with its own **policy
+action**: the public-surface app enumerates the public prefixes and gets a
+Bypass policy, the owner-surface app covers the bare host and gets an Allow
+policy. Access picks **the most specific path match** when deciding which
+app owns a request (not the order the apps were registered in), so the
+public-prefix app wins for its paths and the bare-host app catches
+everything else. The example assumes Kairos at `kairos.example.com`,
+mounted at root (no `KAIROS_PREFIX`); for a prefix mount, add it to every
+path below. It also assumes default `KAIROS_AUTH`, so `/new` and `/manage`
+are owner routes; with `KAIROS_AUTH=capability`, move `/new` and
+`/manage/*` to the public app's **Path** list.
 
 ```
-# 1. Allow app — bare host, FAIL-CLOSED default for everything else.
-#    Registered first so it exists; the bypass app below wins for its paths.
-Name:          Kairos owners
-Type:          Self-hosted (Allow)
-Domain:        kairos.example.com     # bare host; no Path
-Policy:        Allow — your IdP group / email domain
-
-# 2. Bypass app — enumerated public prefixes, no login prompt.
+# Public surface — enumerated public prefixes, no login prompt.
 Name:          Kairos public surface
-Type:          Self-hosted (Bypass)
+Type:          Self-hosted
 Domain:        kairos.example.com
 Path:          /p/*, /v/*, /static/*, /api/*, /mcp/*,
                /health, /imprint, /privacy, /llms.txt, /robots.txt
                # + /new, /manage, /manage/*  when KAIROS_AUTH=capability
-Policy:        Allow — everyone (Bypass)
+Policy action: Bypass (everyone)
+
+# Owner surface — bare host, FAIL-CLOSED default for everything else.
+Name:          Kairos owners
+Type:          Self-hosted
+Domain:        kairos.example.com     # bare host; no Path
+Policy action: Allow — your IdP group / email domain
 ```
 
-**Do not use a wildcard bypass of `kairos.example.com/*` for the bypass app**
-— Access matches `host/*` against the bare `/` too, which would turn the
-owner dashboard public. The Path list has to enumerate the public prefixes,
-and the fail-closed allow app on the bare host (no Path) stays on top of
-everything else.
+**Do not give the public app a wildcard path of `kairos.example.com/*`** —
+Access matches `host/*` against the bare `/` too, which would turn the owner
+dashboard public. The public app's Path list has to enumerate the public
+prefixes; the owner app on the bare host (no Path) is always the
+less-specific match and catches everything else.
 
 With `KAIROS_PREFIX=/scheduler`, every path above gets the prefix:
 `/scheduler/p/*, /scheduler/v/*, /scheduler/static/*, /scheduler/api/*,

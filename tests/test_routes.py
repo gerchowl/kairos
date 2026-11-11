@@ -577,138 +577,654 @@ def test_static_mount_serves_assets(client):
 
 
 # -- Issue #88: every public-link generator emits the /p/ form --
+#
+# The audit here drives the REAL routes (web form, API, public, capability
+# manage console) against a real SQLite DB with a fake SMTP relay, captures
+# everything they emit (HTTP response bodies, sent mail bodies, llms.txt), and
+# refuses any URL whose path is the bare `{P}/<token>` form for a poll's
+# `public_token` or an invite's `token`.
+#
+# Driving the routes (rather than hand-constructing URLs and calling the link
+# builders directly) is the test's teeth: every one-line revert to the bare
+# form at web.py's `share_url` (owner view), api.py's `_share_url`, public.py's
+# agent.json vote URLs, web.py's nudge/reminder invite URL, and the capability
+# console's share link / decision poll URL — breaks this guard, because each of
+# those sites is on the path of one of the responses or emails we scan.
 
-def test_no_public_link_generator_emits_root_token_form():
-    """Audit every generator of a public poll URL -- email body, poll page,
-    ICS feed/attachment, iMIP REQUEST, agent.json, llms.txt -- and assert
-    none produces a bare `{base}/<token>` link. One regression here (a
-    template, a forgotten f-string) is how share links drift back to the
-    root and the proxy policy stops covering them.
 
-    This is the pair of `test_no_root_catch_all_shadows_literal_or_fabricates_
-    redirects`: together they say "every link is `/p/<token>`, and the root
-    is reserved for owner pages -- no redirect, no catch-all, no drift."""
-    from datetime import date as _date
-    from datetime import time as _time
+def _forbid_bare_token_form(blob: str, label: str, *, token: str,
+                            prefix: str, good_leaders: tuple,
+                            host_anchor: str = "testserver") -> None:
+    """A bare `{host}{prefix}/{token}` substring that is NOT part of any good
+    form (`{host}{prefix}/<leader>/{token}` for `leader` in `good_leaders`) is
+    the regression we are catching.
 
-    from kairos import email_service, templating
-    from kairos import ics as ics_mod
-
-    base = "https://x.example"
-    prefix = "/scheduler"
-    tok = "TOKENabcXYZ"
-    inv = "INVITEabc"
-    public_url = f"{base}{prefix}/p/{tok}"
-    invite_url = f"{base}{prefix}/p/i/{inv}"
-
-    poll = {
-        "id": "p1", "title": "Retreat", "description": "d",
-        "mode": "time_slot", "timezone": "Europe/Zurich",
-        "status": "open", "decided_slot_id": None, "public_token": tok,
-    }
-    slot = {"id": "s1", "date": _date(2026, 6, 8),
-            "start_time": _time(9, 0), "end_time": _time(9, 30)}
-
-    def forbid_root_form(blob: str, label: str, *, token: str = tok) -> None:
-        """A bare `{base}{prefix}/<token>` that is NOT the leading substring
-        of `{base}{prefix}/p/<token>` is the regression we are catching."""
-        bad = f"{base}{prefix}/{token}"
-        good = f"{base}{prefix}/p/{token}"
-        idx = 0
-        while True:
-            j = blob.find(bad, idx)
-            if j < 0:
-                break
-            if blob[j: j + len(good)] == good:
-                # It IS the /p/ form -- skip past the whole `good` match.
-                idx = j + len(good)
-                continue
-            raise AssertionError(
-                f"{label}: root-level token link `{bad}` appeared "
-                f"(context: ...{blob[max(0, j - 30):j + len(bad) + 30]!r}...)"
-            )
-        assert good in blob or f"{base}{prefix}/p/i/{inv}" in blob, (
-            f"{label}: neither `{good}` nor the invite form appears"
+    The hostname is in the anchor on purpose: without it, `/{token}` at an
+    empty prefix is a substring of `/p/{token}` (position 2, after the `/p`)
+    and would false-positive. Every URL emitted here is built from
+    `get_base_url(request)` or `request.url.hostname`, so the TestClient's
+    `base_url='https://testserver'` makes `testserver` a reliable anchor. The
+    substring search is otherwise scheme-agnostic: `https://x/<P>/<tok>` and
+    `webcal://x/<P>/<tok>` would both be caught.
+    """
+    bad = f"{host_anchor}{prefix}/{token}"
+    goods = tuple(f"{host_anchor}{prefix}/{leader}/{token}"
+                  for leader in good_leaders)
+    idx = 0
+    while True:
+        j = blob.find(bad, idx)
+        if j < 0:
+            break
+        matched = next((g for g in goods if blob[j:j + len(g)] == g), None)
+        if matched:
+            idx = j + len(matched)
+            continue
+        raise AssertionError(
+            f"{label}: bare `{bad}` found where only {goods} are allowed "
+            f"(context: ...{blob[max(0, j - 40):j + len(bad) + 40]!r}...)"
         )
 
-    # 1. Decided-event ICS (the one attached to the "we picked a date" email).
-    # RFC 5545 folds lines at 75 octets with `\r\n ` continuation, so unfold
-    # before substring checks for every ICS body.
-    def _unfold(ics_text: str) -> str:
-        return ics_text.replace("\r\n ", "").replace("\r\n\t", "")
 
-    decided = dict(poll, status="decided", decided_slot_id="s1")
-    decided_ics = _unfold(ics_mod.build_ics(decided, slot, public_url))
-    forbid_root_form(decided_ics, "build_ics / decided .ics URL")
+def _unfold_ics(blob: str) -> str:
+    """RFC 5545 folds at 75 octets with `\r\n ` continuation; unfold so the
+    token substring is contiguous when it sits across a fold boundary.
+    `\r\n\t` is the older HTAB-folded form some writers still emit."""
+    return blob.replace("\r\n ", "").replace("\r\n\t", "")
 
-    # 2. Reverse-calendar candidate feed (every open-poll subscribe).
-    feed = _unfold(ics_mod.build_feed_ics(decided, [slot], [], base_url=base,
-                                          prefix=prefix, total_expected=0))
-    forbid_root_form(feed, "build_feed_ics / candidate feed")
 
-    # 3. Invite feed with deep-link vote URLs.
-    inv_feed = _unfold(ics_mod.build_feed_ics(decided, [slot], [], base_url=base,
-                                              prefix=prefix, invite_token=inv,
-                                              total_expected=0))
-    forbid_root_form(inv_feed, "build_feed_ics / invite feed")
-    for av in ("yes", "maybe", "no"):
-        assert f"{prefix}/p/i/{inv}/s/s1/{av}" in inv_feed
+def _decoded_parts(msg) -> list[str]:
+    """Return each leaf payload of an email message as decoded text.
 
-    # 4. iMIP REQUEST (the invite .ics mail body).
-    req_ics = _unfold(ics_mod.build_request_ics(
-        decided, slot, "to@x.ch",
-        organizer_email="org@x.ch", organizer_name="Org",
-        url=public_url))
-    forbid_root_form(req_ics, "build_request_ics / iMIP REQUEST")
+    `msg.as_string()` encodes text/plain and text/html parts as base64 (the
+    default Content-Transfer-Encoding here), which hides the URL substrings a
+    scan of the raw stringification would otherwise see. Walk the tree,
+    decode each leaf, and return it as str — so a reminder URL sitting in a
+    base64-encoded text/plain body is still auditable.
+    """
+    parts: list[str] = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            parts.append(payload.decode(charset, errors="replace"))
+        except (LookupError, UnicodeDecodeError):
+            parts.append(payload.decode("utf-8", errors="replace"))
+    return parts
 
-    # 5. Decision email body (HTML + text). The outer MIMEMultipart("mixed")
-    # wraps a multipart/alternative (text + HTML) plus the .ics attachment;
-    # pull both parts out of the alternative wrapper.
-    dmsg = email_service.build_decision_message(
-        "to@x.ch", "Retreat", "2026-06-08", public_url,
-        "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n", "Lars", note="", reply_to="l@x.ch")
-    alt = dmsg.get_payload()[0]
-    text_part = alt.get_payload()[0].get_payload(decode=True).decode()
-    html_part = alt.get_payload()[1].get_payload(decode=True).decode()
-    forbid_root_form(text_part, "decision email text")
-    forbid_root_form(html_part, "decision email HTML")
 
-    # 6. Invite email body (multipart/alternative directly; text + HTML).
-    imsg = email_service.build_invite_message("to@x.ch", "Retreat", invite_url,
-                                              "Lars", reply_to="l@x.ch")
-    itext = imsg.get_payload()[0].get_payload(decode=True).decode()
-    ihtml = imsg.get_payload()[1].get_payload(decode=True).decode()
-    forbid_root_form(itext, "invite email text", token=inv)
-    forbid_root_form(ihtml, "invite email HTML", token=inv)
+def test_link_generators_through_real_code_paths(tmp_path, monkeypatch):
+    """E2E audit: drive the REAL routes against a real SQLite poll with
+    FEED+IMIP on and SMTP captured, then assert every outbound URL carrying a
+    poll-scoped token is under the `{P}/p/` or `{P}/p/i/` form.
 
-    # 7. agent.json shape (invitee self-describing surface) -- the URLs the
-    # route builds, asserted at the URL-construction site so a regression is
-    # caught here even if the HTTP shape stays the same.
-    vb = f"{base}{prefix}/p/i/{inv}/s/s1"
-    agent_blob = "\n".join([
-        f"{vb}/yes", f"{vb}/maybe", f"{vb}/no",
-        f"webcal://x.example{prefix}/p/i/{inv}/feed.ics",
-    ])
-    forbid_root_form(agent_blob, "agent.json vote/subscribe URLs", token=inv)
+    Surfaces exercised, with the link generator in parentheses:
 
-    # 8. The poll page itself (the "copy the share link" box).
-    env2 = templating.create_env()
-    rendered = templating.render(
-        env2, "poll.html", title="t", poll=decided, share_url=public_url,
-        user={"uid": "u", "name": "N", "email": "e@x.ch"},
-        now=_date(2026, 6, 8), responses=[], invites=[], contacts={},
-        total=0, pending_n=0, convergence={"state": "collecting"},
-        is_ts=True, ts_payload={"grid": [], "saved": None},
-        decided_label=None, msg=None, csrf_token="c", notif_count=0, notifs=[],
-    ).body.decode()
-    forbid_root_form(rendered, "poll.html share_url")
+    - Create poll via web form (`POST /new`) + list via `GET /` (web.py)
+    - Create / list / detail via API (api.py:`_share_url`)
+    - API `event.ics` for an open poll — serves the candidate feed
+      (ics.build_feed_ics)
+    - Owner view of the poll page (web.py's `share_url`, rendered into
+      poll.html) — mutation #1 target
+    - Invite via web form, invite via API (api.py:`invite_url`) — the API
+      response carries the invite URL; the API also sends an invite email,
+      whose body contains the URL
+    - Nudge via web (`POST /polls/{id}/remind`) — sends a reminder email with
+      the invite URL from web.py:`url = f"{base}{P}/p/i/{inv['token']}"` —
+      mutation #4 target
+    - Decide + email-decision via web and API — decision email with the ICS
+      attachment (ics.build_ics) and the poll URL (web.py:`poll_url` /
+      api.py:`_share_url`)
+    - API `imip-decision` — iMIP REQUEST email with poll URL (also an ics.py
+      build_request_ics path through the deep-link `{v}/<code>` short-link
+      affordance, which this guard checks is never the bare root form)
+    - Public pages: `GET /p/<token>`, `/p/<token>/event.ics` (decided + open),
+      `/p/i/<token>`, `/p/i/<token>/feed.ics`, `/p/i/<token>/agent.json`
+      (public.py:`vb` — mutation #3 target)
+    - `GET /llms.txt` — the static agent-discovery doc; a bare `{P}/<token>`
+      example there would tell agents to use the legacy form
 
-    # 9. llms.txt -- static agent-discovery doc in main.py.
-    llms_client = TestClient(main.app, base_url="https://x.example")
-    llms_body = llms_client.get("/scheduler/llms.txt").text
-    # llms.txt documents the invitee link shape, so the /p/i/ form must be
-    # mentioned and no bare `{P}/<token>` example may appear.
-    assert "/scheduler/p/i/<token>" in llms_body
-    # A bare `/scheduler/<token>` example in the docs is exactly the kind of
-    # regression that tells agents to use the legacy form.
-    assert "/scheduler/<token>" not in llms_body
+    Separately: `test_link_generators_through_real_code_paths_empty_prefix`
+    reruns this audit's core surfaces under `KAIROS_PREFIX=''` in a fresh
+    interpreter, so the module-level `P = settings.PREFIX` consumers are
+    re-imported rather than patched after the fact.
+    """
+    from kairos import api, db, email_service, main, settings, web  # noqa: F401
+    from kairos.csrf import make_csrf
+
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setenv("KAIROS_API_KEY", "k")
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
+    monkeypatch.setattr(settings, "IMIP_ENABLED", True)
+    monkeypatch.setattr(settings, "IMIP_ORGANIZER", "replies@kairos.example")
+    monkeypatch.setattr(settings, "IMIP_ORGANIZER_NAME", "Kairos")
+
+    sent: list = []
+
+    class _FakeSMTP:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def send_message(self, msg):
+            sent.append(msg)
+
+    monkeypatch.setattr(email_service, "SMTP_HOST", "smtp.example.net")
+    monkeypatch.setattr(email_service, "SMTP_FROM", "kairos@example.org")
+    monkeypatch.setattr(email_service, "_smtp_session", lambda: _FakeSMTP())
+    monkeypatch.setattr(email_service, "_last_refusal_logged", None)
+
+    prefix = "/scheduler"
+    hdr = {"X-User": "owner", "X-Email": "owner@x.ch", "X-Name": "Owner"}
+    api_hdr = {"Authorization": "Bearer k"}
+    csrf_owner = make_csrf("owner")
+
+    # Every body we must audit, collected as (label, text). Email bodies are
+    # appended after the client exits, so one flat list covers every surface.
+    scanned: list[tuple[str, str]] = []
+
+    def scan(label: str, resp) -> str:
+        """Capture a response body for the audit and return it unchanged."""
+        body = resp.text if hasattr(resp, "text") else str(resp)
+        scanned.append((label, body))
+        return body
+
+    with TestClient(main.create_app(), base_url="https://testserver",
+                    headers=hdr) as c:
+        # ---- 1. Create a poll via the web form.
+        r = c.post(f"{prefix}/new", data={
+            "title": "WebPoll", "mode": "full_day",
+            "timezone": "Europe/Zurich",
+            "dates": ["2026-06-08", "2026-06-09"],
+            "csrf": csrf_owner,
+        }, follow_redirects=False)
+        assert r.status_code == 302, r.text
+
+        web_poll = next(p for p in db.list_polls() if p["title"] == "WebPoll")
+        pid_w, tok_w = web_poll["id"], web_poll["public_token"]
+
+        # ---- 2. Create a poll via the API; the response includes `share_url`.
+        r = c.post(f"{prefix}/api/polls", headers=api_hdr, json={
+            "title": "ApiPoll", "mode": "time_slot", "creator": "owner",
+            "slots": [{"date": "2026-07-06", "start_time": "09:00",
+                       "end_time": "09:30"},
+                      {"date": "2026-07-06", "start_time": "09:30",
+                       "end_time": "10:00"}],
+        })
+        assert r.status_code == 200, r.text
+        api_poll = r.json()
+        pid_a, tok_a = api_poll["id"], api_poll["public_token"]
+        scan("POST /api/polls", r)
+
+        # ---- 3. API GETs: list, detail, event.ics (open -> feed).
+        scan("GET /api/polls (list)",
+             c.get(f"{prefix}/api/polls", headers=api_hdr))
+        scan("GET /api/polls/{id}",
+             c.get(f"{prefix}/api/polls/{pid_a}", headers=api_hdr))
+        scan("GET /api/polls/{id}/event.ics (open=feed)",
+             c.get(f"{prefix}/api/polls/{pid_a}/event.ics", headers=api_hdr))
+
+        # ---- 4. Owner view (web). Renders `share_url` into poll.html —
+        #         mutation #1's target (web.py:611).
+        r = c.get(f"{prefix}/polls/{pid_w}")
+        assert r.status_code == 200, r.text
+        scan("GET /polls/{id} (owner view)", r)
+        # Dashboard — exercises the list page too.
+        scan("GET / (dashboard)", c.get(f"{prefix}/"))
+
+        # ---- 5. Invite via the web form and via the API.
+        r = c.post(f"{prefix}/polls/{pid_w}/invite", data={
+            "email": "alice@x.ch", "csrf": csrf_owner,
+        }, follow_redirects=False)
+        assert r.status_code == 302, r.text
+        inv_w = next(i for i in db.get_invites(pid_w) if i["email"] == "alice@x.ch")
+        tok_iw = inv_w["token"]
+
+        r = c.post(f"{prefix}/api/polls/{pid_a}/invite", headers=api_hdr,
+                   json={"emails": ["bob@x.ch"], "required": True})
+        assert r.status_code == 200, r.text
+        scan("POST /api/polls/{id}/invite", r)
+        inv_a = next(i for i in db.get_invites(pid_a) if i["email"] == "bob@x.ch")
+        tok_ia = inv_a["token"]
+
+        # ---- 6. Remind via the web (POST /polls/{id}/remind). Alice is a
+        #         pending+cold invite, so the nudge engine sends her a reminder
+        #         email whose URL comes from web.py:873 — mutation #4's target.
+        r = c.post(f"{prefix}/polls/{pid_w}/remind", data={"csrf": csrf_owner},
+                   follow_redirects=False)
+        assert r.status_code == 302, r.text
+        assert "msg=nudged&inv=1" in r.headers["location"], r.headers
+
+        # ---- 7. API nudge for the same reason on the API poll.
+        r = c.post(f"{prefix}/api/polls/{pid_a}/nudge", headers=api_hdr,
+                   json={"force": False, "emails": None})
+        assert r.status_code == 200, r.text
+        scan("POST /api/polls/{id}/nudge", r)
+
+        # ---- 8. Decide + email-decision on the web poll. The decision email
+        #         carries the poll URL (web.py:967) and the .ics (ics.build_ics).
+        slots_w = db.get_poll(pid_w)["slots"]
+        r = c.post(f"{prefix}/polls/{pid_w}/decide", data={
+            "slot_id": slots_w[0]["id"], "csrf": csrf_owner,
+        }, follow_redirects=False)
+        assert r.status_code == 302, r.text
+
+        r = c.post(f"{prefix}/polls/{pid_w}/email-decision", data={
+            "note": "see you then", "csrf": csrf_owner,
+        }, follow_redirects=False)
+        assert r.status_code == 302, r.text
+
+        # ---- 9. Decide + email-decision + imip-decision on the API poll.
+        slots_a = db.get_poll(pid_a)["slots"]
+        r = c.post(f"{prefix}/api/polls/{pid_a}/decide", headers=api_hdr,
+                   json={"slot_id": slots_a[0]["id"]})
+        assert r.status_code == 200, r.text
+        scan("POST /api/polls/{id}/decide", r)
+
+        r = c.post(f"{prefix}/api/polls/{pid_a}/email-decision",
+                   headers=api_hdr, json={"note": "final"})
+        assert r.status_code == 200, r.text
+        scan("POST /api/polls/{id}/email-decision", r)
+
+        r = c.post(f"{prefix}/api/polls/{pid_a}/imip-decision",
+                   headers=api_hdr)
+        assert r.status_code == 200, r.text
+        scan("POST /api/polls/{id}/imip-decision", r)
+
+        # ---- 10. Public surfaces.
+        scan("GET /p/<token> (public page)",
+             c.get(f"{prefix}/p/{tok_w}"))
+        scan("GET /p/<token>/event.ics (decided)",
+             c.get(f"{prefix}/p/{tok_w}/event.ics"))
+        # The API poll is also decided — its public page + ics exercises
+        # another path through _share_url / build_ics.
+        scan("GET /p/<tok-api>", c.get(f"{prefix}/p/{tok_a}"))
+        scan("GET /p/<tok-api>/event.ics",
+             c.get(f"{prefix}/p/{tok_a}/event.ics"))
+
+        # Invite pages + feed + agent.json. public.py:310's `vb` is mutation
+        # #3's target; agent.json is where that line surfaces.
+        scan("GET /p/i/<tok> (invite page)",
+             c.get(f"{prefix}/p/i/{tok_iw}"))
+        scan("GET /p/i/<tok>/feed.ics",
+             c.get(f"{prefix}/p/i/{tok_iw}/feed.ics"))
+        scan("GET /p/i/<tok>/agent.json",
+             c.get(f"{prefix}/p/i/{tok_iw}/agent.json"))
+        scan("GET /p/i/<tok-api>/agent.json",
+             c.get(f"{prefix}/p/i/{tok_ia}/agent.json"))
+
+        # ---- 11. llms.txt — the agent-discovery doc; a bare `{P}/<token>`
+        #          example there would tell agents to use the legacy form.
+        llms_body = scan("GET /llms.txt", c.get(f"{prefix}/llms.txt"))
+        assert f"{prefix}/p/i/<token>" in llms_body
+        assert f"{prefix}/<token>" not in llms_body
+
+    # ---- 12. Email bodies (what the fake SMTP captured). text/plain and
+    #          text/html parts default to base64 Content-Transfer-Encoding,
+    #          which hides the URL substrings from a scan of `msg.as_string()`;
+    #          `_decoded_parts` walks the tree and decodes each leaf. ICS
+    #          attachments are also decoded here (as text/calendar), with the
+    #          `\r\n ` continuation lines unfolded so a folded token substring
+    #          is contiguous.
+    assert sent, "expected the fake SMTP to have captured some messages"
+    for i, msg in enumerate(sent):
+        subj = msg["Subject"] or "(no subject)"
+        for k, part in enumerate(_decoded_parts(msg)):
+            scanned.append((f"SMTP #{i} part #{k}: {subj!r}",
+                            _unfold_ics(part)))
+
+    # ---- 13. The audit itself.
+    # The poll's `public_token` may ONLY appear in a URL as `{P}/p/{token}`.
+    # An invite's `token` may ONLY appear as `{P}/p/i/{token}`. The short-link
+    # table maps `{P}/v/<code>` to `/p/i/<token>/s/...`, resolved server-side,
+    # so a /v/ short link does not contain the raw token and the audit never
+    # sees it in a bare form.
+    token_leaders = [
+        (tok_w, ("p",)),
+        (tok_a, ("p",)),
+        (tok_iw, ("p/i",)),
+        (tok_ia, ("p/i",)),
+    ]
+    for token, leaders in token_leaders:
+        for label, body in scanned:
+            _forbid_bare_token_form(_unfold_ics(body), label,
+                                    token=token, prefix=prefix,
+                                    good_leaders=leaders)
+
+    # ---- 14. Positive assertions: every link we expected to see appeared at
+    #          least once. A guard that passes because the body was EMPTY
+    #          (SMTP never captured anything, a route 500'd silently) must
+    #          itself fail; this closes that loophole.
+    want = {
+        f"{prefix}/p/{tok_w}":  "share link for web poll",
+        f"{prefix}/p/{tok_a}":  "share link for API poll",
+        f"{prefix}/p/i/{tok_iw}": "invite link for web invite",
+        f"{prefix}/p/i/{tok_ia}": "invite link for API invite",
+    }
+    seen = dict.fromkeys(want, 0)
+    for _label, body in scanned:
+        unfolded = _unfold_ics(body)
+        for k in want:
+            if k in unfolded:
+                seen[k] += 1
+    missing = [f"{k} ({v})" for k, v in want.items() if seen[k] == 0]
+    assert not missing, f"never saw the /p/ form for: {missing}"
+
+
+def test_link_generators_through_real_code_paths_capability_mode(tmp_path, monkeypatch):
+    """Same audit, on the capability-mode routes — the one surface with its
+    own link generators: the mailed `/manage/<admin_token>` link and the
+    console's `share_url` + decision `poll_url` (capability.py:880, 1361).
+
+    Exercised:
+
+    - Anon creation via `POST /new` — the manage link is MAILED, body captured
+    - `GET  /manage/<token>` — interstitial, renders `manage_path`
+    - `POST /manage/<token>` — exchange, mints capability cookie, 302 to
+      `/manage`
+    - `GET  /manage` — console (share_url + capability.py's templates)
+    - `POST /manage/link` — "email me a new link", second manage email
+    - `POST /manage/<id>/decide` and `/email-decision` — capability.py:1361
+    """
+    from kairos import capability, db, email_service, main, settings, web
+    from kairos.csrf import make_csrf
+
+    monkeypatch.setattr(settings, "DB_URL", f"sqlite:///{tmp_path}/k.db")
+    monkeypatch.setattr(settings, "AUTH_MODE", "capability")
+    monkeypatch.setitem(web.env.globals, "CAPABILITY", True)
+    monkeypatch.setattr(settings, "FEED_ENABLED", True)
+
+    sent: list = []
+
+    class _FakeSMTP:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def send_message(self, msg):
+            sent.append(msg)
+
+    monkeypatch.setattr(email_service, "SMTP_HOST", "smtp.example.net")
+    monkeypatch.setattr(email_service, "SMTP_FROM", "kairos@example.org")
+    monkeypatch.setattr(email_service, "_smtp_session", lambda: _FakeSMTP())
+    monkeypatch.setattr(email_service, "_last_refusal_logged", None)
+
+    prefix = "/scheduler"
+    scanned: list[tuple[str, str]] = []
+
+    with TestClient(main.create_app(), base_url="https://testserver") as c:
+        # ---- 1. Anon poll creation. Mails the manage link.
+        r = c.post(f"{prefix}/new", data={
+            "title": "CapPoll", "creator_email": "ada@example.org",
+            "mode": "full_day", "timezone": "Europe/Zurich",
+            "dates": ["2026-12-01", "2026-12-02"],
+            "csrf": make_csrf(capability.ANON_FORM_UID),
+        }, follow_redirects=False)
+        assert r.status_code == 200, r.text  # success renders a page here
+        scanned.append(("POST /new (accountless)", r.text))
+        assert sent, "capability-mode create must have mailed a manage link"
+        # Grab the admin token from the DB — it is NOT in any HTTP response.
+        poll = next(p for p in db.list_polls() if p["title"] == "CapPoll")
+        pid, tok_pub = poll["id"], poll["public_token"]
+        admin_token = poll["admin_token"]
+
+        # ---- 2. GET interstitial, POST exchange, GET console.
+        r = c.get(f"{prefix}/manage/{admin_token}")
+        assert r.status_code == 200, r.text
+        scanned.append(("GET /manage/<token>", r.text))
+
+        r = c.post(f"{prefix}/manage/{admin_token}", data={},
+                   follow_redirects=False)
+        assert r.status_code == 302, r.text
+        assert r.headers["location"] == f"{prefix}/manage"
+
+        # The exchange rotated the admin token; use the new one.
+        admin_token = db.get_poll(pid)["admin_token"]
+
+        r = c.get(f"{prefix}/manage")
+        assert r.status_code == 200, r.text
+        scanned.append(("GET /manage (console)", r.text))
+
+        # ---- 3. Re-link: "email me a new manage link" — second manage email.
+        r = c.post(f"{prefix}/manage/link", data={
+            "email": "ada@example.org",
+            "csrf": make_csrf(capability.LINK_FORM_UID),
+        }, follow_redirects=False)
+        assert r.status_code == 200, r.text
+
+        # ---- 4. Decide + email-decision from the console — poll_url comes
+        #         from capability.py:1361.
+        slot_id = db.get_poll(pid)["slots"][0]["id"]
+        csrf_pid = make_csrf(pid)
+        r = c.post(f"{prefix}/manage/{pid}/decide",
+                   data={"slot_id": slot_id, "csrf": csrf_pid},
+                   follow_redirects=False)
+        assert r.status_code == 302, r.text
+
+        # add a responder so email-decision has someone to mail
+        db.add_response(pid, "Bea", "bea@example.org", {}, invite_id=None)
+
+        r = c.post(f"{prefix}/manage/{pid}/email-decision",
+                   data={"note": "fin", "csrf": csrf_pid},
+                   follow_redirects=False)
+        assert r.status_code == 302, r.text
+
+    # ---- 5. Audit every captured HTTP body + email body. Email leaves are
+    #          decoded (text/plain and text/html default to base64, which
+    #          would otherwise hide the URL from a raw `as_string()` scan).
+    for i, msg in enumerate(sent):
+        subj = msg["Subject"] or "(no subject)"
+        for k, part in enumerate(_decoded_parts(msg)):
+            scanned.append((f"SMTP #{i} part #{k}: {subj!r}",
+                            _unfold_ics(part)))
+
+    # A public-token link must only appear as `{P}/p/<token>`; the admin token
+    # may ONLY appear as `{P}/manage/<token>` and never as a bare root URL
+    # — that is what the proxy bypass policy for `/manage` relies on.
+    for token, leaders in [(tok_pub, ("p",)), (admin_token, ("manage",))]:
+        for label, body in scanned:
+            _forbid_bare_token_form(_unfold_ics(body), label,
+                                    token=token, prefix=prefix,
+                                    good_leaders=leaders)
+
+    # Positive: at least one manage link under /manage/ appeared, and at least
+    # one share link under /p/ appeared.
+    joined = "\n".join(_unfold_ics(b) for _, b in scanned)
+    assert f"{prefix}/manage/{admin_token}" in joined, \
+        "the rotated manage link was never observed"
+    assert f"{prefix}/p/{tok_pub}" in joined, \
+        "the capability poll's share link was never observed"
+
+
+def test_link_generators_through_real_code_paths_empty_prefix(tmp_path):
+    """Same audit, but with `KAIROS_PREFIX=''`. A subprocess is the cheapest
+    way to re-import every `P = settings.PREFIX` consumer against an empty
+    prefix — reloading the modules in-process would strand references held by
+    other test modules and break conftest's autouse fixture, which caches
+    `kairos.capability` and `kairos.ratelimit` on first load.
+
+    The subprocess runs a minimal re-do of the HTTP audit (poll via API, invite
+    via API, nudge, agent.json) and asserts that no body carries a bare
+    `/<token>` (which at prefix='' is the root form)."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = Path(tmp_path) / "probe_empty_prefix.py"
+    script.write_text(_EMPTY_PREFIX_PROBE)
+
+    env = {**os.environ,
+           "KAIROS_PREFIX": "",
+           "KAIROS_AUTH": "header",
+           "KAIROS_LOGIN_URL": "/login",
+           "SESSION_SECRET": "dummy",
+           "KAIROS_DB_URL": f"sqlite:///{tmp_path}/k.db",
+           "KAIROS_FEED": "on",
+           "KAIROS_IMIP": "on",
+           "KAIROS_IMIP_ORGANIZER": "replies@kairos.example",
+           "KAIROS_API_KEY": "k"}
+
+    r = subprocess.run([sys.executable, str(script)], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, (
+        f"empty-prefix probe failed (exit {r.returncode}):\n"
+        f"STDOUT:\n{r.stdout}\n\nSTDERR:\n{r.stderr}"
+    )
+
+
+_EMPTY_PREFIX_PROBE = r'''"""Empty-prefix probe — runs in a subprocess under KAIROS_PREFIX=''.
+
+Hits a subset of the routes the in-process audit hits (the ones whose URL
+generators sit at a `P = settings.PREFIX` line, where `P == ""` here), and
+asserts no captured body carries a bare `/{token}` that is NOT a legitimate
+`/p/{token}` or `/p/i/{token}` form.
+"""
+import sys
+
+from fastapi.testclient import TestClient
+
+from kairos import api, db, email_service, main, settings, web  # noqa: F401
+from kairos.csrf import make_csrf
+
+
+assert settings.PREFIX == "", f"expected empty prefix, got {settings.PREFIX!r}"
+
+
+sent = []
+
+
+class _FakeSMTP:
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+    def send_message(self, msg):
+        sent.append(msg)
+
+
+email_service.SMTP_HOST = "smtp.example.net"
+email_service.SMTP_FROM = "kairos@example.org"
+email_service._smtp_session = lambda: _FakeSMTP()
+email_service._last_refusal_logged = None
+
+
+def unfold(s):
+    return s.replace("\r\n ", "").replace("\r\n\t", "")
+
+
+def forbid(blob, label, token, leaders, host_anchor="testserver"):
+    # Anchor on the hostname: without it, `/<token>` at an empty prefix is a
+    # substring of `/p/<token>` (position 2 of `/p/<token>` is `/` followed
+    # by the token) and would false-positive.
+    bad = f"{host_anchor}/{token}"
+    goods = tuple(f"{host_anchor}/{leader}/{token}" for leader in leaders)
+    idx = 0
+    while True:
+        j = blob.find(bad, idx)
+        if j < 0:
+            break
+        matched = next((g for g in goods if blob[j:j + len(g)] == g), None)
+        if matched:
+            idx = j + len(matched)
+            continue
+        raise AssertionError(
+            f"{label}: bare `{bad}` found where only {goods} allowed "
+            f"(context: ...{blob[max(0, j - 40):j + len(bad) + 40]!r}...)"
+        )
+
+
+hdr = {"X-User": "owner", "X-Email": "owner@x.ch", "X-Name": "Owner"}
+api_hdr = {"Authorization": "Bearer k"}
+csrf_owner = make_csrf("owner")
+
+scanned = []
+
+
+with TestClient(main.create_app(), base_url="https://testserver", headers=hdr) as c:
+    # Create via API (returns share_url under empty prefix).
+    r = c.post("/api/polls", headers=api_hdr, json={
+        "title": "ApiPoll", "mode": "time_slot", "creator": "owner",
+        "slots": [{"date": "2026-07-06", "start_time": "09:00",
+                   "end_time": "09:30"}],
+    })
+    assert r.status_code == 200, r.text
+    poll_a = r.json()
+    pid_a = poll_a["id"]
+    tok_a = poll_a["public_token"]
+    scanned.append(("POST /api/polls", r.text))
+
+    scanned.append(("GET /api/polls", c.get("/api/polls", headers=api_hdr).text))
+    scanned.append(("GET /api/polls/{id}",
+                    c.get(f"/api/polls/{pid_a}", headers=api_hdr).text))
+
+    # Invite via API (sends mail; response carries invite_url).
+    r = c.post(f"/api/polls/{pid_a}/invite", headers=api_hdr,
+               json={"emails": ["bob@x.ch"], "required": True})
+    assert r.status_code == 200, r.text
+    scanned.append(("POST /api/polls/{id}/invite", r.text))
+    inv_a = next(i for i in db.get_invites(pid_a) if i["email"] == "bob@x.ch")
+    tok_ia = inv_a["token"]
+
+    # Nudge via API (reminder email).
+    r = c.post(f"/api/polls/{pid_a}/nudge", headers=api_hdr,
+               json={"force": False, "emails": None})
+    assert r.status_code == 200, r.text
+
+    # Agent.json — public.py vote URLs.
+    scanned.append(("GET /p/i/<tok>/agent.json",
+                    c.get(f"/p/i/{tok_ia}/agent.json").text))
+
+    # Public poll page + event.ics (feed, open).
+    scanned.append(("GET /p/<tok>", c.get(f"/p/{tok_a}").text))
+    scanned.append(("GET /p/<tok>/event.ics (feed)",
+                    c.get(f"/p/{tok_a}/event.ics").text))
+    scanned.append(("GET /p/i/<tok>/feed.ics",
+                    c.get(f"/p/i/{tok_ia}/feed.ics").text))
+    scanned.append(("GET /llms.txt", c.get("/llms.txt").text))
+
+# Email bodies. text/plain and text/html parts default to base64
+# Content-Transfer-Encoding, which hides the URL substrings from a raw
+# `as_string()` scan; walk and decode each leaf instead.
+def decoded_parts(msg):
+    parts = []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            parts.append(payload.decode(charset, errors="replace"))
+        except (LookupError, UnicodeDecodeError):
+            parts.append(payload.decode("utf-8", errors="replace"))
+    return parts
+
+
+assert sent, "expected the fake SMTP to have captured some messages"
+for i, msg in enumerate(sent):
+    subj = msg["Subject"] or "(no subject)"
+    for k, part in enumerate(decoded_parts(msg)):
+        scanned.append((f"SMTP #{i} part #{k}: {subj!r}", unfold(part)))
+
+# Audit.
+for token, leaders in [(tok_a, ("p",)), (tok_ia, ("p/i",))]:
+    for label, body in scanned:
+        forbid(unfold(body), label, token, leaders)
+
+# Positive: the share link and the invite link appeared somewhere.
+joined = "\n".join(unfold(b) for _, b in scanned)
+assert f"testserver/p/{tok_a}" in joined, "share link under /p/ never observed"
+assert f"testserver/p/i/{tok_ia}" in joined, "invite link under /p/i/ never observed"
+
+print("empty-prefix audit OK")
+sys.exit(0)
+'''
