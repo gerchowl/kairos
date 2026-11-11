@@ -523,10 +523,16 @@ def test_origin_is_checked_when_the_allowlist_is_configured(monkeypatch, stubbed
     assert r3.status_code == 403
 
 
-def test_without_an_allowlist_origin_is_not_consulted(client):
-    r = client.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
-                    headers={"Origin": "https://evil.example"})
-    assert r.status_code == 200  # same as `/api` — Origin is only checked when configured
+def test_without_an_allowlist_a_request_with_no_origin_header_still_passes(client):
+    """Spec: streamable-HTTP servers MUST validate Origin. The resulting
+    policy is: a request with NO Origin header passes (curl, `claude mcp`,
+    every non-browser agent), and a request WITH an Origin header passes
+    only if it is listed in `KAIROS_MCP_ALLOWED_ORIGINS`. The default empty
+    allowlist is the safe default — see
+    `test_origin_bearing_request_is_403_when_no_allowlist_is_configured`."""
+    # No Origin header — request passes regardless of allowlist.
+    r = client.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    assert r.status_code == 200
 
 
 # -- 7. Regression tests for PR #89 adversarial-review findings ------------
@@ -841,3 +847,295 @@ def test_origin_match_is_case_insensitive_and_trailing_slash_tolerant(monkeypatc
     r = c.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
                headers={"Origin": "https://evil.example"})
     assert r.status_code == 403
+
+
+# -- 7f. PR #89 final round — adversarial-review findings ------------------
+#
+# Every test in this section was observed FAILING on head 20547bd — the shape
+# of the finding first, and only then the fix. The grouping mirrors the
+# fix list in the final review round.
+
+
+# -- 7f.1 MEDIUM: ids NaN/Infinity, lone-surrogate strings, … → plain 500 -
+
+def test_mcp_endpoint_never_returns_a_non_json_response_for_any_fuzz_input(client):
+    """MEDIUM: a request id of NaN / ±Infinity, a lone-surrogate string, or
+    otherwise malformed JSON used to drive the fallback error path through
+    code that cannot encode the id (Starlette's `allow_nan=False` renderer,
+    or UTF-8 encoding of a lone surrogate), so the response fell out as a
+    plain-text HTTP 500 — breaking the MCP wire format. Every body in this
+    fuzz list must now come back as a VALID JSON response, never a 500 and
+    never a non-JSON body.
+    """
+    import pytest as _pt
+
+    fuzz_bodies = [
+        b"",                                                      # empty body
+        b"null",                                                  # JSON null
+        b"true",                                                  # JSON true
+        b"[]",                                                    # empty array (batch refused)
+        b'"str"',                                                 # scalar string
+        b"123",                                                   # scalar number
+        b'{"jsonrpc":"2.0","id":NaN,"method":"ping"}',            # NaN id
+        b'{"jsonrpc":"2.0","id":Infinity,"method":"ping"}',       # Infinity id
+        b'{"jsonrpc":"2.0","id":-Infinity,"method":"ping"}',      # -Infinity id
+        b'{"jsonrpc":"2.0","id":"\xed\xa0\x80","method":"ping"}',  # lone surrogate (invalid UTF-8)
+        b'{"jsonrpc":"2.0","id":"\\ud800","method":"ping"}',      # lone surrogate as JSON escape
+        b'{"jsonrpc":"2.0","id":99999999999999999999999999999,"method":"ping"}',  # huge int
+        b'{"jsonrpc":"2.0","id":1,"method":"ping","extra":NaN}',  # NaN in body param
+        b"\xef\xbb\xbf" + b'{"jsonrpc":"2.0","id":1,"method":"ping"}',  # BOM-prefixed
+        b"\xff\xfe\xfd",                                          # invalid UTF-8 bytes
+        b"[" * 500 + b"]" * 500,                                  # deep nesting under cap
+        b'{"jsonrpc":"2.0","id":true,"method":"ping"}',           # bool id (not JSON-RPC)
+        b'{"jsonrpc":"2.0","id":{"nested":1},"method":"ping"}',   # object id
+        b"{not json",                                             # outright malformed
+    ]
+    for body in fuzz_bodies:
+        r = client.post(MCP, content=body, headers={"Content-Type": "application/json"})
+        assert r.status_code != 500, (
+            f"body {body!r} drove a plain 500: {r.text[:200]!r}"
+        )
+        # The response body must be valid JSON — an MCP client reads
+        # `result.isError` / `error.code`, not an HTML 500 page.
+        try:
+            env = r.json()
+        except Exception as e:  # pragma: no cover — asserting below
+            _pt.fail(f"body {body!r} → non-JSON response (status {r.status_code}): "
+                     f"{r.text[:200]!r} ({e})")
+        # Every failure response names a JSON-RPC envelope (either an error
+        # or a WWW-Authenticate 401 detail).
+        assert isinstance(env, dict), f"body {body!r} → {env!r}"
+
+
+def test_nan_and_infinity_ids_are_parse_errors_not_server_errors(client):
+    """JSON `NaN` / ±Infinity are not valid JSON (ECMA-404); Python's
+    `json.loads` accepts them by default but Starlette's JSONResponse
+    renderer cannot emit them. `parse_constant=` raises them at parse time,
+    so they come back as a JSON-RPC parse error, not a 500."""
+    for body in (
+        b'{"jsonrpc":"2.0","id":NaN,"method":"ping"}',
+        b'{"jsonrpc":"2.0","id":Infinity,"method":"ping"}',
+        b'{"jsonrpc":"2.0","id":-Infinity,"method":"ping"}',
+    ):
+        r = client.post(MCP, content=body, headers={"Content-Type": "application/json"})
+        assert r.status_code == 200
+        env = r.json()
+        assert env["error"]["code"] == mcp_http.PARSE_ERROR, (body, env)
+
+
+def test_lone_surrogate_id_is_an_invalid_request_with_null_id_echo(client):
+    """A `"id": "\\ud800"` body parses to a Python string whose UTF-8
+    encoding fails. `_valid_jsonrpc_id` refuses it, and the envelope error
+    path echoes `id: null` back — the alternative would 500 on the
+    JSONResponse renderer."""
+    body = b'{"jsonrpc":"2.0","id":"\\ud800","method":"ping"}'
+    r = client.post(MCP, content=body, headers={"Content-Type": "application/json"})
+    assert r.status_code == 200, r.text
+    env = r.json()
+    assert env["error"]["code"] == mcp_http.INVALID_REQUEST
+    assert env["id"] is None
+
+
+def test_valid_jsonrpc_id_rejects_non_finite_floats_and_bad_strings():
+    """Unit guard for the id validator: non-finite floats and
+    non-UTF-8-encodable strings are not safe to echo back, so they are
+    excluded from the acceptance set, regardless of how they got past the
+    parser."""
+    assert mcp_http._valid_jsonrpc_id(float("nan")) is False
+    assert mcp_http._valid_jsonrpc_id(float("inf")) is False
+    assert mcp_http._valid_jsonrpc_id(float("-inf")) is False
+    assert mcp_http._valid_jsonrpc_id("\udc00") is False
+    assert mcp_http._valid_jsonrpc_id("\ud800") is False
+    # And the valid shapes still pass.
+    assert mcp_http._valid_jsonrpc_id(1) is True
+    assert mcp_http._valid_jsonrpc_id("ok") is True
+    assert mcp_http._valid_jsonrpc_id(None) is True
+    assert mcp_http._valid_jsonrpc_id(3.14) is True
+
+
+# -- 7f.2 LOW: tools/call with id null → invalid request, not 202 ---------
+
+def test_tools_call_with_id_null_is_invalid_request_not_a_notification(client):
+    """MCP spec 2025-06-18 §4: a request id MUST NOT be null. A `tools/call`
+    with `"id": null` used to be read as a notification (202 empty body)
+    — the comment even said "refuse rather than silently drop it" but the
+    code dropped it. It must now be an INVALID_REQUEST JSON-RPC error."""
+    r = client.post(MCP, json={
+        "jsonrpc": "2.0", "id": None, "method": "tools/call",
+        "params": {"name": "whoami", "arguments": {}},
+    })
+    assert r.status_code == 200, r.text
+    env = r.json()
+    assert env["error"]["code"] == mcp_http.INVALID_REQUEST
+    # A null-id envelope is uncorrelatable, so the error echoes null back.
+    assert env["id"] is None
+
+
+def test_other_methods_with_id_null_are_also_invalid_request(client):
+    """Not just `tools/call`: any method with `"id": null` (not omitted) is
+    an INVALID_REQUEST per MCP 2025-06-18. Notifications remain OK — they
+    omit the field entirely."""
+    for method in ("initialize", "tools/list", "ping"):
+        r = client.post(MCP, json={"jsonrpc": "2.0", "id": None, "method": method})
+        assert r.status_code == 200, (method, r.text)
+        env = r.json()
+        assert env["error"]["code"] == mcp_http.INVALID_REQUEST, (method, env)
+
+
+# -- 7f.3 LOW: tools/call arguments non-object → invalid_params -----------
+
+def test_tools_call_arguments_non_object_is_invalid_params_not_silently_coerced(client):
+    """`arguments: []` / `0` / `""` / `false` was silently coerced to `{}` by
+    `.get("arguments") or {}`; a bug in the caller rather than a shape the
+    server should assume on their behalf. Pydantic refuses non-object bodies
+    on REST; this surface now matches."""
+    for bad in ([], 0, "", False, 3.14):
+        r = client.post(MCP, json={
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "whoami", "arguments": bad},
+        })
+        assert r.status_code == 200
+        env = r.json()
+        assert env.get("error", {}).get("code") == mcp_http.INVALID_PARAMS, (bad, env)
+        assert "arguments" in env["error"]["message"], (bad, env)
+
+
+def test_tools_call_arguments_missing_defaults_to_empty_object(client):
+    """A caller that omits `arguments` entirely still gets `{}` — the common
+    shape for a zero-arg tool (whoami, list_polls). Only an explicit
+    non-object value is refused."""
+    r = client.post(MCP, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "whoami"},  # no `arguments`
+    })
+    assert r.status_code == 200, r.text
+    env = r.json()
+    assert "result" in env, env
+    assert "isError" not in env["result"]
+
+
+# -- 7f.4 LOW: wrong-type poll_id → type-named error, not "missing" --------
+
+def test_wrong_type_poll_id_names_the_type_problem_not_missing(client):
+    """A `poll_id` that is a number, list, bool, or object is not a missing
+    argument — it is a wrong-type argument, and the refusal must say so so
+    the agent fixes the call rather than adding an argument that is already
+    there."""
+    for bad in (42, 3.14, ["p1"], {"a": 1}, True):
+        r, env = call_tool(client, "get_poll", {"poll_id": bad})
+        assert r.status_code == 200, (bad, r.text)
+        assert env["result"].get("isError") is True, (bad, env)
+        text = env["result"]["content"][0]["text"]
+        assert "poll_id" in text, (bad, text)
+        assert "invalid" in text.lower(), (bad, text)
+        assert "must be a non-empty string" in text, (bad, text)
+        assert "missing" not in text.lower(), (
+            f"a wrong-type poll_id ({bad!r}) was reported as missing: {text!r}"
+        )
+
+
+def test_missing_poll_id_still_reads_as_missing(client):
+    """The missing-argument path stays unchanged — only the wrong-type path
+    gets its own message."""
+    r, env = call_tool(client, "get_poll", {})
+    assert r.status_code == 200
+    assert env["result"].get("isError") is True
+    text = env["result"]["content"][0]["text"]
+    assert "missing argument: poll_id" in text, text
+
+
+# -- 7f.5 LOW: initialize/tools/list/unknown-tool charge the api budget ---
+
+def test_initialize_charges_the_api_budget_so_it_is_not_a_free_ping(monkeypatch, stubbed):
+    """`initialize` used to be free — an authenticated key could call it
+    forever without charging any rule. Set `api: 2/hour` and watch the
+    third call refuse."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS",
+                        {**settings.DEFAULT_RATE_LIMITS, "api": (2, 3600)})
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    for i in (1, 2):
+        r, env = rpc(c, "initialize", {}, id=i)
+        assert r.status_code == 200 and "result" in env, env
+    r, env = rpc(c, "initialize", {}, id=3)
+    assert env.get("error", {}).get("code") == mcp_http.RATE_LIMITED_CODE, env
+    assert env["error"]["data"]["rule"] == "api"
+
+
+def test_tools_list_charges_the_api_budget(monkeypatch, stubbed):
+    """`tools/list` used to be free too, same reason as `initialize`."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS",
+                        {**settings.DEFAULT_RATE_LIMITS, "api": (2, 3600)})
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    for i in (1, 2):
+        r, env = rpc(c, "tools/list", id=i)
+        assert r.status_code == 200 and "result" in env, env
+    r, env = rpc(c, "tools/list", id=3)
+    assert env.get("error", {}).get("code") == mcp_http.RATE_LIMITED_CODE
+    assert env["error"]["data"]["rule"] == "api"
+
+
+def test_unknown_tool_name_charges_the_api_budget(monkeypatch, stubbed):
+    """An unknown tool name (`tools/call name='nope'`) used to short-circuit
+    out of `_run_tool` with a tool-error result, never touching any budget
+    — so an authenticated key could bang on `nope` as an unmetered probe.
+    Now it charges the cheap `api` rule just like a read."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS",
+                        {**settings.DEFAULT_RATE_LIMITS, "api": (2, 3600)})
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    for i in (1, 2):
+        r, env = call_tool(c, "nope_not_a_tool", id=i)
+        assert r.status_code == 200
+        assert env["result"].get("isError") is True, env
+    r, env = call_tool(c, "nope_not_a_tool", id=3)
+    assert env.get("error", {}).get("code") == mcp_http.RATE_LIMITED_CODE, env
+    assert env["error"]["data"]["rule"] == "api"
+
+
+def test_unauthenticated_initialize_is_401_before_any_charge(monkeypatch, stubbed):
+    """Charging must happen only for authenticated principals. An
+    unauthenticated hammer on `initialize` stays 401 on every attempt — the
+    budget is never consumed, so the first *authenticated* caller still
+    has their full quota."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS",
+                        {**settings.DEFAULT_RATE_LIMITS, "api": (1, 3600)})
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": "Bearer wrong"})
+    for _ in range(5):
+        r = c.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        assert r.status_code == 401, r.text
+    # And the valid key still has its first call:
+    c.headers["Authorization"] = f"Bearer {KEY}"
+    r, env = rpc(c, "initialize", {})
+    assert r.status_code == 200 and "result" in env, env
+
+
+# -- 7f.6 LOW/spec: Origin validation ON by default ------------------------
+
+def test_origin_bearing_request_is_403_when_no_allowlist_is_configured(monkeypatch, stubbed):
+    """Spec 2025-06-18: streamable-HTTP servers MUST validate Origin. The
+    safe default is: empty allowlist → every Origin-bearing request is 403.
+    A CLI agent that sends no Origin header still passes."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.delenv("KAIROS_MCP_ALLOWED_ORIGINS", raising=False)
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    # No Origin — passes (CLI agents).
+    r1 = c.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+    assert r1.status_code == 200, r1.text
+    # With Origin and empty allowlist — refused.
+    for origin in ("https://evil.example", "https://claude.ai",
+                   "https://something.local"):
+        r = c.post(MCP, json={"jsonrpc": "2.0", "id": 2, "method": "ping"},
+                   headers={"Origin": origin})
+        assert r.status_code == 403, (origin, r.text)

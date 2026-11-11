@@ -74,14 +74,16 @@ is answered with a JSON-RPC parse error at HTTP 413 — a recursion-bomb body
 (200 KiB of `[[[[…]]]]`) cannot drive a RecursionError inside the JSON
 parser, because the parser never gets handed the bytes.
 
-**Origin validation.** The spec requires it to prevent DNS-rebinding attacks
-on local-bound servers. `KAIROS_MCP_ALLOWED_ORIGINS` lists allowed origins;
-unset means "no Origin header required and none rejected", which is the
-`/api` surface's existing behaviour (Kairos has no CORS today and nothing
-cross-origin reads this surface). A hosted deployment sets it. The caller's
-`Origin` header is normalised (lowercase scheme/host, trailing slash
-stripped) before comparison, so an allowlist entry `https://claude.ai` and
-an incoming header `https://CLAUDE.AI/` match.
+**Origin validation.** Spec 2025-06-18 §4: streamable-HTTP servers **MUST**
+validate the `Origin` header to prevent DNS-rebinding attacks on local-
+bound instances. Policy here, as the only safe default on a MUST-validate
+spec: a request **without** an `Origin` header passes (CLI agents — curl,
+`claude mcp`, the stdio adapter), and a request **with** an `Origin`
+header passes only if it appears in `KAIROS_MCP_ALLOWED_ORIGINS`. The
+default (empty) allowlist refuses every Origin-bearing request. Operators
+who want to let a browser reach `/mcp` list the origins explicitly; the
+header is normalised (lowercase scheme/host, trailing slash stripped), so
+one entry `https://claude.ai` matches an incoming `https://CLAUDE.AI/`.
 
 **MCP-Protocol-Version.** If the client sent a `MCP-Protocol-Version` header,
 it must be one this server supports (2025-06-18 and the three widely-used
@@ -107,6 +109,7 @@ ceiling once and both surfaces see it.
 
 import json
 import logging
+import math
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Request
@@ -202,20 +205,23 @@ def _allowed_origins() -> set[str]:
 def _validate_origin(request: Request) -> None:
     """Raise `HTTPException(403)` when the Origin header is set and not allowed.
 
-    Spec requirement for streamable HTTP, to prevent a local-bound Kairos
-    from being driven by a page a browser just loaded (DNS-rebinding). When
-    no allowlist is configured, this is a no-op — Kairos has no cross-origin
-    web surface today, and refusing every Origin-bearing request would break
-    the same curl / `claude mcp` bearer flows the ``/api`` surface accepts.
+    Spec requirement: streamable-HTTP servers **MUST** validate the Origin
+    header to prevent a local-bound Kairos from being driven by a page a
+    browser just loaded (DNS rebinding). The policy here is: a request with
+    NO `Origin` header passes (curl, `claude mcp`, the stdio adapter, any
+    non-browser agent), and a request WITH an `Origin` header passes only if
+    the normalised value is listed in `KAIROS_MCP_ALLOWED_ORIGINS`. Default
+    (empty allowlist) means every Origin-bearing request is refused — the
+    only safe default on a spec that requires validation. Operators who want
+    to let a browser reach `/mcp` set the allowlist explicitly.
     """
-    allowed = _allowed_origins()
-    if not allowed:
-        return
     origin = request.headers.get("origin")
     if origin is None:
         return
+    allowed = _allowed_origins()
     if _normalise_origin(origin) not in allowed:
-        log.warning("refused Origin %r (allowed: %s)", origin, ",".join(sorted(allowed)))
+        log.warning("refused Origin %r (allowed: %s)",
+                    origin, ",".join(sorted(allowed)) or "none")
         raise HTTPException(403, "Origin not allowed")
 
 
@@ -672,6 +678,13 @@ def _validate_body(tool: dict, params: dict) -> BaseModel | None:
     return model.model_validate(body)
 
 
+# Sentinel for "argument was not supplied" vs. "argument was supplied as None".
+# Explicit `None` for `poll_id` is treated as missing (JSON-RPC callers that
+# emit `"poll_id": null` meant to not send one); other wrong types are flagged
+# as a type error so the refusal names the actual problem.
+_MISSING: Any = object()
+
+
 def _run_tool(name: str, params: dict, principal: dict, request: Request) -> dict[str, Any]:
     """Resolve, authorize, and call the REST function for one tool.
 
@@ -685,6 +698,10 @@ def _run_tool(name: str, params: dict, principal: dict, request: Request) -> dic
     """
     tool = _TOOL_INDEX.get(name)
     if tool is None:
+        # Charge the cheap `api` budget so an unknown-tool probe cannot be
+        # used as an unmetered ping by an authenticated key. RateLimited
+        # propagates out — the caller turns it into a -32099 JSON-RPC error.
+        charge_request(principal, "api")
         return _tool_error(
             f"Unknown tool {name!r}. Call tools/list to see what this bearer may use."
         )
@@ -694,16 +711,25 @@ def _run_tool(name: str, params: dict, principal: dict, request: Request) -> dic
         # (1) charge + scope: cheap checks that must run before any arg
         # parsing, or a malformed call would silently skip the rate budget.
         # (2) reach: needs the poll_id, which must be present and a string.
-        #     A missing poll_id is a 400 isError result (post-charge), same
-        #     as on REST where it would be a 422 from the path parameter.
+        #     A missing poll_id is a 400 isError result; a wrong-type poll_id
+        #     (number, list, bool, …) names the type problem so an agent
+        #     reading the refusal can fix the call.
         poll_id = None
         if tool["reach"]:
-            poll_id = params.get("poll_id")
-            if not isinstance(poll_id, str) or not poll_id:
+            raw_poll_id = params.get("poll_id", _MISSING)
+            if raw_poll_id is _MISSING or raw_poll_id is None:
                 # Charge still happens — the budget punishes the loop that
                 # builds malformed calls, not just well-formed ones.
                 _authorize(principal, tool["scope"], tool["rule"])
                 return _tool_error("400: missing argument: poll_id")
+            if not isinstance(raw_poll_id, str) or not raw_poll_id:
+                _authorize(principal, tool["scope"], tool["rule"])
+                kind = type(raw_poll_id).__name__
+                return _tool_error(
+                    f"400: invalid argument poll_id: must be a non-empty string "
+                    f"(got {kind})"
+                )
+            poll_id = raw_poll_id
         _authorize(principal, tool["scope"], tool["rule"], poll_id=poll_id)
         # (3) body: same Pydantic model REST uses, so coercion matches.
         body = _validate_body(tool, params)
@@ -761,108 +787,175 @@ def _jsonrpc_result(request_id: Any, result: Any) -> dict:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+def _rate_limited_error(exc: RateLimited, request_id: Any) -> dict:
+    """The -32099 JSON-RPC rate-limit envelope. One spelling, one place.
+
+    The agent's loop needs `retry_after` in `error.data`, which the stdio
+    adapter surfaces the same way (via the HTTP Retry-After header)."""
+    return _jsonrpc_error(
+        RATE_LIMITED_CODE,
+        f"Rate limit {exc.rule!r} exceeded",
+        request_id,
+        data={"rule": exc.rule, "retry_after": exc.retry_after},
+    )
+
+
 def _handle_method(method: str, params: Any, request_id: Any, principal: dict | None,  # noqa: C901 — one JSON-RPC method dispatcher, clearer flat than split per method
                    request: Request) -> dict | None:
-    """Return one JSON-RPC response (dict), or None for a notification."""
+    """Return one JSON-RPC response (dict), or None for a notification.
+
+    A `RateLimited` from any `charge_request` call (`initialize`, `tools/list`,
+    an unknown tool name, or a `tools/call` branch) becomes a -32099 JSON-RPC
+    error envelope — one catch point, one shape, so the agent sees the same
+    rule/retry_after fields regardless of which method tripped the budget.
+    """
     is_notification = request_id is None
-    if method == "initialize":
-        if is_notification:
+    try:
+        if method == "initialize":
+            if is_notification:
+                return None
+            # Charge the cheap `api` budget so `initialize` cannot be used as
+            # an unmetered ping by an authenticated key — `tools/list` and
+            # unknown tool names charge the same rule for the same reason.
+            if principal is not None:
+                charge_request(principal, "api")
+            return _jsonrpc_result(request_id, {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": SERVER_INFO,
+            })
+        if method == "notifications/initialized":
+            # Spec: notifications answer 202 with empty body. From the dispatcher's
+            # perspective that's "produce no response object".
             return None
-        return _jsonrpc_result(request_id, {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": SERVER_INFO,
-        })
-    if method == "notifications/initialized":
-        # Spec: notifications answer 202 with empty body. From the dispatcher's
-        # perspective that's "produce no response object".
-        return None
-    if method.startswith("notifications/"):
-        return None  # tolerate and ignore other notifications
-    if method == "ping":
-        if is_notification:
-            return None
-        return _jsonrpc_result(request_id, {})
-    if method == "tools/list":
-        if is_notification:
-            return None
-        tools_list = [
-            {
-                "name": t["name"],
-                "description": t["description"],
-                "inputSchema": t["input_schema"],
-            }
-            for t in TOOLS
-        ]
-        return _jsonrpc_result(request_id, {"tools": tools_list})
-    if method == "tools/call":
-        if is_notification:
-            # tools/call as a notification would be fire-and-forget — the spec
-            # requires a result, so refuse rather than silently drop it.
-            return None
-        if principal is None:
-            # Should never reach here because authentication happened before
-            # dispatch; keep a loud failure rather than a silent pass.
-            return _jsonrpc_error(INTERNAL_ERROR, "principal missing", request_id)
-        if not isinstance(params, dict):
-            return _jsonrpc_error(INVALID_PARAMS, "params must be an object", request_id)
-        name = params.get("name")
-        arguments = params.get("arguments") or {}
-        if not isinstance(name, str):
-            return _jsonrpc_error(INVALID_PARAMS, "tools/call requires `name`", request_id)
-        if not isinstance(arguments, dict):
-            return _jsonrpc_error(INVALID_PARAMS, "tools/call `arguments` must be an object", request_id)
-        try:
+        if method.startswith("notifications/"):
+            return None  # tolerate and ignore other notifications
+        if method == "ping":
+            if is_notification:
+                return None
+            return _jsonrpc_result(request_id, {})
+        if method == "tools/list":
+            if is_notification:
+                return None
+            if principal is not None:
+                charge_request(principal, "api")
+            tools_list = [
+                {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "inputSchema": t["input_schema"],
+                }
+                for t in TOOLS
+            ]
+            return _jsonrpc_result(request_id, {"tools": tools_list})
+        if method == "tools/call":
+            if is_notification:
+                # tools/call as a notification would be fire-and-forget — the spec
+                # requires a result. Per MCP 2025-06-18, a request ID also MUST
+                # NOT be null: the envelope check in `_validate_envelope` turns
+                # `"id": null` into INVALID_REQUEST before this function runs,
+                # so a tools/call with a null id is refused, not silently dropped.
+                return None
+            if principal is None:
+                # Should never reach here because authentication happened before
+                # dispatch; keep a loud failure rather than a silent pass.
+                return _jsonrpc_error(INTERNAL_ERROR, "principal missing", request_id)
+            if not isinstance(params, dict):
+                return _jsonrpc_error(INVALID_PARAMS, "params must be an object", request_id)
+            name = params.get("name")
+            # `.get(..., {})` (not `.get(...) or {}`): `or {}` collapsed `[]`,
+            # `0`, `""`, `False` to `{}` and silently accepted them as "no args
+            # given", but a caller that passed a non-object `arguments` has a
+            # bug the dispatcher should surface — same shape REST does on a
+            # wrong-type body.
+            arguments = params.get("arguments", {})
+            if not isinstance(name, str):
+                return _jsonrpc_error(INVALID_PARAMS, "tools/call requires `name`", request_id)
+            if not isinstance(arguments, dict):
+                return _jsonrpc_error(INVALID_PARAMS, "tools/call `arguments` must be an object", request_id)
             tool_result = _run_tool(name, arguments, principal, request)
-        except RateLimited as exc:
-            # Protocol-level: transport refused. The agent's loop needs
-            # retry_after in `error.data`, which the stdio adapter surfaces
-            # the same way (via the HTTP Retry-After header).
-            return _jsonrpc_error(
-                RATE_LIMITED_CODE,
-                f"Rate limit {exc.rule!r} exceeded",
-                request_id,
-                data={"rule": exc.rule, "retry_after": exc.retry_after},
-            )
-        return _jsonrpc_result(request_id, tool_result)
-    if is_notification:
-        return None
-    return _jsonrpc_error(METHOD_NOT_FOUND, f"Unknown method: {method}", request_id)
+            return _jsonrpc_result(request_id, tool_result)
+        if is_notification:
+            return None
+        return _jsonrpc_error(METHOD_NOT_FOUND, f"Unknown method: {method}", request_id)
+    except RateLimited as exc:
+        # Protocol-level: transport refused. One envelope shape regardless of
+        # which method tripped the budget.
+        return _rate_limited_error(exc, request_id)
 
 
 def _valid_jsonrpc_id(value: Any) -> bool:
-    """True when `value` is one of the three JSON-RPC 2.0 id types.
+    """True when `value` is a safe JSON-RPC id *this server can echo back*.
 
-    The spec §4.1 requires an id that is a String, Number, or Null; anything
-    else is an Invalid Request. A bool is a Number subclass in Python, so it
-    is excluded explicitly — `True` is not a legitimate correlation id even
-    though `isinstance(True, int)` holds.
+    JSON-RPC 2.0 §4.1 permits String, Number, or Null; MCP 2025-06-18
+    tightens that to "MUST NOT be null" for a request id (notifications
+    simply omit the field). The acceptance set here is the intersection the
+    server can round-trip without a serialisation failure: strings must be
+    encodable as UTF-8 (a lone surrogate like ``"\\udc00"`` cannot be, and
+    Starlette's JSONResponse renderer would 500 on it), and floats must be
+    finite (NaN / ±Infinity fail Starlette's ``allow_nan=False`` renderer).
+    A bool is a Number subclass in Python, so it is excluded explicitly —
+    `True` is not a legitimate correlation id even though
+    `isinstance(True, int)` holds. Null is accepted here; the envelope check
+    refuses it separately when a method requires a request id (MCP rule).
     """
     if value is None:
         return True
     if isinstance(value, bool):
         return False
-    return isinstance(value, (str, int, float))
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return True
+    return False
 
 
 def _validate_envelope(message: Any) -> tuple[bool, dict | None]:
     """Is this a well-formed JSON-RPC 2.0 request/notification?
 
     Returns (ok, error_response). The error response is a complete JSON-RPC
-    envelope so the caller can send it unchanged.
+    envelope so the caller can send it unchanged, with `id: null` whenever
+    the incoming id itself is unsafe to echo — so a malformed id can never
+    drive a serialisation failure on the response side.
     """
     if not isinstance(message, dict):
         return False, _jsonrpc_error(INVALID_REQUEST, "request must be a JSON object")
+    # If the incoming id is anything we cannot safely echo back (NaN, a lone
+    # surrogate, a bool, a dict/list, …), every error response we build from
+    # this envelope must use `null` instead — Starlette's JSONResponse will
+    # otherwise 500 trying to render it.
+    raw_id = message.get("id") if "id" in message else None
+    safe_id = raw_id if (raw_id is None or _valid_jsonrpc_id(raw_id)) else None
     if message.get("jsonrpc") != "2.0":
-        return False, _jsonrpc_error(INVALID_REQUEST, "jsonrpc must be '2.0'", message.get("id"))
+        return False, _jsonrpc_error(INVALID_REQUEST, "jsonrpc must be '2.0'", safe_id)
     method = message.get("method")
     if not isinstance(method, str) or not method:
-        return False, _jsonrpc_error(INVALID_REQUEST, "method is required", message.get("id"))
-    # id (when present) must be string, number or null — bool excluded.
-    # Spec: §4.1. A list/dict id would silently correlate as whatever Python
-    # serialises it to, so refuse at the envelope rather than deeper.
-    if "id" in message and not _valid_jsonrpc_id(message["id"]):
-        return False, _jsonrpc_error(INVALID_REQUEST, "id must be string, number, or null")
+        return False, _jsonrpc_error(INVALID_REQUEST, "method is required", safe_id)
+    if "id" in message:
+        # MCP 2025-06-18: a request id MUST NOT be null. Notifications omit
+        # the field entirely; `"id": null` is a request whose id cannot
+        # correlate, and the spec requires INVALID_REQUEST rather than a
+        # silent 202. Without this, `tools/call` with `"id": null` was
+        # dropped as a notification — the comment above said "refuse rather
+        # than silently drop" but the code did the opposite.
+        if message["id"] is None:
+            return False, _jsonrpc_error(
+                INVALID_REQUEST,
+                "id must not be null (MCP spec 2025-06-18 §4)",
+                None,
+            )
+        if not _valid_jsonrpc_id(message["id"]):
+            return False, _jsonrpc_error(
+                INVALID_REQUEST,
+                "id must be a non-null string or finite number",
+                None,
+            )
     return True, None
 
 
@@ -905,6 +998,21 @@ async def _read_body_capped(request: Request) -> bytes:
     return bytes(buf)
 
 
+def _reject_json_constant(value: str) -> Any:
+    """Reject the non-standard JSON constants ``NaN`` / ``Infinity`` /
+    ``-Infinity`` as parse errors.
+
+    Python's `json.loads` accepts these by default, but they are not valid
+    JSON (ECMA-404), and Starlette's `JSONResponse` renderer refuses to
+    emit them (`allow_nan=False`) — so if one made it into a message id or
+    an argument, echoing it back in any error response would 500 the
+    request. Rejecting them at parse time is a defence-in-depth against the
+    fallback error path; `_valid_jsonrpc_id` rejects non-finite floats too
+    for the same reason, in case a future change lifts this guard.
+    """
+    raise ValueError(f"illegal JSON constant: {value}")
+
+
 def _parse_body(raw: bytes) -> tuple[Any, dict | None]:
     """Parse the JSON body. Returns (message, error) — exactly one is set.
 
@@ -912,11 +1020,14 @@ def _parse_body(raw: bytes) -> tuple[Any, dict | None]:
     handled because a deeply-nested brackets payload drives `json.loads`
     into one; the body-size cap makes this rare, but a hostile client can
     still send 999 nested `{...}` inside the cap. `ValueError` catches every
-    other parse pathology.
+    other parse pathology (bad UTF-8, our `parse_constant` rejection, …).
     """
     try:
-        return json.loads(raw) if raw else None, None
-    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        return (
+            json.loads(raw, parse_constant=_reject_json_constant)
+            if raw else None, None
+        )
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError, RecursionError) as exc:
         return None, _jsonrpc_error(PARSE_ERROR, f"Parse error: {exc}")
 
 
@@ -969,9 +1080,12 @@ def _dispatch_sync(message: Any, principal: dict, request: Request) -> Response:
             return Response(status_code=202, headers=_response_headers())
         return _rpc_response(response)
     except Exception:
+        # Fallback error path: `id: null` unconditionally. Echoing a malformed
+        # id back (a NaN, a lone surrogate, a dict) would drive this same
+        # exception path through JSONResponse's renderer and loop on a 500;
+        # `null` is always serialisable so this envelope can never fail.
         log.exception("mcp dispatch raised")
-        request_id = message.get("id") if isinstance(message, dict) else None
-        return _rpc_response(_jsonrpc_error(INTERNAL_ERROR, "internal error", request_id))
+        return _rpc_response(_jsonrpc_error(INTERNAL_ERROR, "internal error", None))
 
 
 @router.post("/mcp", include_in_schema=False)
