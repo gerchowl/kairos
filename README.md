@@ -53,6 +53,133 @@ before exposing this to anyone** — TLS, the trusted-proxy allowlist, backups,
 and the choices this image deliberately leaves to you (base image, registry,
 retention).
 
+## Protecting owner pages with a reverse proxy
+
+Every URL a poll is *supposed* to answer without a login lives under one of
+these prefixes. Everything else is owner surface and the proxy should require
+auth for it. The list is pinned by
+`tests/test_routes.py::test_link_generators_through_real_code_paths` (drive
+the real routes with a captured SMTP, assert every emitted URL carrying a
+poll-scoped token is under `/p/` or `/p/i/`) and by
+`test_no_root_catch_all_shadows_literal_or_fabricates_redirects` (nothing
+answers at the bare root of the prefix that would make `/<anything>` a public
+path):
+
+| Prefix | What is there |
+|---|---|
+| `/p`         | Public poll pages, invite pages (`/p/i/<token>`), decided-event `/p/<token>/event.ics`, candidate feeds (`/p/i/<token>/feed.ics`), deep-link vote URLs, `agent.json` |
+| `/v`         | Self-hosted short links (one indexed SELECT + a redirect) |
+| `/static`    | CSS/JS assets |
+| `/health`    | Liveness/readiness probe (SELECT 1 + `{status, app}`) |
+| `/api`       | REST API — authenticates itself with `Authorization: Bearer <token>` (owner-minted, scoped, revocable — #82) |
+| `/mcp`       | MCP server (pending #83) — same bearer, so include it in the bypass list from day one |
+| `/imprint`   | Imprint page, if `KAIROS_LEGAL=on` — linked from the voter page footer |
+| `/privacy`   | Privacy page, if `KAIROS_LEGAL=on` — same footer |
+| `/llms.txt`  | Agent-discovery doc |
+| `/robots.txt`| Crawler policy |
+
+Add these two paths **only** when `KAIROS_AUTH=capability` (anonymous
+poll creation + emailed single-use owner links — #30):
+
+| Prefix (capability mode) | What is there |
+|---|---|
+| `/new`     | Anonymous poll creation form (with Turnstile when configured) |
+| `/manage`  | Capability console: `GET /manage/<token>` (single-use link exchange), `POST /manage/link` (mail a fresh link) |
+
+There is no `/i` or `/ping` at the root of the prefix. Invite pages live
+under `/p/i/<token>`; the probe above is `/health` (SELECT 1 + `{status,
+app}`), and the API carries its own unauth-free liveness ping at `/api/ping`
+inside the `/api` bypass — neither needs a separate rule, so listing them
+would only leak a bypass onto non-routes a future PR might claim.
+
+### Cloudflare Access example
+
+Two self-hosted applications on the same host, each with its own **policy
+action**: the public-surface app enumerates the public prefixes and gets a
+Bypass policy, the owner-surface app covers the bare host and gets an Allow
+policy. Access picks **the most specific path match** when deciding which
+app owns a request (not the order the apps were registered in), so the
+public-prefix app wins for its paths and the bare-host app catches
+everything else. The example assumes Kairos at `kairos.example.com`,
+mounted at root (no `KAIROS_PREFIX`); for a prefix mount, add it to every
+path below. It also assumes default `KAIROS_AUTH`, so `/new` and `/manage`
+are owner routes; with `KAIROS_AUTH=capability`, move `/new` and
+`/manage/*` to the public app's **Path** list.
+
+```
+# Public surface — enumerated public prefixes, no login prompt.
+Name:          Kairos public surface
+Type:          Self-hosted
+Domain:        kairos.example.com
+Path:          /p/*, /v/*, /static/*, /api/*, /mcp/*,
+               /health, /imprint, /privacy, /llms.txt, /robots.txt
+               # + /new, /manage, /manage/*  when KAIROS_AUTH=capability
+Policy action: Bypass (everyone)
+
+# Owner surface — bare host, FAIL-CLOSED default for everything else.
+Name:          Kairos owners
+Type:          Self-hosted
+Domain:        kairos.example.com     # bare host; no Path
+Policy action: Allow — your IdP group / email domain
+```
+
+**Do not give the public app a wildcard path of `kairos.example.com/*`** —
+Access matches `host/*` against the bare `/` too, which would turn the owner
+dashboard public. The public app's Path list has to enumerate the public
+prefixes; the owner app on the bare host (no Path) is always the
+less-specific match and catches everything else.
+
+With `KAIROS_PREFIX=/scheduler`, every path above gets the prefix:
+`/scheduler/p/*, /scheduler/v/*, /scheduler/static/*, /scheduler/api/*,
+/scheduler/mcp/*, /scheduler/health, /scheduler/imprint, /scheduler/privacy,
+/scheduler/llms.txt, /scheduler/robots.txt` — the allow app's domain is still
+just the bare host.
+
+### nginx example
+
+The same shape without Cloudflare — two blocks, the specific prefixes first:
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name kairos.example.com;
+
+  # 1. Public surface — one `auth_request off;` for the enumerated prefixes.
+  #    Order matters: nginx tries exact/literal matches before regex, so the
+  #    `location =` blocks and the regex below both win over `location /`.
+  location = /health     { auth_request off; proxy_pass http://127.0.0.1:8003; include /etc/nginx/kairos-proxy.conf; }
+  location = /imprint    { auth_request off; proxy_pass http://127.0.0.1:8003; include /etc/nginx/kairos-proxy.conf; }
+  location = /privacy    { auth_request off; proxy_pass http://127.0.0.1:8003; include /etc/nginx/kairos-proxy.conf; }
+  location = /llms.txt   { auth_request off; proxy_pass http://127.0.0.1:8003; include /etc/nginx/kairos-proxy.conf; }
+  location = /robots.txt { auth_request off; proxy_pass http://127.0.0.1:8003; include /etc/nginx/kairos-proxy.conf; }
+  location ~ ^/(p|v|static|api|mcp)(/|$) {
+    auth_request off;
+    proxy_pass http://127.0.0.1:8003;
+    include /etc/nginx/kairos-proxy.conf;
+  }
+  # Capability mode only: uncomment to make anonymous creation + manage links public.
+  # location = /new { auth_request off; proxy_pass http://127.0.0.1:8003; include /etc/nginx/kairos-proxy.conf; }
+  # location ~ ^/manage(/|$) { auth_request off; proxy_pass http://127.0.0.1:8003; include /etc/nginx/kairos-proxy.conf; }
+
+  # 2. Everything else is an owner page — gate it with your auth_request
+  #    handler (oauth2-proxy, Authelia, your proxy's built-in auth, …).
+  location / {
+    auth_request /auth;           # or auth_basic, or your IdP's module
+    proxy_pass http://127.0.0.1:8003;
+    include /etc/nginx/kairos-proxy.conf;
+  }
+}
+
+# /etc/nginx/kairos-proxy.conf (shared headers)
+#   proxy_set_header Host $host;
+#   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#   proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+For `KAIROS_PREFIX=/scheduler`, prefix each public literal (`/scheduler/health`,
+…), change the regex to `^/scheduler/(p|v|static|api|mcp)(/|$)`, and move the
+owner block to `location /scheduler/`.
+
 ## Features
 
 - Full-day or time-slot polls, when2meet drag grids, heatmaps
