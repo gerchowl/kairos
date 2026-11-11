@@ -404,10 +404,9 @@ def _refuse_key(principal: dict, poll_id: str) -> None:
         )
         raise HTTPException(
             403,
-            f"This token acts for {owner} and reaches only that owner's polls. "
-            f"Poll {poll_id} belongs to another owner, so a token minted for "
-            f"{owner} cannot read it -- mint a token under that owner's account "
-            f"(the panel at /tokens) instead.",
+            f"This token acts for {owner} and reaches only that owner's polls; "
+            f"poll {poll_id} is not one of them. To work on a poll another "
+            f"account owns, mint a token under that account (the panel at /tokens).",
         )
     grant = grant_for(principal)
     held = "every poll" if grant is EVERY_POLL else ", ".join(sorted(grant)) or "no polls"
