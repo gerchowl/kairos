@@ -142,7 +142,7 @@ from kairos import settings
 from kairos.auth import _serializer, can_manage, get_base_url, require_manage
 from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
-    add_slots,
+    add_slots_capped,
     create_invite,
     create_poll,
     delete_poll,
@@ -1445,7 +1445,13 @@ def _edit(request, form, poll, web):
         timezone=timezone,
     )
     if slots:
-        add_slots(poll["id"], slots)
+        # Finding 1 of PR #92 round-2: this used to call the bare `add_slots`,
+        # which skipped the atomic count/check/insert — 128 concurrent workers
+        # against a 1,000-cap poll took it to 3,610 slots on /manage/{id}/edit.
+        # One entry point now (`add_slots_capped`), every surface, every mode
+        # (ADR-0012 parity): REST, MCP, the web owner form AND this capability
+        # console all pass through the same transactional guard.
+        add_slots_capped(poll["id"], slots, cap=settings.max_slots_per_poll())
     return _back("saved")
 
 
@@ -1473,8 +1479,13 @@ def _parse_dates(values) -> list[str]:
     every date is at least one slot, so the refusal is stated at the function
     that manufactures the input rather than discovered downstream after the list
     exists.
+
+    The date-shape check uses `kairos.validation.validate_date` -- the one
+    predicate every slot-writing surface uses (REST models, MCP, web /new,
+    web edit, this console), so the four call sites cannot drift and the
+    refusal does not echo the submitted value (finding 5 of PR #92 round-2).
     """
-    from datetime import date
+    from kairos.validation import InvalidDate, validate_date
 
     parsed = []
     per_request = settings.MAX_SLOTS_PER_REQUEST
@@ -1484,9 +1495,9 @@ def _parse_dates(values) -> list[str]:
             if not part:
                 continue
             try:
-                date.fromisoformat(part)
-            except ValueError:
-                raise HTTPException(400, f"{part!r} is not a date (expected YYYY-MM-DD)") from None
+                validate_date(part, field="dates")
+            except InvalidDate as exc:
+                raise HTTPException(400, str(exc)) from None
             parsed.append(part)
             if per_request > 0 and len(parsed) > per_request:
                 # Refused *here*, so the 95,000th date is never appended and never

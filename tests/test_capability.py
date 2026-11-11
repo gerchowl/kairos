@@ -2365,8 +2365,11 @@ def test_the_console_edit_dates_field_cannot_smuggle_past_the_field_ceiling():
     with pytest.raises(HTTPException):
         capability._parse_dates([",".join(["2026-01-05"] * 20)] * 200)  # 4,000 total
     # Empty parts are still skipped, and a genuine bad date is still a 400 about the date.
+    # Since PR #92 round-2 the shared `kairos.validation.validate_date` writes
+    # the refusal: "dates must be YYYY-MM-DD (got 'nope')" with a bounded excerpt
+    # of the submitted value (finding 5 -- no full echo).
     assert capability._parse_dates(["2026-01-05, ,2026-01-06,"]) == ["2026-01-05", "2026-01-06"]
-    with pytest.raises(HTTPException, match="not a date"):
+    with pytest.raises(HTTPException, match="YYYY-MM-DD"):
         capability._parse_dates(["2026-01-05,nope"])
 
 

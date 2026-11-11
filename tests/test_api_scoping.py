@@ -140,9 +140,7 @@ def stubbed(monkeypatch, sent):
     # about authorisation and not about a missing in-memory schema.
     monkeypatch.setattr(api, "create_poll", lambda creator, title, *a, **k: dict(POLL))
     monkeypatch.setattr(api, "update_poll", lambda pid, **k: dict(POLL))
-    monkeypatch.setattr(api, "add_slots", lambda pid, slots: slots)
     monkeypatch.setattr(api, "add_slots_capped", lambda pid, slots, cap: slots)
-    monkeypatch.setattr(web, "add_slots", lambda pid, slots: slots)
     monkeypatch.setattr(web, "add_slots_capped", lambda pid, slots, cap: slots)
     monkeypatch.setattr(api, "add_response", lambda pid, name, email, avail: {"id": "r1"})
     monkeypatch.setattr(api, "find_response_by_email", lambda pid, email: None)

@@ -36,7 +36,6 @@ routes reach it inside the shared `nudge_participants`; the four senders below
 call it themselves, ahead of any write and any budget charge.
 """
 
-from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -46,7 +45,6 @@ from kairos.auth import get_base_url
 from kairos.capability import require_sendable
 from kairos.db import (
     add_response,
-    add_slots,  # noqa: F401 — re-exported for tests that monkey-patch it
     add_slots_capped,
     bump_slot_sequence,
     create_invite,
@@ -75,6 +73,13 @@ from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
 from kairos.scoping import api_scope, charge_force, charge_poll_recipients, check_recipient_list, enforce
+from kairos.validation import (
+    InvalidDate,
+    InvalidTime,
+    validate_date,
+    validate_time,
+    validate_time_ordering,
+)
 from kairos.web import (
     _valid_timezone,
     decided_slot_of,
@@ -97,29 +102,37 @@ class SlotIn(BaseModel):
     # previous shape accepted any string and relied on `datetime.strptime` in
     # `add_slots_endpoint` to refuse a bad date, which caught `add_dates` but
     # left `POST /polls` writing rows that would then raise on the next read.
-    date: str = Field(..., max_length=10)
-    start_time: str | None = Field(default=None, max_length=5)
-    end_time: str | None = Field(default=None, max_length=5)
+    #
+    # One shared validator module (`kairos.validation`) is used by every
+    # slot-writing surface -- REST models (here), MCP (via these same models),
+    # the web /new and /polls/{id}/edit paths, and the capability console's
+    # `_parse_dates` -- so a regression test can pin each predicate once and
+    # the four call sites cannot drift.
+    date: str
+    start_time: str | None = None
+    end_time: str | None = None
 
     @field_validator("date")
     @classmethod
     def _check_date(cls, v: str) -> str:
+        # Delegates to the shared validator, which refuses what a DATE column
+        # would raise on at next read AND does not echo the submitted value
+        # in the refusal message (finding 5). `HH:MM:SS` is accepted and
+        # normalised to `HH:MM` so a MySQL TIME round-trip is not refused.
         try:
-            datetime.strptime(v, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError("date must be YYYY-MM-DD") from None
-        return v
+            return validate_date(v, field="date")
+        except InvalidDate as exc:
+            raise ValueError(str(exc)) from None
 
     @field_validator("start_time", "end_time")
     @classmethod
-    def _check_time(cls, v: str | None) -> str | None:
+    def _check_time(cls, v: str | None, info) -> str | None:
         if v is None:
             return v
         try:
-            datetime.strptime(v, "%H:%M")
-        except ValueError:
-            raise ValueError("time must be HH:MM") from None
-        return v
+            return validate_time(v, field=info.field_name)
+        except InvalidTime as exc:
+            raise ValueError(str(exc)) from None
 
     @model_validator(mode="after")
     def _check_ordering(self) -> "SlotIn":
@@ -127,10 +140,10 @@ class SlotIn(BaseModel):
         # zero-length slot is a user error; a negative-length one is a 500
         # in the ICS builder. Catching it at the input is cheapest.
         if self.start_time and self.end_time:
-            s = datetime.strptime(self.start_time, "%H:%M")
-            e = datetime.strptime(self.end_time, "%H:%M")
-            if e <= s:
-                raise ValueError("end_time must be after start_time")
+            try:
+                validate_time_ordering(self.start_time, self.end_time, field="time_slot")
+            except InvalidTime as exc:
+                raise ValueError(str(exc)) from None
         return self
 
 class PollCreate(BaseModel):
@@ -207,11 +220,16 @@ class SlotsAdd(BaseModel):
         # route's `datetime.strptime` loop already does this but at a surface
         # that depends on which route reaches it — doing it on the model is
         # one validator for every caller that speaks this shape (REST, MCP).
-        for d in v:
+        #
+        # The shared validator (`kairos.validation`) refuses what a DATE
+        # column could not store AND does not echo the submitted value in
+        # the refusal message (finding 5): the previous version's `{d!r}`
+        # would reflect a 1 MB garbage string back at the client.
+        for i, d in enumerate(v):
             try:
-                datetime.strptime(d, "%Y-%m-%d")
-            except (TypeError, ValueError):
-                raise ValueError(f"dates must be YYYY-MM-DD (got {d!r})") from None
+                validate_date(d, field=f"dates[{i}]")
+            except InvalidDate as exc:
+                raise ValueError(str(exc)) from None
         return v
 
 class MailIn(BaseModel):

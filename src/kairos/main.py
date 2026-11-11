@@ -17,11 +17,33 @@ from kairos.db import get_connection, init_schema
 def _install_body_size_cap(app: FastAPI) -> None:
     """Refuse a request body over `settings.MAX_BODY_BYTES`, BEFORE FastAPI parses.
 
-    ASGI middleware counting streamed bytes: works with or without a
-    Content-Length (chunked transfer, misreported length, both caught),
-    runs on **every** surface (web, api, mcp -- the previous version only
-    bounded /mcp), and answers a JSON 413 so an agent reading the response
-    sees the knob name in the detail. Zero disables the cap.
+    ASGI middleware that **buffers and replays** the body up to the cap and
+    answers 413 the moment a chunk would take the running total past it.
+    Works with or without a Content-Length (chunked transfer, misreported
+    length, both caught), runs on every surface (web, api — /mcp has its own
+    JSON-RPC envelope), and answers a JSON 413 so an agent reading the
+    response sees the knob name in the detail. Zero disables the cap.
+
+    **Finding 2 of PR #92 round-2.** The previous version wrapped
+    `receive()` as a *passive* counter: it incremented `total` per chunk
+    but still returned every chunk to the downstream app. On a chunked
+    300 MB body FastAPI's body reader kept pulling until `more_body=False`,
+    so the app had already materialised the whole thing in memory
+    (measured: 100 MB → 431 MB RSS; 300 MB → 1.2 GB RSS) before the
+    middleware's post-call override turned it into a 413. The 413 was
+    "flow-shaped" -- right status, wrong invariant: the cap must bound
+    what *parsing* costs, not what the parser does *afterwards*.
+
+    The design in use here is "buffer and replay": the middleware reads the
+    body itself (up to `cap` bytes), and on the chunk that would exceed the
+    cap it returns **immediately** with 413 -- the downstream app is never
+    called at all, so no body parser can have started on a partial body.
+    Under the cap, the buffered body is handed to the app via a replay
+    `receive()` that delivers it as one `http.request` message with
+    `more_body=False`. This costs us streaming to downstream routes, which
+    Kairos does not use: every FastAPI route here buffers its body before
+    validating (JSON / form), so the extra copy is paid at request time
+    and freed when the handler returns. 1 MiB fits comfortably.
 
     An operator who disables this (`KAIROS_MAX_BODY_BYTES=0`) keeps the
     MCP-local per-stream cap in `kairos.mcp_http._read_body_capped`, so a
@@ -35,6 +57,15 @@ def _install_body_size_cap(app: FastAPI) -> None:
     # without having to teach this middleware to mint the envelope itself.
     mcp_path = f"{settings.PREFIX}/mcp"
 
+    def _too_large(current_cap: int) -> JSONResponse:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": (
+                f"request body exceeds {current_cap} bytes "
+                f"(KAIROS_MAX_BODY_BYTES)"
+            )},
+        )
+
     @app.middleware("http")
     async def body_size_middleware(request, call_next):
         # Re-read every request so a test that monkey-patches the setting
@@ -42,52 +73,64 @@ def _install_body_size_cap(app: FastAPI) -> None:
         current_cap = settings.MAX_BODY_BYTES
         if current_cap <= 0 or request.url.path == mcp_path:
             return await call_next(request)
+        # GET/HEAD/OPTIONS/DELETE have no body (conceptually; clients may send
+        # one, which the ASGI server still delivers); let them pass without
+        # buffering so the hot path for cheap reads is zero-copy.
+        if request.method in ("GET", "HEAD", "OPTIONS"):
+            return await call_next(request)
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
                 if int(cl) > current_cap:
-                    return JSONResponse(
-                        status_code=413,
-                        content={"detail": (
-                            f"request body exceeds {current_cap} bytes "
-                            f"(KAIROS_MAX_BODY_BYTES)"
-                        )},
-                    )
+                    return _too_large(current_cap)
             except ValueError:
-                # Malformed Content-Length: fall through to the stream cap,
-                # same as /mcp's per-stream guard does.
+                # Malformed Content-Length: fall through to the stream cap.
                 pass
 
-        # Wrap the ASGI receive() so FastAPI reads bytes through this counter:
-        # the cap fires BEFORE any JSON / form body parser materialises
-        # anything, which is the whole point.
-        total = 0
-        over = False
+        # Buffer-and-replay. Read chunks ourselves; the moment the running
+        # total would exceed the cap, return 413 WITHOUT calling the app.
+        # Memory is bounded at `cap` bytes regardless of how many bytes the
+        # client sends (a chunked 300 MB body stops reading as soon as the
+        # cap+1'th byte arrives).
         receive = request.receive
-
-        async def counting_receive():
-            nonlocal total, over
+        body = bytearray()
+        more_body = True
+        while more_body:
             msg = await receive()
-            if msg.get("type") == "http.request":
-                total += len(msg.get("body") or b"")
-                if total > current_cap:
-                    over = True
-            return msg
+            msg_type = msg.get("type")
+            if msg_type == "http.disconnect":
+                return _too_large(current_cap)
+            if msg_type != "http.request":
+                continue
+            chunk = msg.get("body") or b""
+            more_body = bool(msg.get("more_body", False))
+            if len(body) + len(chunk) > current_cap:
+                # Over cap on this chunk: refuse now. The app is NEVER called,
+                # so no body parser can have begun on a partial body. The
+                # remaining chunks (if any) sit in the ASGI server's buffer,
+                # which uvicorn bounds (HIGH_WATER_LIMIT ~ 64 KiB per
+                # connection) -- not under our control, but not an unbounded
+                # memory pool either.
+                return _too_large(current_cap)
+            body.extend(chunk)
+        buffered = bytes(body)
 
-        request._receive = counting_receive  # Starlette's documented hook
-        response = await call_next(request)
-        if over:
-            # The route may have already answered (small handler, early
-            # return before the oversized trailer arrived); override with
-            # 413 either way, since the request violated the cap.
-            return JSONResponse(
-                status_code=413,
-                content={"detail": (
-                    f"request body exceeds {current_cap} bytes "
-                    f"(KAIROS_MAX_BODY_BYTES)"
-                )},
-            )
-        return response
+        # Replay the buffered body to the app in a single message. FastAPI's
+        # body readers call receive() in a loop until `more_body=False`, so
+        # one shot is enough.
+        sent = False
+
+        async def replay_receive():
+            nonlocal sent
+            if not sent:
+                sent = True
+                return {"type": "http.request", "body": buffered, "more_body": False}
+            # After the body, deliver a disconnect so a buggy handler that
+            # keeps reading sees end-of-stream, not a hang.
+            return {"type": "http.disconnect"}
+
+        request._receive = replay_receive  # Starlette's documented hook
+        return await call_next(request)
 
     # Keep the installed cap visible for anything that wants to assert the
     # default at import time without reading env itself.

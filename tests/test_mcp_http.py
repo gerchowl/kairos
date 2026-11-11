@@ -95,7 +95,7 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(api, "get_invites", lambda pid: [])
     monkeypatch.setattr(api, "create_poll", lambda creator, *a, **k: dict(POLL))
     monkeypatch.setattr(api, "update_poll", lambda pid, **k: dict(POLL))
-    monkeypatch.setattr(api, "add_slots", lambda pid, slots: slots)
+    monkeypatch.setattr(api, "add_slots_capped", lambda pid, slots, cap: slots)
     monkeypatch.setattr(api, "add_response", lambda *a, **k: {"id": "r1"})
     monkeypatch.setattr(api, "find_response_by_email", lambda *a, **k: None)
     monkeypatch.setattr(api, "notify_new_response", lambda *a, **k: None)

@@ -525,30 +525,21 @@ def list_polls(creator_id: str | None = None) -> list[dict]:
     return polls
 
 
-def add_slots(poll_id: str, slots: list[dict]) -> list[dict]:
-    """Append new slots to an existing poll (additive edit — responses keep)."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    slot_rows = []
-    for s in slots:
-        slot_id = new_id()
-        cursor.execute(
-            "INSERT INTO sched_poll_slots (id, poll_id, date, start_time, end_time) VALUES (%s, %s, %s, %s, %s)",
-            (slot_id, poll_id, s["date"], s.get("start_time"), s.get("end_time")),
-        )
-        slot_rows.append({"id": slot_id, "date": s["date"],
-                          "start_time": s.get("start_time"), "end_time": s.get("end_time")})
-    conn.commit()
-    cursor.close()
-    conn.close()
-    return slot_rows
-
-
 def add_slots_capped(poll_id: str, slots: list[dict], cap: int) -> list[dict]:
-    """`add_slots`, but atomic in count+check+insert: refuses if existing + new > cap.
+    """Append new slots to a poll, atomic in count+check+insert.
+
+    The **only** public slot-insertion entry point: finding 1 of PR #92
+    round-2 noted that a plain `add_slots` beside this function left the race
+    one bypass away (the capability-console `/manage/{id}/edit` called it,
+    skipping the atomic guard — 128 concurrent workers reached **3,610
+    slots** against a 1,000-cap poll on the pre-fix tree). So the bare
+    helper has been **removed**, not just privatised: an ImportError at
+    module-load is a louder refusal than a lint note. Every surface -- the
+    web owner form, the capability console, REST and MCP -- calls this one
+    function, with `cap=settings.max_slots_per_poll()`.
 
     The per-poll cap on #70 used to be checked in the route before calling
-    `add_slots`, and the PR #92 adversarial-review pass measured the race:
+    a bare `add_slots`, and the PR #92 adversarial-review pass measured the race:
     **64 concurrent `POST /api/polls/{id}/slots` calls against the same key
     took the poll to 36,100 slots** on a 1,000-cap deployment, because every
     one of the 64 workers read the same `existing_count`, saw it was under

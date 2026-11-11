@@ -606,3 +606,401 @@ def test_finding_5_slot_cap_refusal_sentence_fires_on_rest(client, monkeypatch):
     assert r.status_code == 400, r.text
     assert "too large" in r.text
     assert "50" in r.text
+
+
+# -- PR #92 round-2 regression pass ----------------------------------------
+#
+# One test per finding, each failing on 888ed5c and passing after.
+
+
+def test_round2_finding_1_bare_add_slots_is_gone():
+    """**Round-2 finding 1 (HIGH).** The bare `add_slots` must no longer
+    be importable from `kairos.db`, so a future caller cannot bypass the
+    atomic guard by naming the private helper. The one entry point is
+    `add_slots_capped`.
+    """
+    from kairos import db
+    assert not hasattr(db, "add_slots"), (
+        "kairos.db.add_slots must be removed — every slot write goes "
+        "through add_slots_capped so the per-poll cap is atomic."
+    )
+    assert hasattr(db, "add_slots_capped")
+
+
+def test_round2_finding_1_manage_edit_is_atomic_under_concurrent_writers(tmp_path, monkeypatch):
+    """**Round-2 finding 1 (HIGH race).** `capability._edit` called the
+    bare `add_slots` on /manage/{id}/edit, skipping the atomic
+    count+check+insert the REST path got in round-1. 128 concurrent workers
+    against a 1,000-cap poll took it to 3,610 slots on the pre-fix tree.
+    The fix removes the bare helper and routes every slot-insertion
+    through `add_slots_capped`, so the console cannot drift from REST.
+
+    Pinned against real SQLite via a thread pool so the race actually
+    runs; final slot count must be `<= cap`. The manage auth/CSRF step
+    is one-shot (the token is rotated on exchange), so this test stubs
+    `require_manage` and `require_csrf` to let N concurrent POSTs reach
+    `_edit` -- the REST-level atomicity test
+    (`test_finding_1_add_slots_is_atomic_under_concurrent_writers`) pins
+    the same invariant from the other direction.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setenv("KAIROS_AUTH", "capability")
+    monkeypatch.setenv("KAIROS_MAX_SLOTS_PER_POLL", "100")
+    monkeypatch.setattr("kairos.settings.AUTH_MODE", "capability")
+    monkeypatch.setattr("kairos.capability.is_configured", lambda: True)
+    monkeypatch.setattr("kairos.capability.require_manage",
+                        lambda poll, request, **kw: poll)
+    monkeypatch.setattr("kairos.capability.require_csrf", lambda d, form: None)
+    # The session check sits before `require_manage`; stub to a valid session
+    # for the poll under test. Each worker's TestClient has no cookies, so
+    # `read_session` returns None otherwise.
+    def _fake_session(request):
+        return {"pid": poll_id, "at": "stub-token"}
+    monkeypatch.setattr("kairos.capability.read_session", _fake_session)
+    path = tmp_path / "manage_race.db"
+    monkeypatch.setattr("kairos.settings.DB_URL", f"sqlite:///{path}")
+    monkeypatch.setattr("kairos.dbconn.IS_SQLITE", True)
+
+    from kairos import db
+    db.init_schema()
+    poll = db.create_poll(
+        creator_id="race-owner", title="race", description=None,
+        mode="full_day", timezone="UTC",
+        slots=[{"date": f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}"} for i in range(50)],
+        owner_id=None, creator_email="r@x.ch",
+    )
+    poll_id = poll["id"]
+
+    # One session cookie per worker so cookie-jar access does not serialise
+    # the race. Each client runs its own POST through the real app, which
+    # calls the real `_edit`, which calls the real `add_slots_capped`.
+    def worker(i: int):
+        c = TestClient(main.app, base_url="https://testserver")
+        # The route reads the session; with `require_manage` stubbed above,
+        # a bare POST is enough.
+        dates = [f"2030-{1 + i:02d}-{1 + d:02d}" for d in range(10)]
+        return c.post(
+            f"/scheduler/manage/{poll_id}/edit",
+            data={"csrf": "x", "title": "race", "timezone": "UTC",
+                  "dates": ",".join(dates)},
+            follow_redirects=False,
+        )
+
+    N = 24
+    with ThreadPoolExecutor(max_workers=N) as pool:
+        responses = list(pool.map(worker, range(N)))
+
+    final = db.get_poll(poll_id)
+    assert len(final["slots"]) <= 100, (
+        f"the poll holds {len(final['slots'])} slots, over the cap of 100 — "
+        "the capability /manage/{id}/edit race reopened."
+    )
+    # At least one must have been accepted and at least one refused for the
+    # race window to have run; otherwise the test is vacuous.
+    accepted = sum(1 for r in responses if r.status_code in (200, 302, 303))
+    refused = sum(1 for r in responses if r.status_code == 400)
+    assert accepted >= 1 and refused >= 1, (
+        f"test did not exercise the race: accepted={accepted} refused={refused} "
+        f"statuses={[r.status_code for r in responses]}"
+    )
+
+
+def test_round2_finding_2_middleware_stops_reading_a_chunked_over_cap_body(monkeypatch):
+    """**Round-2 finding 2 (HIGH body-size on chunked).** A chunked body
+    over cap used to arrive in full (100 MB → 431 MB RSS; 300 MB → 1.2 GB
+    RSS) before the middleware answered 413. The fix buffers up to the
+    cap and refuses the moment a chunk would exceed it, NEVER forwarding
+    further bytes to the app.
+
+    Driven at the ASGI layer (not through `TestClient`) because httpx's
+    ASGI transport pre-reads a generator into one buffer before handing
+    it to ASGI's `receive` — a limitation of the TEST layer, not of the
+    middleware. At the ASGI layer we can measure what we actually care
+    about:
+
+      * the app is never called (no body parser got partial bytes),
+      * `receive` is NOT drained past the chunk that trips the cap
+        (so RSS stays flat even for a 300 MiB body).
+    """
+    monkeypatch.setattr("kairos.settings.MAX_BODY_BYTES", 1 * 1024 * 1024)
+    # Reinstall the middleware against a minimal ASGI app, so we drive
+    # `_install_body_size_cap`'s exact function with a hand-crafted
+    # `receive()` whose yields we can count and whose rate we control.
+    from fastapi import FastAPI
+
+    from kairos import main as _main
+    inner = FastAPI()
+    call_count = {"app": 0}
+
+    @inner.post("/scheduler/api/polls")
+    async def _spy():  # pragma: no cover — must not run
+        call_count["app"] += 1
+        return {"ok": True}
+
+    _main._install_body_size_cap(inner)
+
+    # Build the ASGI scope of a chunked POST (no Content-Length).
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "server": ("testserver", 443),
+        "path": "/scheduler/api/polls",
+        "raw_path": b"/scheduler/api/polls",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"transfer-encoding", b"chunked"),
+        ],
+        "client": ("127.0.0.1", 12345),
+    }
+    body_size = 300 * 1024 * 1024  # 300 MiB — the shape the finding measured
+    chunk_size = 256 * 1024
+    chunks_yielded = {"n": 0}
+
+    async def receive():
+        # Yield 256 KiB chunks until exhausted; count them so we can assert the
+        # middleware stopped reading early.
+        if chunks_yielded["n"] * chunk_size >= body_size:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        chunks_yielded["n"] += 1
+        return {"type": "http.request",
+                "body": b"\x00" * chunk_size,
+                "more_body": True}
+
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    import asyncio
+    asyncio.run(inner(scope, receive, send))
+
+    # The response must be 413.
+    starts = [m for m in sent if m.get("type") == "http.response.start"]
+    assert starts and starts[0]["status"] == 413, starts
+    # The app must NEVER have been called for an over-cap body.
+    assert call_count["app"] == 0, (
+        "the route handler must not have run for an over-cap body — "
+        "a route that has started parsing a partial body has already "
+        "allocated its parse cost"
+    )
+    # And the middleware must have stopped reading early, not drained the
+    # whole 300 MiB. 1 MiB cap / 256 KiB chunk = 4 chunks to reach the
+    # cap; the 5th trips it. A pre-fix read-everything middleware would
+    # yield ~1200 chunks.
+    assert chunks_yielded["n"] <= 16, (
+        f"middleware pulled {chunks_yielded['n']} chunks of {chunk_size} "
+        f"for a 300 MiB over-cap body — it must stop at the cap, not "
+        "continue draining the stream."
+    )
+
+
+def test_round2_finding_2_body_over_cap_with_content_length_is_413(monkeypatch):
+    """**Round-2 finding 2 (header-shortcut).** When the client sends a
+    Content-Length over cap, the middleware refuses before reading a
+    byte of the body. This is the easy case and the test client handles
+    it faithfully.
+    """
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr("kairos.settings.MAX_BODY_BYTES", 1 * 1024 * 1024)
+    oversized = b"x" * (int(1.5 * 1024 * 1024))
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    r = c.post(
+        "/scheduler/api/polls",
+        content=oversized,
+        headers={"Content-Type": "application/json",
+                 "Content-Length": str(len(oversized))},
+    )
+    assert r.status_code == 413, r.text
+
+
+def test_round2_finding_2_under_cap_body_is_replayed_intact(monkeypatch):
+    """The buffer-and-replay design hands the app the WHOLE body as one
+    `http.request` message. Pins that a normal under-cap request still
+    reaches the route and the route reads every byte.
+    """
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr("kairos.settings.MAX_BODY_BYTES", 1 * 1024 * 1024)
+    monkeypatch.setattr(api, "create_poll", lambda *a, **k: dict(POLL))
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    r = c.post("/scheduler/api/polls", json={
+        "title": "x", "mode": "full_day", "timezone": "Europe/Zurich",
+        "slots": [{"date": "2026-06-08"}],
+    })
+    assert r.status_code == 200, r.text
+
+
+def test_round2_finding_3_web_new_header_mode_refuses_the_per_request_cap(monkeypatch):
+    """**Round-2 finding 3 (MEDIUM per-request cap on /new).** Header-mode
+    /new had no per-request cap: 5,000 dates created 5,000 slot dicts
+    without challenge. The shared `web.request_cap_refusal` enforces the
+    arithmetic bound on every write surface.
+    """
+    monkeypatch.setenv("KAIROS_MAX_SLOTS_PER_REQUEST", "500")
+    monkeypatch.setattr("kairos.settings.MAX_SLOTS_PER_REQUEST", 500)
+    monkeypatch.setattr("kairos.settings.AUTH_MODE", "header")
+    monkeypatch.setattr("kairos.settings.HOSTED", False)
+    monkeypatch.setattr("kairos.web.get_user",
+                        lambda req: {"uid": "lars", "name": "L", "email": "l@x.ch"})
+    monkeypatch.setattr("kairos.web.require_csrf", lambda user, form: None)
+    monkeypatch.setattr("kairos.web.create_poll", lambda *a, **k: dict(POLL))
+    # `_error_page` renders the nav, which reads notifications; stub so the
+    # test is about the refusal shape, not the DB fixture.
+    monkeypatch.setattr("kairos.web.get_notifications", lambda uid, unread_only=True: [])
+    c = TestClient(main.app, base_url="https://testserver")
+    from datetime import date as _d
+    from datetime import timedelta as _td
+    start = _d(2027, 1, 1)
+    many = [(start + _td(days=i)).isoformat() for i in range(600)]
+    r = c.post("/scheduler/new", data={
+        "title": "huge", "mode": "full_day", "timezone": "Europe/Zurich",
+        "csrf": "x", "dates": many,
+    })
+    assert r.status_code == 400, r.text
+    assert "500" in r.text
+    assert "too large" in r.text or "per-request" in r.text
+
+
+def test_round2_finding_3_request_cap_helper_is_shared(monkeypatch):
+    """The per-request refusal is one function used everywhere."""
+    from kairos import web
+    monkeypatch.setattr("kairos.settings.MAX_SLOTS_PER_REQUEST", 50)
+    assert web.request_cap_refusal(49) is None
+    assert web.request_cap_refusal(50) is None
+    msg = web.request_cap_refusal(51)
+    assert msg and "50" in msg and "too large" in msg
+    monkeypatch.setattr("kairos.settings.MAX_SLOTS_PER_REQUEST", 0)
+    assert web.request_cap_refusal(10_000_000) is None, "0 disables the cap"
+
+
+def test_round2_finding_4_shared_validators_live_in_one_module():
+    """**Round-2 finding 4 (MEDIUM validation).** One `validate_date` /
+    `validate_time` used by every surface. Shape + arithmetic + bounded
+    input length. `HH:MM:SS` is accepted and normalised to `HH:MM` so a
+    MySQL TIME round-trip is not refused by its own input layer (fixes
+    the round-1 regression).
+    """
+    from kairos.validation import (
+        InvalidDate,
+        InvalidTime,
+        validate_date,
+        validate_time,
+    )
+    assert validate_date("2026-01-05") == "2026-01-05"
+    for bad in ("2026-1-5", "not-a-date", "2026-13-01", "2026-02-30",
+                "2026/01/05", "x" * 500, 20260105):
+        with pytest.raises(InvalidDate):
+            validate_date(bad)
+    assert validate_time("09:00") == "09:00"
+    assert validate_time("09:00:00") == "09:00", "HH:MM:SS must normalise to HH:MM"
+    assert validate_time("23:59:59") == "23:59"
+    for bad in ("25:00", "9:5", "nope", "x" * 500, None, 900):
+        with pytest.raises(InvalidTime):
+            validate_time(bad)
+
+
+def test_round2_finding_4_rest_slot_accepts_hhmmss_and_normalises(client, monkeypatch):
+    """`SlotIn` must accept `HH:MM:SS` on start/end and normalise -- the
+    column round-trip on MySQL carries seconds, so refusing them would
+    make the data its own validator refused (round-1 regression).
+    """
+    captured = {}
+    def capture_create_poll(*a, **k):
+        slots = k.get("slots")
+        if slots is None:
+            slots = a[5]  # positional
+        captured["slots"] = slots
+        return dict(POLL)
+    monkeypatch.setattr(api, "create_poll", capture_create_poll)
+    r = client.post("/scheduler/api/polls", json={
+        "title": "x", "mode": "time_slot", "timezone": "Europe/Zurich",
+        "slots": [{"date": "2026-06-08",
+                   "start_time": "09:00:00", "end_time": "10:00:00"}],
+    })
+    assert r.status_code == 200, r.text
+    assert captured["slots"][0]["start_time"] == "09:00"
+    assert captured["slots"][0]["end_time"] == "10:00"
+
+
+def test_round2_finding_4_rest_slot_refuses_short_date_and_missing_zeros(client, monkeypatch):
+    """A tight regex up front refuses shapes that `date.fromisoformat`
+    might accept on a lax Python; the column converter raises on them
+    either way.
+    """
+    monkeypatch.setattr(api, "create_poll", lambda *a, **k: dict(POLL))
+    for bad in ("2026-1-5", "20260105"):
+        r = client.post("/scheduler/api/polls", json={
+            "title": "x", "mode": "full_day", "timezone": "Europe/Zurich",
+            "slots": [{"date": bad}],
+        })
+        assert r.status_code == 422, (bad, r.text)
+
+
+def test_round2_finding_4_read_path_tolerates_a_bad_stored_date(caplog):
+    """A poll already on disk with a malformed `date` row must not 500
+    the page. `validation.slot_is_readable` says False for such rows and
+    the operator is told once.
+    """
+    import logging
+
+    from kairos.validation import slot_is_readable
+    good = {"id": "s1", "poll_id": "p1", "date": date(2026, 6, 8)}
+    bad = {"id": "sbad", "poll_id": "p1", "date": "not-a-date"}
+    bad_time = {"id": "stime", "poll_id": "p1", "date": date(2026, 6, 8),
+                "start_time": "nope"}
+    assert slot_is_readable(good) is True
+    with caplog.at_level(logging.WARNING, logger="kairos.validation"):
+        assert slot_is_readable(bad) is False
+        assert slot_is_readable(bad_time) is False
+    assert any("skipping unreadable slot" in r.message for r in caplog.records)
+
+
+def test_round2_finding_5_validators_do_not_echo_the_full_submitted_value():
+    """**Round-2 finding 5 (LOW).** A bad input of 1 MB must not produce
+    a 1 MB refusal. The validator excerpts at 40 chars with an ellipsis.
+    """
+    from kairos.validation import (
+        InvalidDate,
+        InvalidTime,
+        validate_date,
+        validate_time,
+    )
+    huge = "x" * (1 * 1024 * 1024)
+    try:
+        validate_date(huge)
+    except InvalidDate as exc:
+        msg = str(exc)
+        assert len(msg) < 200, f"refusal message is {len(msg)} chars long"
+        assert huge[:100] not in msg
+    else:
+        raise AssertionError("expected InvalidDate")
+    try:
+        validate_time(huge)
+    except InvalidTime as exc:
+        msg = str(exc)
+        assert len(msg) < 200
+        assert huge[:100] not in msg
+    else:
+        raise AssertionError("expected InvalidTime")
+
+
+def test_round2_finding_5_slot_add_rejection_is_bounded(client, monkeypatch):
+    """REST `SlotsAdd._check_dates` must not echo the full submitted
+    value into the 422 body. A 500 KiB bad date produces a short response.
+    """
+    monkeypatch.setattr(api, "get_poll", lambda pid: dict(POLL))
+    monkeypatch.setattr(api, "add_slots_capped", lambda pid, slots, cap: slots)
+    huge_bad = "x" * (int(0.5 * 1024 * 1024))
+    r = client.post("/scheduler/api/polls/p1/slots", json={"dates": [huge_bad]})
+    assert r.status_code == 422, r.text
+    assert len(r.text) < 10_000, (
+        f"a 500 KiB bad date produced a {len(r.text)}-char response — "
+        "the validator echoed the submitted value in full."
+    )
+    assert huge_bad[:100] not in r.text
