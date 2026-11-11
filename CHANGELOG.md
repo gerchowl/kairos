@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.14.0](https://github.com/gerchowl/kairos/compare/v0.13.0...v0.14.0) (2026-11-11)
+
+
+### Features
+
+* **auth:** owner-minted API tokens — scoped, expiring, revocable ([#82](https://github.com/gerchowl/kairos/issues/82)) ([#85](https://github.com/gerchowl/kairos/issues/85)) ([820ff95](https://github.com/gerchowl/kairos/commit/820ff95da7622c5b3bf914b8924a11e63d2fd8be))
+* **mcp:** serve MCP from the Kairos server — streamable HTTP /mcp ([#83](https://github.com/gerchowl/kairos/issues/83)) ([#89](https://github.com/gerchowl/kairos/issues/89)) ([9b66963](https://github.com/gerchowl/kairos/commit/9b66963a3aa1ab0785ae633ed06f7063fef69c88))
+
+
+### Bug Fixes
+
+* **api:** bound the dates × grid product on every API/MCP slot path ([#70](https://github.com/gerchowl/kairos/issues/70)) ([#92](https://github.com/gerchowl/kairos/issues/92)) ([e448bde](https://github.com/gerchowl/kairos/commit/e448bde315baeed61a02d43ac578266e64499bac))
+* **ui:** date picker — current-month jump, page-jump, grid jiggle, clear all ([#80](https://github.com/gerchowl/kairos/issues/80)) ([6a054b9](https://github.com/gerchowl/kairos/commit/6a054b91254db24a796255fe8b5c2987f9f189ba))
+
+
+### Documentation
+
+* **proxy:** public path prefixes for reverse-proxy/Access setups + link-generator guard ([#88](https://github.com/gerchowl/kairos/issues/88)) ([#90](https://github.com/gerchowl/kairos/issues/90)) ([76b42f4](https://github.com/gerchowl/kairos/commit/76b42f424077d3138453666dc96c4f4d1ce04038))
+* **proxy:** three README nits in the reverse-proxy section ([76b42f4](https://github.com/gerchowl/kairos/commit/76b42f424077d3138453666dc96c4f4d1ce04038))
+* refresh HANDOFF.md and epic [#38](https://github.com/gerchowl/kairos/issues/38) after [#68](https://github.com/gerchowl/kairos/issues/68) and [#72](https://github.com/gerchowl/kairos/issues/72) land ([2c00a34](https://github.com/gerchowl/kairos/commit/2c00a349f4daa93a685afebf6f2d32d253f06226))
+
 ## [0.13.0](https://github.com/gerchowl/kairos/compare/v0.12.0...v0.13.0) (2026-10-04)
 
 
