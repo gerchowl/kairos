@@ -1139,3 +1139,70 @@ def test_origin_bearing_request_is_403_when_no_allowlist_is_configured(monkeypat
         r = c.post(MCP, json={"jsonrpc": "2.0", "id": 2, "method": "ping"},
                    headers={"Origin": origin})
         assert r.status_code == 403, (origin, r.text)
+
+
+@pytest.mark.parametrize("extra", [
+    {"method": "\udc00"},
+    {"extra": ["\ud800"]},
+    {"\ud800": "value"},
+])
+def test_surrogate_envelope_strings_are_invalid_requests(client, extra):
+    message = {"jsonrpc": "2.0", "id": 1, "method": "ping", **extra}
+    response = client.post(MCP, content=json.dumps(message),
+                           headers={"Content-Type": "application/json"})
+    assert response.status_code == 200
+    assert response.json()["error"]["code"] == mcp_http.INVALID_REQUEST
+    assert response.json()["id"] == 1
+
+
+@pytest.mark.parametrize("params", [
+    {"name": "\ud800", "arguments": {}},
+    {"name": "get_poll", "arguments": {"poll_id": "\udc00"}},
+    {"name": "whoami", "arguments": {"extra": [{"title": "\ud800"}]}},
+    {"name": "whoami", "arguments": {"\ud800": "value"}},
+])
+def test_surrogate_tool_strings_are_invalid_params_before_dispatch(client, params, monkeypatch):
+    calls = []
+    monkeypatch.setattr(mcp_http, "_run_tool", lambda *args: calls.append(args))
+    message = {"jsonrpc": "2.0", "id": "request", "method": "tools/call", "params": params}
+    response = client.post(MCP, content=json.dumps(message),
+                           headers={"Content-Type": "application/json"})
+    assert response.status_code == 200
+    assert response.json()["error"]["code"] == mcp_http.INVALID_PARAMS
+    assert response.json()["id"] == "request"
+    assert not calls
+
+
+def test_raw_surrogate_method_is_invalid_request(client):
+    response = client.post(MCP, content=b'{"jsonrpc":"2.0","id":1,"method":"\xed\xa0\x80"}',
+                           headers={"Content-Type": "application/json"})
+    assert response.status_code == 200
+    assert response.json()["error"]["code"] == mcp_http.INVALID_REQUEST
+
+
+def test_valid_unicode_method_remains_method_not_found(client):
+    response = client.post(MCP, json={"jsonrpc": "2.0", "id": "🌻", "method": "café🌻"})
+    assert response.status_code == 200
+    assert response.json()["error"]["code"] == mcp_http.METHOD_NOT_FOUND
+    assert response.json()["id"] == "🌻"
+
+
+def test_ping_does_not_charge_a_tool_budget(client, monkeypatch):
+    charged = []
+    monkeypatch.setattr(mcp_http, "charge_request", lambda *args, **kwargs: charged.append(args))
+    r, env = rpc(client, "ping")
+    assert r.status_code == 200
+    assert env["result"] == {}
+    assert charged == []
+
+
+def test_tool_notification_is_acknowledged_without_execution(client, monkeypatch):
+    called = []
+    monkeypatch.setattr(mcp_http, "_run_tool", lambda *args, **kwargs: called.append(args))
+    r = client.post(MCP, json={
+        "jsonrpc": "2.0", "method": "tools/call",
+        "params": {"name": "get_poll", "arguments": {"poll_id": "p1"}},
+    })
+    assert r.status_code == 202
+    assert r.content == b""
+    assert called == []

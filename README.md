@@ -576,6 +576,15 @@ Two ways to speak MCP to a Kairos instance:
    `retry_after` (same budgets as `/api`; `KAIROS_RATE_LIMIT=on` enables the
    per-key tier).
 
+   **Validation and liveness.** Every request string, including object keys
+   and nested arguments, must be encodable as UTF-8. Invalid envelope strings
+   return `-32600`; invalid strings in `params` return `-32602` before tool
+   execution. `ping` remains an authenticated, unmetered liveness check so
+   exhausted tool budgets do not hide transport health. A `tools/call` without
+   an `id` is acknowledged with an empty 202 and is **not executed**: clients
+   must send a request id to invoke tools and receive their result. An explicit
+   `"id": null` is invalid, rather than a notification.
+
    **Origin validation.** `KAIROS_MCP_ALLOWED_ORIGINS` is a comma-separated
    allowlist of origins (e.g. `https://claude.ai,https://cursor.so`) for
    the MCP spec's DNS-rebinding guard. The spec (2025-06-18 §4) says a
