@@ -26,6 +26,6 @@ Kairos features traced to the decisions that shape them (`docs/adr/`). The
 | Cloudflare Turnstile on the anonymous creation + re-link paths (obligation A1) | `turnstile.py`, `capability.py`, `web.py`, `main.py` | ADR-0012 |
 | Verified-creator-before-third-party-mail send-gate (`manage_verified_at`, obligation A2) | `capability.py`, `web.py`, `api.py` | ADR-0009, ADR-0012 |
 | Optional accounts / multi-tenancy (planned) | — | ADR-0009 |
-| Agent surfaces: REST API, `/llms.txt`, OpenAPI, MCP, `agent.json` | `api.py`, `main.py`, `public.py`, `mcp/` | ADR-0010 |
+| Agent surfaces: REST API, `/llms.txt`, OpenAPI, MCP (hosted streamable HTTP + local stdio), `agent.json` | `api.py`, `main.py`, `public.py`, `mcp/`, `mcp_http.py` | ADR-0010 |
 | Brand & hosting home (nerdmachines house brand, `kairos.nerdmachines.com`) | `docs/design/productization-obligations.md` | ADR-0011 |
 | Outbound-mail identity gate (`KAIROS_HOSTED` + `KAIROS_FROM_DOMAIN`, obligation M1) + SPF/DKIM/DMARC runbook | `email_service.py`, `settings.py`, `main.py`, `docs/design/mail-auth.md` | ADR-0011 |
