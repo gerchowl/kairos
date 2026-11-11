@@ -46,7 +46,7 @@
         "KAIROS_AUTH": "demo",
         "KAIROS_BRAND": "Kairos (spike)",
         "KAIROS_POLL_REACH": "scoped",
-        "KAIROS_RATE_LIMIT": "off",
+        "KAIROS_RATE_LIMIT": "on",
         "KAIROS_IMIP": "off",
         "KAIROS_FEED": "off",
         "KAIROS_DB_URL": "do-sqlite:///kairos"

@@ -63,7 +63,20 @@ def _apply_env_from_bindings(env):
         "KAIROS_FEED",
         "KAIROS_HOSTED",
         "KAIROS_PUBLIC_URL",
+        "KAIROS_API_KEY",
+        "KAIROS_API_KEYS",
+        "KAIROS_MCP_ALLOWED_ORIGINS",
     )
+    # Every KAIROS_* binding, not just the names above: a fixed list silently
+    # dropped KAIROS_API_KEYS (and would drop any setting added later). The
+    # list stays as the fallback when the binding names can't be enumerated.
+    try:
+        from js import Object
+
+        names = [str(n) for n in Object.keys(env)]
+        wanted = tuple(sorted(set(wanted) | {n for n in names if n.startswith("KAIROS_")}))
+    except Exception:
+        pass
     for name in wanted:
         try:
             value = getattr(env, name, None)
