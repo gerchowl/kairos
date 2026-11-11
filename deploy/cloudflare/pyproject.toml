@@ -1,0 +1,22 @@
+[project]
+name = "kairos-cf-worker"
+version = "0.1.0-spike"
+description = "Kairos deployed as a Cloudflare Python Worker + Durable Object (SQLite)."
+requires-python = ">=3.12"
+# Runtime deps, aligned with kairos' own pyproject.toml. These are what gets
+# vendored into python_modules/ by `scripts/vendor.sh` (see README) — the deploy
+# does NOT read this file; wrangler bundles whatever is on disk at deploy time.
+dependencies = [
+    "fastapi==0.115.6",
+    "jinja2>=3.1,<3.2",
+    "itsdangerous>=2.1",
+    "python-multipart>=0.0.9",
+    "email-validator>=2.2",
+    "starlette==0.41.3",
+    "pydantic==2.10.6",
+    "pydantic-core==2.27.2",
+    "tzdata>=2024.2",
+]
+
+[dependency-groups]
+dev = ["workers-py>=1.17"]

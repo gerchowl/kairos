@@ -1,0 +1,11 @@
+# Vendored emscripten/pyodide wheels + the kairos source tree are rebuilt by
+# the deploy script (see README.md). None of it belongs in version control for
+# a spike PR.
+python_modules/
+.venv/
+.venv-workers/
+public/static/
+pyproject-full.toml.bak
+
+# wrangler local state
+.wrangler/
