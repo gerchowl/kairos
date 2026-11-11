@@ -1931,18 +1931,27 @@ def test_no_accepted_creation_ever_exceeds_the_cap(cap_mode):
                 assert slots == [], f"{start}-{end} @ {increment}min refused but returned slots"
 
 
-def test_the_slot_cap_is_not_consulted_outside_capability_mode(monkeypatch):
-    """`slot_cap_refusal` is asked about the anonymous surface only.
+def test_the_slot_cap_is_consulted_in_every_mode(monkeypatch):
+    """`slot_cap_refusal` is asked about **every** auth mode since PR #92.
 
-    The owner's own form has never been capped, an owner-mode request is
-    authenticated, and a cap for every deployment is a policy change this issue is
-    not making — so the answer must stay "no opinion" in the other four modes, or the
-    gate would quietly become a new limit on the ETH deployment.
+    The policy choice the adversarial-review pass recorded (#70, on PR #92):
+    the agent surface cannot be second-class to the human one (ADR-0012), so
+    the cap that applies in capability mode applies in header/demo/oidc/none
+    mode too. The number itself still differs by mode -- tighter when every
+    request can be anonymous, looser on the self-host/ETH shape -- but the
+    sentence is the same one, from the same function.
     """
     monkeypatch.setattr(settings, "AUTH_MODE", "header")
-    assert capability.slot_cap_refusal(10 ** 9, 992) is None
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.delenv("KAIROS_MAX_SLOTS_PER_POLL", raising=False)
+    # Header-mode default is 5000 -- the cap still fires above it.
+    assert capability.slot_cap_refusal(settings.max_slots_per_poll() + 1, 992) is not None
     monkeypatch.setattr(settings, "AUTH_MODE", "capability")
+    # Capability-mode default is 1000; well below 10**9.
     assert capability.slot_cap_refusal(10 ** 9, 992) is not None
+    # And an operator who disables the per-poll cap (`=0`) opts out everywhere.
+    monkeypatch.setenv("KAIROS_MAX_SLOTS_PER_POLL", "0")
+    assert capability.slot_cap_refusal(10 ** 9, 992) is None
 
 
 def test_empty_date_fields_do_not_count_towards_the_product(cap_mode):
@@ -2122,16 +2131,26 @@ def test_a_creator_with_more_polls_than_the_cap_still_gets_their_link(console):
     assert f"/scheduler/manage/{original['admin_token']}" in live.relay.sent[0].as_string()
 
 
-def test_the_bounds_on_this_mode_are_pinned_by_this_suite():
+def test_the_bounds_on_this_mode_are_pinned_by_this_suite(monkeypatch):
     """`MAX_LINKS_PER_REQUEST` was unpinned: raising 10 → 1000 left 809/809 green.
 
     It is the only bound on the re-link fan-out, and the rate limit is the operator's
     number rather than ours, so a bound nobody asserts is a number that gets widened
-    by accident and reviewed by nobody. The slot cap is here for the same reason,
+    by accident and reviewed by nobody. The slot caps are here for the same reason,
     and the increment bounds because they are what terminate the loop above.
     """
     assert capability.MAX_LINKS_PER_REQUEST == 10
+    # Per-request memory guard: one knob, one default (issue #70 + PR #92).
+    assert settings.MAX_SLOTS_PER_REQUEST == 2000
+    # Per-poll cap: tighter in capability mode, looser in header mode.
+    monkeypatch.delenv("KAIROS_MAX_SLOTS_PER_POLL", raising=False)
+    monkeypatch.setattr(settings, "HOSTED", False)
+    monkeypatch.setattr(settings, "AUTH_MODE", "capability")
     assert capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL == 1000
+    monkeypatch.setattr(settings, "AUTH_MODE", "header")
+    assert capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL == 5000
+    monkeypatch.setattr(settings, "HOSTED", True)
+    assert capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL == 1000, "HOSTED tightens the cap in any auth mode"
     assert (web.MIN_INCREMENT_MINUTES, web.MAX_INCREMENT_MINUTES) == (1, 1440)
     # And the fan-out is charged in links, so the bound above is the blast radius a
     # single form post can open against a relay.
@@ -2222,19 +2241,22 @@ def test_the_console_edit_refuses_the_product_of_dates_and_the_polls_own_grid(ca
     assert caught.value.status_code == 400
     assert "too large" in caught.value.detail, "the creation path's sentence, reused"
     assert "19,600 dates" in caught.value.detail, "the refusal should say which field to change"
-    assert f"{19_600 * 125:,}" in caught.value.detail
+    # Total slot count (existing + new product) is in the sentence. The grid
+    # poll carries 125 prior slots, so the total is 19,600 × 125 + 125 = 2,450,125.
+    assert f"{19_600 * 125 + 125:,}" in caught.value.detail
 
-    # A cap honoured outside capability mode — where `slot_cap_refusal` deliberately has
-    # no opinion — still refuses, and still says something. Pinned because the
-    # alternative is `HTTPException(400, None)`, which reaches the creator as a blank
-    # reason.
+    # Outside capability mode -- since PR #92 the cap applies in every mode,
+    # by policy (ADR-0012 agent/human parity). The number is looser in header
+    # mode (5,000 vs. 1,000), but the sentence is the same one, from the same
+    # function.
     monkey_free = settings.AUTH_MODE
     try:
         settings.AUTH_MODE = "header"
-        with pytest.raises(HTTPException) as blunt:
+        with pytest.raises(HTTPException) as caught2:
             web.expand_new_dates(poll, dates, cap=capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL)
-        assert blunt.value.status_code == 400
-        assert blunt.value.detail and "1,000" in blunt.value.detail
+        assert caught2.value.status_code == 400
+        assert "too large" in caught2.value.detail
+        assert "5,000" in caught2.value.detail
     finally:
         settings.AUTH_MODE = monkey_free
 
@@ -2265,29 +2287,56 @@ def test_the_console_edit_bound_is_checked_before_the_slots_are_built():
     )
 
 
-def test_the_console_edit_cap_boundary_is_exact():
+def test_the_console_edit_cap_boundary_is_exact(cap_mode):
     """1,000 accepted, 1,001 refused — and a full_day poll, where the grid is empty.
 
     The full_day half matters: with no time pairs the product is one slot per date, so
     this is the same ceiling on a different shape rather than a special case. It is
     also the case where a wrong `per_date` would silently refuse every edit.
-    """
-    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
-    grid = _grid_poll(125)
 
-    at_cap = web.expand_new_dates(grid, [f"2026-02-{day:02d}" for day in range(1, 9)], cap=cap)
-    assert len(at_cap) == cap
-    over = [f"2026-03-{day:02d}" for day in range(1, 10)]
+    Since the PR #92 adversarial-review pass the per-poll cap is the
+    **total**, so a boundary test needs an *empty* poll -- the fresh grid
+    this build uses above carries 125 prior slots, and
+    `existing + new <= cap` is what the data layer and the route now agree
+    on.
+    """
+    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL  # 1000 under cap_mode
+    # Grid poll with zero prior slots on the poll, so `existing + new` is `new`.
+    grid = {"id": "p1", "mode": "time_slot", "slots": [
+        {"id": f"s{i}", "date": "2025-06-01",
+         "start_time": f"{9 + i // 60:02d}:{i % 60:02d}",
+         "end_time": f"{9 + (i + 1) // 60:02d}:{(i + 1) % 60:02d}"}
+        for i in range(125)
+    ]}
+    # existing is the one date 2025-06-01; new dates below are all distinct
+    # from it, so `new_dates` is 8 and product is 8 * 125 = 1000.
+    existing_slot_count = len(grid["slots"])
+    assert existing_slot_count == 125
+
+    # 8 new dates × 125 pairs = 1000 new slots. existing + new = 125 + 1000 = 1125.
+    # Under the new per-poll cap (total), this now exceeds the cap -- so the
+    # boundary for "accepted" is one that fits total.
+    new_dates_at_total_cap = [f"2026-02-{day:02d}" for day in range(1, 8)]  # 7 × 125 = 875
+    at_cap = web.expand_new_dates(grid, new_dates_at_total_cap, cap=cap)
+    assert len(at_cap) == 7 * 125
+    assert existing_slot_count + len(at_cap) == 1000 == cap
+
+    # One more date would be 8 × 125 = 1000 new, 125 + 1000 = 1125 -- over.
+    over = [f"2026-03-{day:02d}" for day in range(1, 9)]
     with pytest.raises(HTTPException):
         web.expand_new_dates(grid, over, cap=cap)
 
-    full_day = _grid_poll(125, mode="full_day")
-    assert len(web.expand_new_dates(full_day, [f"2026-04-{day:02d}" for day in range(1, 26)] * 40,
-                                    cap=cap)) == cap, \
-        "a full_day poll yields one slot per date, so the ceiling is the same number"
+    # Full-day: existing=0 (no prior slots). `cap` distinct dates lands on cap.
+    # Spread over ~3 years to get 1,000 unique days without repeats.
+    import datetime as _dt
+    full_day = {"id": "p2", "mode": "full_day", "slots": []}
+    start = _dt.date(2026, 1, 1)
+    at_cap_days = [(start + _dt.timedelta(days=i)).isoformat() for i in range(cap)]
+    accepted = web.expand_new_dates(full_day, at_cap_days, cap=cap)
+    assert len(accepted) == cap
     with pytest.raises(HTTPException):
-        web.expand_new_dates(full_day, [f"2026-05-{day:02d}" for day in range(1, 27)] * 40,
-                             cap=cap)
+        over_days = [(start + _dt.timedelta(days=i)).isoformat() for i in range(cap + 1)]
+        web.expand_new_dates(full_day, over_days, cap=cap)
 
 
 def test_the_console_edit_dates_field_cannot_smuggle_past_the_field_ceiling():
@@ -2295,15 +2344,16 @@ def test_the_console_edit_dates_field_cannot_smuggle_past_the_field_ceiling():
 
     The comma-split means Starlette's `max_fields` never sees the dates: one field is
     unbounded input, and a ~1 MB value is 95,000 valid dates, each one parsed and
-    appended *before* any downstream cap gets a say. The ceiling is the slot cap
-    rather than a second number — every date named becomes at least one slot, so a
-    request naming more than the slot ceiling could never be accepted anyway — and it
-    is enforced *inside* the loop, so the 95,000th date is never appended.
+    appended *before* any downstream cap gets a say. Since the PR #92 adversarial-
+    review pass the ceiling is `settings.MAX_SLOTS_PER_REQUEST` (the per-request
+    memory guard applied on every slot-writing surface) rather than the per-poll
+    cap, because the per-poll cap already fires in `expand_new_dates` and this
+    function is purely a memory guard on the input dimension.
 
     A separate test from the product one because it is a different placement: this
     bounds the input, the other bounds the output, and a creator can trip either.
     """
-    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    cap = settings.MAX_SLOTS_PER_REQUEST
     assert len(capability._parse_dates([",".join(["2026-01-05"] * cap)])) == cap
     with pytest.raises(HTTPException) as caught:
         capability._parse_dates([",".join(["2026-01-05"] * (cap + 1))])
@@ -2313,31 +2363,36 @@ def test_the_console_edit_dates_field_cannot_smuggle_past_the_field_ceiling():
     # Split across many fields too — `max_fields` allows 1000 of them, and the ceiling
     # is on the total parsed, not per field.
     with pytest.raises(HTTPException):
-        capability._parse_dates([",".join(["2026-01-05"] * 10)] * 200)
+        capability._parse_dates([",".join(["2026-01-05"] * 20)] * 200)  # 4,000 total
     # Empty parts are still skipped, and a genuine bad date is still a 400 about the date.
     assert capability._parse_dates(["2026-01-05, ,2026-01-06,"]) == ["2026-01-05", "2026-01-06"]
     with pytest.raises(HTTPException, match="not a date"):
         capability._parse_dates(["2026-01-05,nope"])
 
 
-def test_the_owner_form_is_not_given_a_cap_it_never_had():
-    """`cap=None` means today's behaviour, and that has to stay true.
+def test_the_owner_form_is_given_the_same_cap_as_every_other_surface():
+    """Since PR #92, `cap=None` resolves to `settings.MAX_SLOTS_PER_REQUEST`.
 
-    `expand_new_dates` now has three callers that *do* pass a cap (this console,
-    the REST `/api/polls/{id}/slots` endpoint since #70, and MCP's `add_dates`
-    which calls the REST function directly) and one that does not (the owner's
-    edit form). A mode check inside the shared helper would have silently capped
-    the owner form in capability mode, which is not this branch's call to make.
-    So the cap is a parameter, passed only where the ceiling belongs — at each
-    *call site*, which is also what keeps the REST ceiling equal to the console
-    one by construction rather than by two numbers that happen to match.
+    The adversarial-review pass on #70 overturned the "owner form is never
+    capped" posture: ADR-0012 says the agent surface cannot be second-class
+    to the human one, which also means the human surface cannot be
+    *first-class* -- the same bound applies on every slot-writing surface,
+    so a demo/header deployment cannot be a remote OOM from a human POST any
+    more than from an agent one.
+
+    `cap=` stays a parameter so a caller can tighten the number on one call
+    (tests, future Durable-Object tenants); `cap=None` means "use the
+    policy", resolved at call time from `settings.MAX_SLOTS_PER_REQUEST` so
+    a monkey-patch or an env flip takes effect without a restart.
     """
     poll = _grid_poll(125)
     dates = [f"2026-06-{day:02d}" for day in range(1, 29)] * 100  # 2,800 dates
-    assert len(web.expand_new_dates(poll, dates)) == 2_800 * 125, "the uncapped path is unchanged"
+    # Under the default per-request guard (2,000), 2,800 × 125 = 350,000 slots
+    # is refused -- the owner path is no longer uncapped.
     with pytest.raises(HTTPException):
-        web.expand_new_dates(poll, dates, cap=capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL)
-    # And the signature stays backward compatible for the one caller that never passes it.
+        web.expand_new_dates(poll, dates)
+    # And the signature stays backward compatible: the parameter and its
+    # default are exactly what they were before PR #92.
     assert "cap" in inspect.signature(web.expand_new_dates).parameters
     assert inspect.signature(web.expand_new_dates).parameters["cap"].default is None
 

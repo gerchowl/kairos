@@ -53,6 +53,12 @@ class _SqliteConn:
     def commit(self):
         self._conn.commit()
 
+    def rollback(self):
+        # Mirrors `_MySQLConn.rollback` so callers (e.g. `db.add_slots_capped`,
+        # which opens a transaction explicitly for the slot-cap race fix) can
+        # unwind without a dialect branch.
+        self._conn.rollback()
+
     def close(self):
         self._conn.close()
 
@@ -70,6 +76,9 @@ class _MySQLConn:
 
     def commit(self):
         self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
 
     def close(self):
         self._conn.close()

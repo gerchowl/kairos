@@ -52,6 +52,19 @@ KAIROS_MAIL_PER_POLL  send budget for ONE poll as "<count>/<window>", counted in
                    recipients across every send path and charged to the poll, so
                    it holds regardless of which key asks. 0 disables. Default
                    "2000/day".
+KAIROS_MAX_SLOTS_PER_REQUEST  per-request memory guard (issue #70) — one request
+                   may create at most this many slots, counted
+                   `new_dates * time_pairs` before any expansion. Applied
+                   identically on every slot-writing surface (web, capability
+                   console, REST, MCP). 0 disables. Default 2000.
+KAIROS_MAX_SLOTS_PER_POLL  per-poll ceiling (issue #70) — one poll may hold
+                   at most this many slots. Checked as `existing + new` at the
+                   data layer, atomically per write. Default 1000 when
+                   KAIROS_AUTH=capability or KAIROS_HOSTED is on, 5000
+                   otherwise. 0 disables.
+KAIROS_MAX_BODY_BYTES  request-body size cap (issue #70) — the whole app
+                   refuses a body larger than this with 413 BEFORE FastAPI
+                   parses JSON or forms. Default 1048576 (1 MiB). 0 disables.
 KAIROS_POLL_REACH  who may read which poll, on BOTH surfaces (issue #63/#64):
                    open (default) | scoped. "open" is the rule that has always
                    existed — any authenticated caller reads any poll, which is
@@ -384,6 +397,63 @@ MAIL_MAX_RECIPIENTS = _parse_count(
 # reminder, new-dates notice, decision), so a large meeting fits in one window
 # and a mail cannon does not. Raise it for bigger meetings; 0 disables.
 MAIL_PER_POLL = _parse_rate_limit(os.environ.get("KAIROS_MAIL_PER_POLL", "2000/day"), "KAIROS_MAIL_PER_POLL")
+
+
+# Slot-ceiling knobs (issue #70). Two bounds, on every slot-writing surface:
+#
+#   * `MAX_SLOTS_PER_REQUEST` -- the memory guard. One *request* may create at
+#     most this many slots (counted arithmetically as `new_dates * time_pairs`
+#     before any expansion), on every surface (web owner form, capability
+#     console, REST, MCP). This is the ceiling on what **building** the list
+#     costs -- the lesson #68 recorded three times. A check that runs after the
+#     grid is built produces the right status with the memory already spent.
+#
+#   * `MAX_SLOTS_PER_POLL` -- the per-poll total cap. One *poll* may hold at
+#     most this many slots. Checked as `existing + new` and enforced atomically
+#     at the data layer on every write, so a burst of concurrent requests
+#     cannot slip past a count/check/insert race (finding 1 on PR #92, where
+#     64 concurrent adds took a poll to 36,100 slots on the pre-fix tree).
+#
+# `MAX_SLOTS_PER_POLL` is tighter on the two deployment shapes where every
+# anonymous request can write (`KAIROS_AUTH=capability` or `KAIROS_HOSTED`
+# on), and looser on the self-host/ETH shape where an authenticated owner is
+# the only caller. Both are opt-in via env; both are *finite*, which is the
+# whole point.
+MAX_SLOTS_PER_REQUEST = _parse_count(
+    os.environ.get("KAIROS_MAX_SLOTS_PER_REQUEST", "2000"),
+    "KAIROS_MAX_SLOTS_PER_REQUEST",
+)
+
+
+def max_slots_per_poll() -> int:
+    """Per-poll slot cap, resolved at request time.
+
+    Env wins when set. Default: 1000 for `KAIROS_AUTH=capability` or
+    `KAIROS_HOSTED` on (the surfaces where every request can be anonymous),
+    5000 otherwise (the self-host / ETH shape, where an authenticated owner
+    is the only caller). Resolved at call time so a test that monkey-patches
+    `AUTH_MODE` or `HOSTED` gets the cap for the mode under test, and so an
+    operator who raises `KAIROS_MAX_SLOTS_PER_POLL` sees it take effect
+    without a code change. 0 disables the per-poll cap entirely.
+    """
+    raw = os.environ.get("KAIROS_MAX_SLOTS_PER_POLL", "").strip()
+    if raw:
+        return _parse_count(raw, "KAIROS_MAX_SLOTS_PER_POLL")
+    return 1000 if (AUTH_MODE == "capability" or HOSTED) else 5000
+
+
+# One request-body size ceiling for the whole app. The /mcp endpoint has had
+# this since #83 (local constant); it lives here now so every ASGI surface
+# uses the same number, enforced by middleware **before** FastAPI parses JSON
+# or forms -- a cap that runs after parsing cannot bound what parsing costs
+# (the same lesson as the slot ceilings above). 1 MiB is comfortably above any
+# legitimate payload Kairos accepts: `PollCreate` with a full week of
+# 15-minute time slots is well under 50 KiB, and an `add_dates` body of 2,000
+# ISO dates is ~24 KiB.
+MAX_BODY_BYTES = _parse_count(
+    os.environ.get("KAIROS_MAX_BODY_BYTES", str(1 * 1024 * 1024)),
+    "KAIROS_MAX_BODY_BYTES",
+)
 
 
 def session_secret() -> str:

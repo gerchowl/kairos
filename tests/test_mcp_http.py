@@ -39,7 +39,7 @@ from datetime import date, time
 import pytest
 from fastapi.testclient import TestClient
 
-from kairos import api, apitokens, capability, db, main, mcp_http, ratelimit, settings
+from kairos import api, apitokens, db, main, mcp_http, ratelimit, settings
 
 KEY = "test-api-key"
 MCP = "/scheduler/mcp"
@@ -1171,10 +1171,11 @@ def test_mcp_create_poll_refuses_a_slot_list_over_the_cap(client, monkeypatch):
     the same refusal shape REST returns as a 422, mapped through
     `ValidationError` in `_run_tool`.
     """
+    from kairos import settings as _settings
     wrote = []
     monkeypatch.setattr(api, "create_poll",
                         lambda *a, **k: wrote.append(a) or dict(POLL))
-    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    cap = _settings.MAX_SLOTS_PER_REQUEST
     _, env = call_tool(client, "create_poll", {
         "title": "huge", "mode": "full_day",
         "slots": [{"date": "2026-06-08"} for _ in range(cap + 1)],
@@ -1187,16 +1188,17 @@ def test_mcp_create_poll_refuses_a_slot_list_over_the_cap(client, monkeypatch):
 
 def test_mcp_add_dates_refuses_a_dates_list_over_the_cap(client, monkeypatch):
     """The MCP tool for `/api/polls/{id}/slots`, same bound, same shape."""
+    from kairos import settings as _settings
     added = []
-    monkeypatch.setattr(api, "add_slots",
-                        lambda pid, slots: added.append(slots) or [])
-    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    monkeypatch.setattr(api, "add_slots_capped",
+                        lambda pid, slots, cap: added.append(slots) or [])
+    cap = _settings.MAX_SLOTS_PER_REQUEST
     _, env = call_tool(client, "add_dates", {
         "poll_id": "p1", "dates": ["2026-06-22"] * (cap + 1),
     })
     assert env["result"]["isError"] is True, env
     assert "400" in env["result"]["content"][0]["text"]
-    assert added == [], "add_slots must not run for a refused edit"
+    assert added == [], "add_slots_capped must not run for a refused edit"
 
 
 def test_mcp_add_dates_refuses_the_product_cheaply(monkeypatch, stubbed):
@@ -1205,11 +1207,12 @@ def test_mcp_add_dates_refuses_the_product_cheaply(monkeypatch, stubbed):
     refusal must come back without having built the grid.
     """
     monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setenv("KAIROS_MAX_SLOTS_PER_POLL", "1000")
     poll = _grid_poll_mcp(125)
     monkeypatch.setattr(api, "get_poll", lambda pid: dict(poll) if pid == "p1" else None)
     added = []
-    monkeypatch.setattr(api, "add_slots",
-                        lambda pid, slots: added.append(slots) or [])
+    monkeypatch.setattr(api, "add_slots_capped",
+                        lambda pid, slots, cap: added.append(slots) or [])
     c = TestClient(main.app, base_url="https://testserver",
                    headers={"Authorization": f"Bearer {KEY}"})
     dates = [f"2026-07-{d:02d}" for d in range(1, 21)]
@@ -1234,10 +1237,11 @@ def test_rest_and_mcp_refuse_the_same_over_cap_input_for_add_dates(client, monke
     an `isError=true` result. Each is the surface's own idiom for the same
     policy — and both are the same number in the same constant.
     """
+    from kairos import settings as _settings
     added = []
-    monkeypatch.setattr(api, "add_slots",
-                        lambda pid, slots: added.append(slots) or [])
-    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    monkeypatch.setattr(api, "add_slots_capped",
+                        lambda pid, slots, cap: added.append(slots) or [])
+    cap = _settings.MAX_SLOTS_PER_REQUEST
     r = client.post("/scheduler/api/polls/p1/slots",
                     json={"dates": ["2026-06-22"] * (cap + 1)})
     assert r.status_code == 422, r.text
@@ -1254,13 +1258,14 @@ def test_invalid_mcp_add_dates_still_charges_the_api_write_budget(monkeypatch, s
     the loop that produces it, not just the well-formed calls. Identical to
     the `create_poll` test above — different tool, same property.
     """
+    from kairos import settings as _settings
     monkeypatch.setenv("KAIROS_API_KEY", KEY)
     monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
     monkeypatch.setattr(settings, "RATE_LIMITS",
                         {**settings.DEFAULT_RATE_LIMITS, "api_write": (2, 3600)})
     c = TestClient(main.app, base_url="https://testserver",
                    headers={"Authorization": f"Bearer {KEY}"})
-    cap = capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL
+    cap = _settings.MAX_SLOTS_PER_REQUEST
     body = {"poll_id": "p1", "dates": ["2026-06-22"] * (cap + 1)}
     for i in (1, 2):
         _, env = call_tool(c, "add_dates", body, id=i)

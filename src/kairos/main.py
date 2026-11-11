@@ -5,12 +5,113 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from kairos import settings, turnstile
 from kairos.db import get_connection, init_schema
+
+
+def _install_body_size_cap(app: FastAPI) -> None:
+    """Refuse a request body over `settings.MAX_BODY_BYTES`, BEFORE FastAPI parses.
+
+    ASGI middleware counting streamed bytes: works with or without a
+    Content-Length (chunked transfer, misreported length, both caught),
+    runs on **every** surface (web, api, mcp -- the previous version only
+    bounded /mcp), and answers a JSON 413 so an agent reading the response
+    sees the knob name in the detail. Zero disables the cap.
+
+    An operator who disables this (`KAIROS_MAX_BODY_BYTES=0`) keeps the
+    MCP-local per-stream cap in `kairos.mcp_http._read_body_capped`, so a
+    nested-brackets recursion bomb cannot reach `json.loads` on that
+    transport by that path either.
+    """
+    cap = settings.MAX_BODY_BYTES
+    # /mcp has its own body-cap-aware handler that answers a JSON-RPC envelope
+    # at HTTP 413 (spec-level refusal, not an ASGI one), and its tests pin
+    # that shape. Leaving the /mcp path to its own handler keeps that shape
+    # without having to teach this middleware to mint the envelope itself.
+    mcp_path = f"{settings.PREFIX}/mcp"
+
+    @app.middleware("http")
+    async def body_size_middleware(request, call_next):
+        # Re-read every request so a test that monkey-patches the setting
+        # takes effect without reinstalling the middleware.
+        current_cap = settings.MAX_BODY_BYTES
+        if current_cap <= 0 or request.url.path == mcp_path:
+            return await call_next(request)
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                if int(cl) > current_cap:
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": (
+                            f"request body exceeds {current_cap} bytes "
+                            f"(KAIROS_MAX_BODY_BYTES)"
+                        )},
+                    )
+            except ValueError:
+                # Malformed Content-Length: fall through to the stream cap,
+                # same as /mcp's per-stream guard does.
+                pass
+
+        # Wrap the ASGI receive() so FastAPI reads bytes through this counter:
+        # the cap fires BEFORE any JSON / form body parser materialises
+        # anything, which is the whole point.
+        total = 0
+        over = False
+        receive = request.receive
+
+        async def counting_receive():
+            nonlocal total, over
+            msg = await receive()
+            if msg.get("type") == "http.request":
+                total += len(msg.get("body") or b"")
+                if total > current_cap:
+                    over = True
+            return msg
+
+        request._receive = counting_receive  # Starlette's documented hook
+        response = await call_next(request)
+        if over:
+            # The route may have already answered (small handler, early
+            # return before the oversized trailer arrived); override with
+            # 413 either way, since the request violated the cap.
+            return JSONResponse(
+                status_code=413,
+                content={"detail": (
+                    f"request body exceeds {current_cap} bytes "
+                    f"(KAIROS_MAX_BODY_BYTES)"
+                )},
+            )
+        return response
+
+    # Keep the installed cap visible for anything that wants to assert the
+    # default at import time without reading env itself.
+    body_size_middleware._kairos_cap = cap
+
+
+def _install_validation_handler(app: FastAPI) -> None:
+    """Install a 422 handler that scrubs `input` and `ctx` from the response.
+
+    Pydantic's default `RequestValidationError` body includes the entire
+    offending input value and a validator context -- which echoes what the
+    client sent back at it, so a poll-creating agent that posts a 2 MB JSON
+    body with a bad timezone sees the whole 2 MB in the response (finding 3
+    on PR #92). Return the same `detail` shape minus `input` and `ctx`,
+    keeping `loc`, `msg` and `type` -- enough for an agent to find the
+    offending field, with no echo of the submitted value.
+    """
+    @app.exception_handler(RequestValidationError)
+    async def _validation_handler(_request, exc: RequestValidationError):
+        detail = []
+        for err in exc.errors():
+            cleaned = {k: v for k, v in err.items() if k not in ("input", "ctx")}
+            detail.append(cleaned)
+        return JSONResponse(status_code=422, content={"detail": detail})
 
 P = settings.PREFIX
 log = logging.getLogger("kairos.proxy")
@@ -170,6 +271,14 @@ def create_app() -> FastAPI:
     # Registered unconditionally and inert while KAIROS_RATE_LIMIT is unset, so
     # an unconfigured deployment behaves exactly as before.
     install_ratelimit(app)
+
+    # Issue #70 + PR #92 adversarial-review pass: the request-body size cap and
+    # the 422 handler that scrubs the echoed input. Both apply to every
+    # surface (web, api, mcp) and both read their knob from `settings` at
+    # request time, so an operator who flips KAIROS_MAX_BODY_BYTES does not
+    # need to restart.
+    _install_body_size_cap(app)
+    _install_validation_handler(app)
 
     app.mount(f"{P}/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
 

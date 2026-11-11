@@ -8,7 +8,8 @@ from kairos.auth import can_manage, get_base_url, get_user, require_manage
 from kairos.capability import require_sendable
 from kairos.csrf import make_csrf, require_csrf
 from kairos.db import (
-    add_slots,
+    add_slots,  # noqa: F401 — re-exported for tests that monkey-patch it
+    add_slots_capped,
     create_invite,
     create_poll,
     delete_invite,
@@ -157,8 +158,8 @@ def _valid_timezone(tz: str) -> bool:
 # meant ~40 of them were enough to take the deployment down. A non-numeric value
 # was a plain `ValueError` → 500 on the same line.
 #
-# So the bound is *here*, before the loop, not in a size check after it: the cap in
-# `capability.MAX_SLOTS_PER_ACCOUNTLESS_POLL` refuses a poll that is too big, but a
+# So the bound is *here*, before the loop, not in a size check after it: the per-poll
+# cap `settings.max_slots_per_poll()` refuses a poll that is too big, but a
 # check that runs once the list exists cannot bound what building the list costs.
 # These two numbers make one loop iteration per minute of the window at worst, so a
 # single date is bounded by the day — 1440 iterations, 1440 slots.
@@ -303,27 +304,30 @@ def _owner_action(request: Request, form, poll_id: str) -> tuple[dict, dict]:
 def expand_new_dates(poll: dict, dates: list[str], *, cap: int | None = None) -> list[dict]:
     """Slots for genuinely-new dates; time_slot polls reuse the poll's time grid.
 
-    **`cap` is the ceiling on `new_dates × time-pairs`, and it is checked before the
-    comprehension rather than after it.** Both factors come from the request or from
-    the poll, and the product is what actually lands in the database:
+    **Two bounds, both arithmetic, both checked before the comprehension:**
 
-      * `dates` — on the capability console this arrives as ONE comma-separated field
-        that `_parse_dates` splits, so Starlette's `max_fields` ceiling never sees the
-        dates at all. One ~1 MB field is 95,000 valid dates; the review that found
-        this measured a 220 KB body with 20,000 dates against a poll carrying 125
-        distinct time pairs — **2,500,000 slot rows, 2,501,000 written, +1.1 GB,
-        14 s, status 302**. Not refused, because nothing here looked.
-      * `time_pairs` — the poll's *own* grid, which grows by up to one edit's worth
-        of slots every time. So even a single new date becomes expensive eventually,
-        and only the product says so.
+      1. The *per-request* memory guard -- `new_dates × time-pairs` must be
+         within `settings.MAX_SLOTS_PER_REQUEST` (default 2,000). This is the
+         ceiling on what building the slot list costs, the discipline #68
+         recorded three times over. One ~1 MB `dates` field is 95,000 valid
+         dates; a 220 KB body with 20,000 dates against a 125-time-pair poll
+         is 2.5M rows at +1.1 GB on the pre-fix tree, 14 s, status 302, not
+         refused because nothing looked.
+      2. The *per-poll* total cap -- `existing + new <= settings.max_slots_per_poll()`.
+         This is the ceiling on how large a poll may become, so the API path
+         cannot grow a small poll to over-cap one request at a time. The
+         sentence is `capability.slot_cap_refusal`, same number on every
+         surface.
 
-    The owner form and the REST API pass no `cap` and keep their existing behaviour:
-    the owner path is bounded by `max_fields` (about 90x lower per request) and the
-    API is #51/#63/#64's surface with its own budget. This parameter exists so the
-    capability console can ask for the ceiling at its own call site rather than
-    having a mode check reach into a shared helper and silently change two other
-    surfaces.
+    Since the PR #92 adversarial-review pass both bounds apply on **every**
+    slot-writing surface (owner form, capability console, REST, MCP), because
+    the agent path cannot be second-class to the human one (ADR-0012). The
+    `cap=` parameter overrides the per-request number on one call (tests,
+    future `Durable-Object` tenants that want tighter bounds); `cap=None`
+    resolves `settings.MAX_SLOTS_PER_REQUEST` at call time.
     """
+    if cap is None:
+        cap = settings.MAX_SLOTS_PER_REQUEST
     existing = {str(s["date"]) for s in poll["slots"]}
     new_dates = [d for d in dates if d and d not in existing]
     time_pairs = sorted({(fmt_time(s["start_time"]), fmt_time(s["end_time"]))
@@ -333,13 +337,32 @@ def expand_new_dates(poll: dict, dates: list[str], *, cap: int | None = None) ->
     # below can produce and never an over-estimate of it.
     per_date = len(time_pairs) if on_grid else 1
     product = len(new_dates) * per_date
-    if cap is not None and product > cap:
+    # (1) per-poll total cap — `existing + new` against
+    # `settings.max_slots_per_poll()`. Same sentence every surface uses, so
+    # the web edit, the capability console, REST and MCP all read the same;
+    # it names the dates and the total, which is what a creator needs to act
+    # on. Checked first because when both bounds trip (a 2.45M-slot edit
+    # against a 1,000-slot cap is also over the 2,000 per-request guard)
+    # the per-poll cap is the more informative refusal -- "split into
+    # smaller edits" cannot help a request that would still not fit.
+    #
+    # The atomic dispatch in `db.add_slots_capped` repeats this check inside
+    # a transaction to close the count/check/insert race the PR #92 review
+    # found on concurrent adds.
+    existing_count = len(poll["slots"])
+    total = existing_count + product
+    refusal = capability.slot_cap_refusal(total, len(new_dates))
+    if refusal:
+        raise HTTPException(400, refusal)
+    # (2) per-request memory guard — product vs. `MAX_SLOTS_PER_REQUEST`. The
+    # ceiling on what building the slot list costs; the discipline #68
+    # recorded three times over. A check that runs after the comprehension
+    # produces the right status with the memory already spent.
+    if cap > 0 and product > cap:
         raise HTTPException(
             400,
-            # `slot_cap_refusal` words it and knows the mode; the `or` is for a caller
-            # that passes a cap outside this mode, where it deliberately has no opinion.
-            capability.slot_cap_refusal(product, len(new_dates))
-            or f"That edit would add {product:,} slots, over the limit of {cap:,}.",
+            f"That edit would add {product:,} slots in one request, over the "
+            f"per-request limit of {cap:,}. Split it into smaller edits.",
         )
     if on_grid:
         return [{"date": d, "start_time": st, "end_time": et}
@@ -747,15 +770,32 @@ def edit_poll_submit(poll_id: str, request: Request, form=Depends(form_data)):
     if not _valid_timezone(timezone):
         return _error_page(user, "Edit Poll", "Unknown timezone.",
                            f"{P}/polls/{poll_id}/edit")
+
+    # Everything validated before anything written, so a refused edit leaves
+    # the poll exactly as it was rather than half-applied. `expand_new_dates`
+    # raises on either slot bound (per-request product, per-poll total) before
+    # `update_poll` runs, which is the same "nothing written on a refusal"
+    # discipline the capability console's `_edit` records -- and the same
+    # reason `edit` on the web owner form caps too, since the PR #92 pass.
+    try:
+        slots = expand_new_dates(poll, form.getlist("dates"))
+    except HTTPException as exc:
+        return _error_page(user, "Edit Poll", exc.detail,
+                           f"{P}/polls/{poll_id}/edit")
+
     update_poll(poll_id, title=title,
                 description=form.get("description", "").strip() or None,
                 timezone=timezone)
 
     # Additive date edit: new dates get slots, existing slots (and their
-    # responses) are untouched.
-    slots = expand_new_dates(poll, form.getlist("dates"))
+    # responses) are untouched. `add_slots_capped` repeats the per-poll check
+    # inside a transaction so concurrent requests cannot push it past the cap.
     if slots:
-        add_slots(poll_id, slots)
+        try:
+            add_slots_capped(poll_id, slots, cap=settings.max_slots_per_poll())
+        except HTTPException as exc:
+            return _error_page(user, "Edit Poll", exc.detail,
+                               f"{P}/polls/{poll_id}/edit")
 
         if form.get("notify"):
             # Refetch so the nudge engine sees the just-added slots, then let

@@ -261,7 +261,8 @@ def owner(monkeypatch):
 def test_edit_poll_updates_and_adds_dates(client, owner, monkeypatch):
     updated, added = {}, {}
     monkeypatch.setattr(web, "update_poll", lambda pid, **f: updated.update(f) or True)
-    monkeypatch.setattr(web, "add_slots", lambda pid, slots: added.update(slots=slots) or slots)
+    monkeypatch.setattr(web, "add_slots_capped",
+                        lambda pid, slots, cap: added.update(slots=slots) or slots)
 
     r = client.post("/scheduler/polls/p1/edit", data={
         "title": "Retreat v2", "description": "new desc", "timezone": "Europe/Zurich",
@@ -277,7 +278,7 @@ def test_edit_poll_updates_and_adds_dates(client, owner, monkeypatch):
 
 def test_edit_with_notify_runs_nudge_engine(client, owner, monkeypatch):
     monkeypatch.setattr(web, "update_poll", lambda pid, **f: True)
-    monkeypatch.setattr(web, "add_slots", lambda pid, slots: slots)
+    monkeypatch.setattr(web, "add_slots_capped", lambda pid, slots, cap: slots)
     monkeypatch.setattr(web, "nudge_participants",
                         lambda req, poll, user: {"invited": 1, "updated": 2, "skipped": 0})
     r = client.post("/scheduler/polls/p1/edit", data={

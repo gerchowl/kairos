@@ -154,13 +154,20 @@ INTERNAL_ERROR = -32603
 # refused" from "internal error" and carries `retry_after` in `error.data`.
 RATE_LIMITED_CODE = -32099
 
-# Hard cap on request body size. 1 MiB is far past any legitimate tool call —
-# `create_poll` with a full week's worth of time slots is well under 50 KiB —
-# so refusing over this is free. The cap exists because a 200 KiB of nested
-# JSON brackets drives `json.loads` into a RecursionError without any of the
-# handlers below getting to run; capping `Content-Length` before the body is
-# read keeps that payload from ever reaching the parser.
-MAX_BODY_BYTES = 1 * 1024 * 1024
+# Hard cap on request body size. One knob (`settings.MAX_BODY_BYTES`, default
+# 1 MiB) since the PR #92 adversarial-review pass, enforced in two places:
+#
+#   * `main._install_body_size_cap` -- an ASGI middleware that counts
+#     streamed bytes on every surface (web, api, mcp) BEFORE FastAPI parses
+#     JSON or forms, so an oversized form post never reaches the route;
+#   * this module's `_read_body_capped` -- the local, transport-specific cap
+#     that keeps a 200 KiB of nested JSON brackets from driving `json.loads`
+#     into a RecursionError even if an operator disabled the ASGI cap.
+#
+# Resolved via a function so a test that monkey-patches the setting takes
+# effect without a reimport. Not a module constant because the setting is.
+def _max_body_bytes() -> int:
+    return settings.MAX_BODY_BYTES
 
 
 # -- Allowed-origins policy -------------------------------------------------
@@ -974,18 +981,19 @@ def _response_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 
 async def _read_body_capped(request: Request) -> bytes:
-    """Read the request body, refusing anything over `MAX_BODY_BYTES`.
+    """Read the request body, refusing anything over `settings.MAX_BODY_BYTES`.
 
     Reads Content-Length first when present; otherwise streams into a buffer
     with the same cap. Raises `HTTPException(413)` so the caller returns a
     parse error envelope at HTTP 413 without ever handing the bytes to
     `json.loads` — a nested-brackets recursion bomb cannot reach the parser.
     """
+    cap = _max_body_bytes()
     cl = request.headers.get("content-length")
-    if cl is not None:
+    if cap > 0 and cl is not None:
         try:
-            if int(cl) > MAX_BODY_BYTES:
-                raise HTTPException(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+            if int(cl) > cap:
+                raise HTTPException(413, f"request body exceeds {cap} bytes")
         except ValueError:
             # A malformed Content-Length is a client bug; let the stream
             # read decide, with the same cap.
@@ -993,8 +1001,8 @@ async def _read_body_capped(request: Request) -> bytes:
     buf = bytearray()
     async for chunk in request.stream():
         buf.extend(chunk)
-        if len(buf) > MAX_BODY_BYTES:
-            raise HTTPException(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+        if cap > 0 and len(buf) > cap:
+            raise HTTPException(413, f"request body exceeds {cap} bytes")
     return bytes(buf)
 
 

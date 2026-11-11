@@ -39,14 +39,15 @@ call it themselves, ahead of any write and any budget charge.
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from kairos import reach, settings
+from kairos import capability, reach, settings
 from kairos.auth import get_base_url
-from kairos.capability import MAX_SLOTS_PER_ACCOUNTLESS_POLL, require_sendable
+from kairos.capability import require_sendable
 from kairos.db import (
     add_response,
-    add_slots,
+    add_slots,  # noqa: F401 — re-exported for tests that monkey-patch it
+    add_slots_capped,
     bump_slot_sequence,
     create_invite,
     create_poll,
@@ -70,7 +71,7 @@ from kairos.email_service import (
     sender_refusal,
     webcal_from,
 )
-from kairos.helpers import convergence, fmt_time, format_slot
+from kairos.helpers import convergence, format_slot
 from kairos.ics import build_ics, build_request_ics
 from kairos.notifications import notify_new_response
 from kairos.scoping import api_scope, charge_force, charge_poll_recipients, check_recipient_list, enforce
@@ -90,62 +91,128 @@ router = APIRouter(prefix=f"{P}/api")
 # -- Request/Response models --
 
 class SlotIn(BaseModel):
-    date: str
-    start_time: str | None = None
-    end_time: str | None = None
+    # Validated at the Pydantic layer so a malformed `date` / `start_time` /
+    # `end_time` lands as a 422 at the input of the route, not a 500 at the
+    # `DATE` / `TIME` column's strict read later. Finding 4 on PR #92: the
+    # previous shape accepted any string and relied on `datetime.strptime` in
+    # `add_slots_endpoint` to refuse a bad date, which caught `add_dates` but
+    # left `POST /polls` writing rows that would then raise on the next read.
+    date: str = Field(..., max_length=10)
+    start_time: str | None = Field(default=None, max_length=5)
+    end_time: str | None = Field(default=None, max_length=5)
+
+    @field_validator("date")
+    @classmethod
+    def _check_date(cls, v: str) -> str:
+        try:
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("date must be YYYY-MM-DD") from None
+        return v
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def _check_time(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            datetime.strptime(v, "%H:%M")
+        except ValueError:
+            raise ValueError("time must be HH:MM") from None
+        return v
+
+    @model_validator(mode="after")
+    def _check_ordering(self) -> "SlotIn":
+        # end_time > start_time when both are present (time_slot mode). A
+        # zero-length slot is a user error; a negative-length one is a 500
+        # in the ICS builder. Catching it at the input is cheapest.
+        if self.start_time and self.end_time:
+            s = datetime.strptime(self.start_time, "%H:%M")
+            e = datetime.strptime(self.end_time, "%H:%M")
+            if e <= s:
+                raise ValueError("end_time must be after start_time")
+        return self
 
 class PollCreate(BaseModel):
-    title: str
-    description: str | None = None
+    title: str = Field(..., min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=10_000)
     mode: str  # full_day or time_slot
-    timezone: str = "Europe/Zurich"
-    # Issue #70: a `list[SlotIn]` with no bound is a single-request OOM — the same
-    # defect class the console and `/new` fixed three times over in #68 — so the
-    # list has a `max_length` ceiling at validation time, before any object is
-    # materialised in the route. The number is `MAX_SLOTS_PER_ACCOUNTLESS_POLL`,
-    # one truth across every surface that writes slots: the capability console, the
-    # accountless creation path, and this REST endpoint. The REST ceiling equals the
-    # web one by construction (same constant, not two numbers that happen to match
-    # today). `max_length` refuses at the Pydantic layer, but the dependency
-    # (`api_scope`) is resolved **before** body validation — verified by probe —
-    # so a rate-limit charge is still collected for a refused call, which is the
-    # shape #51/#89 pinned on the MCP side.
-    slots: list[SlotIn] = Field(..., max_length=MAX_SLOTS_PER_ACCOUNTLESS_POLL)
-    creator: str | None = None  # account uid — attributes the poll to a real user
+    timezone: str = Field(default="Europe/Zurich", max_length=64)
+    # Issue #70: a `list[SlotIn]` with no bound is a single-request OOM — the
+    # same defect class the console and `/new` fixed three times over in #68 —
+    # so the list has a `max_length` ceiling at validation time, before any
+    # object is materialised in the route. `MAX_SLOTS_PER_REQUEST` is the
+    # per-request memory guard (2,000 by default), applied identically on every
+    # slot-writing surface since the PR #92 adversarial-review pass -- one
+    # truth across the capability console, the accountless creation path, this
+    # REST endpoint and MCP (`add_dates` calls this model directly, which is
+    # what keeps them in step by construction rather than by two numbers that
+    # happen to match today). `max_length` refuses at the Pydantic layer, but
+    # the dependency (`api_scope`) is resolved **before** body validation --
+    # verified by probe -- so a rate-limit charge is still collected for a
+    # refused call, which is the shape #51/#89 pinned on the MCP side.
+    slots: list[SlotIn] = Field(..., min_length=1, max_length=settings.MAX_SLOTS_PER_REQUEST)
+    creator: str | None = Field(default=None, max_length=255)  # account uid
     # Where a management link may be sent for this poll (#29/#30). Recorded,
     # not acted on: nothing mails it yet, and the response never carries it.
-    creator_email: str | None = None
+    creator_email: str | None = Field(default=None, max_length=320)
+
+    # `mode` and `timezone` are kept as route-level 400s rather than Pydantic
+    # 422s (see `create_poll_endpoint`) so an existing client that pins the
+    # status still reads the same shape. Pydantic validates length and format
+    # of the strings themselves above; the route validates the vocabulary.
 
 class PollUpdate(BaseModel):
-    title: str | None = None
-    description: str | None = None
-    timezone: str | None = None
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=10_000)
+    timezone: str | None = Field(default=None, max_length=64)
     status: str | None = None  # open | closed (use /decide for decided)
 
 class ResponseCreate(BaseModel):
-    name: str
-    email: str | None = None
+    name: str = Field(..., min_length=1, max_length=255)
+    email: str | None = Field(default=None, max_length=320)
     availabilities: dict[str, str]  # slot_id -> yes/maybe/no
 
 class InviteCreate(BaseModel):
-    emails: list[str]
+    # `emails` is bounded by `scoping.check_recipient_list` at request time
+    # (knob: `KAIROS_MAIL_MAX_RECIPIENTS`), so Pydantic does not pin a hard
+    # max_length here -- the operator can turn the cap off with 0 and the
+    # route still accepts the body at the shape layer. The validator below
+    # just refuses the empty list (the route would 400 that too).
+    emails: list[str] = Field(..., min_length=1)
     required: bool = True
-    sender_name: str | None = None
-    reply_to: str | None = None
+    sender_name: str | None = Field(default=None, max_length=255)
+    reply_to: str | None = Field(default=None, max_length=320)
 
 class DecideIn(BaseModel):
-    slot_id: str
+    slot_id: str = Field(..., max_length=64)
 
 class SlotsAdd(BaseModel):
     # Issue #70: `dates` bounds the *input* dimension — one dimension of the
     # product this endpoint materialises; the other (the poll's own grid) is
-    # applied arithmetically inside `add_slots_endpoint` before any expansion.
-    # Same ceiling as every other slot-writing surface; see `PollCreate.slots`
-    # for why the number lives in one constant.
-    dates: list[str] = Field(..., max_length=MAX_SLOTS_PER_ACCOUNTLESS_POLL)
+    # applied arithmetically inside `expand_new_dates` before any expansion
+    # and atomically inside `add_slots_capped` at the data layer (closing the
+    # count/check/insert race the PR #92 review found on this very endpoint).
+    # `MAX_SLOTS_PER_REQUEST` is the per-request memory guard applied
+    # identically on every slot-writing surface; see `PollCreate.slots`.
+    dates: list[str] = Field(..., min_length=1, max_length=settings.MAX_SLOTS_PER_REQUEST)
     notify: bool = False
-    sender_name: str | None = None
-    reply_to: str | None = None
+    sender_name: str | None = Field(default=None, max_length=255)
+    reply_to: str | None = Field(default=None, max_length=320)
+
+    @field_validator("dates")
+    @classmethod
+    def _check_dates(cls, v: list[str]) -> list[str]:
+        # Validate ISO YYYY-MM-DD at the input; finding 4 on PR #92 said the
+        # route's `datetime.strptime` loop already does this but at a surface
+        # that depends on which route reaches it — doing it on the model is
+        # one validator for every caller that speaks this shape (REST, MCP).
+        for d in v:
+            try:
+                datetime.strptime(d, "%Y-%m-%d")
+            except (TypeError, ValueError):
+                raise ValueError(f"dates must be YYYY-MM-DD (got {d!r})") from None
+        return v
 
 class MailIn(BaseModel):
     note: str = ""
@@ -297,6 +364,14 @@ def create_poll_endpoint(body: PollCreate, request: Request, user: dict = Depend
     if body.creator_email and not creator_email:
         raise HTTPException(400, f"Invalid email address: {body.creator_email}")
     slots = [s.model_dump() for s in body.slots]
+    # Issue #70 + PR #92: the per-poll cap applies at creation too. A client
+    # cannot sidestep the `add_slots_capped` race guard by starting an
+    # oversized poll in one `POST /polls`. `capability.slot_cap_refusal`
+    # produces the same sentence every surface uses, so an agent reading
+    # the refusal sees the same text REST/MCP/web all return.
+    refusal = capability.slot_cap_refusal(len(slots), 0)
+    if refusal:
+        raise HTTPException(400, refusal)
     # owner_id == creator_id: the API attributes a poll either to the named user
     # or to the service identity that made it, and that is its owner (ADR-0009).
     poll = create_poll(creator_id, body.title, body.description, body.mode, body.timezone,
@@ -368,8 +443,8 @@ def update_poll_endpoint(poll_id: str, body: PollUpdate, request: Request,
 
 
 class InvitePatch(BaseModel):
-    name: str | None = None
-    email: str | None = None
+    name: str | None = Field(default=None, max_length=255)
+    email: str | None = Field(default=None, max_length=320)
     required: bool | None = None
 
 
@@ -412,8 +487,8 @@ def delete_invite_endpoint(poll_id: str, invite_id: str,
 
 
 class ResponsePatch(BaseModel):
-    name: str | None = None
-    email: str | None = None
+    name: str | None = Field(default=None, max_length=255)
+    email: str | None = Field(default=None, max_length=320)
     required: bool | None = None
 
 
@@ -482,44 +557,25 @@ def add_slots_endpoint(poll_id: str, body: SlotsAdd, request: Request,
         # attached to the request that asked for it, and stops the added dates being
         # written for a request that is about to be refused.
         require_sendable(poll)
-    for d in body.dates:
-        try:
-            datetime.strptime(d, "%Y-%m-%d")
-        except ValueError:
-            raise HTTPException(400, f"Invalid date: {d!r} (expected YYYY-MM-DD)") from None
-    # Issue #70: bound `new_dates × time_pairs` **and** `existing + new`
-    # arithmetically, before any grid is built — the same discipline #68 used
-    # on the web/console path, and for the same reason: a check that runs after
-    # the comprehension produces the right status but with the memory already
-    # spent. Both factors come from the poll itself, so the math costs one
-    # multiplication; neither `expand_new_dates` nor `add_slots` is called when
-    # either bound would trip, which is what keeps the refusal cheap (pinned
-    # by a `tracemalloc` peak test in `tests/test_api.py`).
+    # Issue #70 + PR #92 adversarial-review pass. Three checks, each catching
+    # something the others cannot:
     #
-    # `expand_new_dates(cap=…)` carries the product bound into the shared helper
-    # — same parameter the capability console uses — so the single sentence in
-    # `capability.slot_cap_refusal` is reused where it applies, with the generic
-    # fallback for every other auth mode. The total bound (existing + new) is
-    # one the console never had to compute itself, because it is the API path
-    # that can grow a poll across many sessions with the same key.
-    cap = MAX_SLOTS_PER_ACCOUNTLESS_POLL
-    existing_dates = {str(s["date"]) for s in poll["slots"]}
-    new_date_count = sum(1 for d in body.dates if d and d not in existing_dates)
-    time_pairs = {(fmt_time(s["start_time"]), fmt_time(s["end_time"]))
-                  for s in poll["slots"] if s.get("start_time")}
-    per_date = len(time_pairs) if (poll["mode"] == "time_slot" and time_pairs) else 1
-    product = new_date_count * per_date
-    existing_count = len(poll["slots"])
-    if existing_count + product > cap:
-        raise HTTPException(
-            400,
-            f"That edit would bring the poll to {existing_count + product:,} slots, "
-            f"over the limit of {cap:,}. The poll already has {existing_count:,} slots; "
-            f"this request would add {product:,} more. Add fewer dates, or split the "
-            f"edit across requests.",
-        )
-    slots = expand_new_dates(poll, body.dates, cap=cap)
-    added = add_slots(poll_id, slots) if slots else []
+    #   1. `expand_new_dates` enforces the per-request memory guard (product
+    #      vs. `settings.MAX_SLOTS_PER_REQUEST`) AND the per-poll cap
+    #      arithmetically BEFORE the grid is built -- so an over-cap request
+    #      never allocates a megabyte of slot dicts (pinned by a `tracemalloc`
+    #      peak test in `tests/test_api.py`).
+    #   2. `add_slots_capped` repeats the per-poll check inside a transaction
+    #      at the data layer -- `BEGIN IMMEDIATE` on SQLite, `SELECT ... FOR
+    #      UPDATE` on MySQL -- which is what closes the count/check/insert
+    #      race the review measured on this very endpoint (64 concurrent
+    #      requests pushed a 1,000-cap poll to 36,100 slots on the pre-fix
+    #      tree). The route has to call it, but the atomicity lives in db.py.
+    #   3. Pydantic `max_length` on `SlotsAdd.dates` refuses a 95,000-date
+    #      input at validation, before the route even sees the body. One
+    #      bound at each layer; the three must not disagree.
+    slots = expand_new_dates(poll, body.dates)
+    added = add_slots_capped(poll_id, slots, cap=settings.max_slots_per_poll()) if slots else []
     nudged = None
     if body.notify and added:
         nudged = nudge_participants(request, get_poll(poll_id),
