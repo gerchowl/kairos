@@ -84,6 +84,28 @@ SCHEMA = [
         target VARCHAR(512) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""",
+    # Owner-minted API tokens (issue #82). Each row is one bearer credential the
+    # signed-in owner minted from the admin panel, in addition to the static
+    # KAIROS_API_KEY / KAIROS_API_KEYS env grants (#51). Only the sha256 hash of
+    # the token is stored — the plaintext is shown exactly once at mint time —
+    # so a database leak does not disclose working credentials. The `prefix`
+    # column carries the first ~12 chars of the plaintext (`kai_` + 8 random
+    # chars) for a non-sensitive display handle in the panel's list. All columns
+    # are plain SQL so the schema also lands on the Durable-Object SQLite
+    # backend drafted in PR #79: no partial indexes, no JSON columns, no
+    # dialect-specific defaults beyond the shared ones.
+    """CREATE TABLE IF NOT EXISTS sched_api_tokens (
+        id VARCHAR(36) PRIMARY KEY,
+        owner_uid VARCHAR(255) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        token_hash VARCHAR(64) UNIQUE NOT NULL,
+        prefix VARCHAR(16) NOT NULL,
+        scopes VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL,
+        last_used_at TIMESTAMP NULL,
+        revoked_at TIMESTAMP NULL
+    )""",
 ]
 
 
@@ -871,3 +893,112 @@ def get_unread_notification_count(user_id: str) -> int:
     cursor.close()
     conn.close()
     return count
+
+
+# -- Owner-minted API tokens (issue #82) ------------------------------------
+#
+# The signed-in owner mints bearer credentials from the admin panel. Only the
+# sha256 hash is stored; the plaintext is shown once at mint time and the
+# `prefix` column carries 12 non-sensitive chars for the panel's list.
+#
+# The write side lives here; the authentication/hashing seam lives in
+# `kairos.apitokens` so the same resolver can back `/api` today and `/mcp`
+# tomorrow (issue #83) without a second DB module to forget.
+
+
+def insert_api_token(token_id: str, owner_uid: str, name: str, token_hash: str,
+                     prefix: str, scopes: str, expires_at) -> None:
+    """Persist one minted token. `expires_at` is a `datetime`, `scopes` is a
+    comma-joined grant string over `scoping.SCOPES` (validated by the caller)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO sched_api_tokens (id, owner_uid, name, token_hash, prefix,"
+        " scopes, expires_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (token_id, owner_uid, name, token_hash, prefix, scopes, expires_at),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+
+def get_api_token_by_hash(token_hash: str) -> dict | None:
+    """The token row for a presented credential's sha256, or None.
+
+    The caller hashed the bearer; this is a straight equality lookup on an
+    indexed (UNIQUE) column, so the query is deterministic and timing-safe at
+    the row level — the only way a lookup differs from a miss is the cost of
+    one hashing pass the caller has already paid. Nothing here compares the
+    plaintext; nothing here can, because the plaintext is not stored.
+
+    Returns the whole row (revoked/expired tokens included); the caller is
+    `kairos.apitokens.resolve_token`, which decides whether each state is a
+    401 and in what wording — the wording is deliberately the same across
+    expired / revoked / not-minted, so a probing caller cannot tell the three
+    apart.
+    """
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM sched_api_tokens WHERE token_hash = %s", (token_hash,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    return row
+
+
+def list_api_tokens(owner_uid: str) -> list[dict]:
+    """Every token this owner has minted, newest first. Panel list."""
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM sched_api_tokens WHERE owner_uid = %s ORDER BY created_at DESC",
+        (owner_uid,),
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return rows
+
+
+def revoke_api_token(token_id: str, owner_uid: str) -> bool:
+    """Mark a token revoked, iff it belongs to this owner and is not already revoked.
+
+    The `owner_uid` guard is in SQL rather than in a read-then-write, so an owner
+    cannot revoke someone else's token by guessing an id — the row stays unchanged
+    and the caller gets False. Idempotent on a second click: the second UPDATE
+    matches zero rows (`revoked_at IS NULL` is already false), and the API panel
+    reads that as "already revoked" rather than as a fresh action.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sched_api_tokens SET revoked_at = CURRENT_TIMESTAMP"
+        " WHERE id = %s AND owner_uid = %s AND revoked_at IS NULL",
+        (token_id, owner_uid),
+    )
+    conn.commit()
+    revoked = cursor.rowcount > 0
+    cursor.close()
+    conn.close()
+    return revoked
+
+
+def touch_api_token_last_used(token_id: str) -> None:
+    """Stamp `last_used_at = now()` on one row. Not idempotent; the caller throttles.
+
+    Separate from `get_api_token_by_hash` on purpose: the read happens on every
+    authenticated request and is hot; the write happens at most once per minute
+    per token (`kairos.apitokens._should_touch`) and would otherwise be the
+    second SQLite write for every API call — enough to double the surface's
+    write rate at no useful fidelity, since `last_used_at` is only for the
+    panel's "last used" column.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE sched_api_tokens SET last_used_at = CURRENT_TIMESTAMP WHERE id = %s",
+        (token_id,),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()

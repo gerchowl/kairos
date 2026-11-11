@@ -144,6 +144,12 @@ def create_app() -> FastAPI:
     app.include_router(api_router)
     app.include_router(web_router, include_in_schema=False)
     app.include_router(public_router, include_in_schema=False)
+    # Issue #82: owner-minted API tokens — the admin panel. Registered in every
+    # mode and self-404'ing when the mode has no account to attribute a token
+    # to (capability / none), so the route table stays one shape regardless of
+    # auth mode — the same pattern the OIDC and capability routers use.
+    from kairos.panel import router as panel_router
+    app.include_router(panel_router, include_in_schema=False)
     # Registered in every mode and self-404ing when KAIROS_AUTH != oidc, so the
     # route table — which tests/test_ratelimit.py's route audit reads — does not
     # change shape with the auth mode.

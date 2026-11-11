@@ -432,8 +432,11 @@ def _match(presented: str) -> KeyEntry | None:
 def resolve(request: Request) -> Principal:
     """The principal for the bearer credential on this request, or a 401.
 
-    Two accepted credentials, and the order is deliberate: the **keyring first**,
-    so that scoping wins when a key appears in both places. The other order would
+    Three accepted credentials, and the order is deliberate: the **keyring
+    first**, so that scoping wins when a key appears in both places; then
+    **owner-minted tokens** (issue #82), the DB-backed counterpart to the
+    keyring; and finally `KAIROS_API_KEY`, the single all-power env key the
+    ETH/duplet adapter and every self-hoster still sets. The other order would
     let `KAIROS_API_KEY` silently override the least-privilege entry an operator
     just added for the same key — the exact mistake this module exists to make
     hard. A deployment that sets only `KAIROS_API_KEY` matches nothing in the ring
@@ -450,6 +453,15 @@ def resolve(request: Request) -> Principal:
     entry = _match(presented)
     if entry is not None:
         return _principal(entry)
+
+    # Issue #82: DB-backed owner-minted tokens. The seam
+    # (`kairos.apitokens.resolve_token`) is also what the future server-hosted
+    # /mcp endpoint (#83) will reuse — one function decides revoked / expired /
+    # unknown, so the three states cannot drift apart across surfaces.
+    from kairos.apitokens import resolve_token
+    token_principal = resolve_token(presented)
+    if token_principal is not None:
+        return token_principal
 
     if not _legacy_key():
         raise HTTPException(401, "Invalid API key")

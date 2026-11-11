@@ -752,10 +752,14 @@ def test_the_missing_poll_page_is_the_page_it_has_always_been(scoped, client):
     page = as_person(client, STRANGER).get(f"{web.P}/polls/no-such-poll")
     assert page.status_code == 404
     scrubbed = _scrubbed_page(page)
-    assert len(page.content) == 4309
-    assert len(scrubbed) == 4274
+    # #82 added a navbar link to /tokens for any signed-in non-capability
+    # owner, which all three of these numbers absorb. The byte-identity
+    # between a refused and a missing poll is maintained -- same nav, same
+    # template, same bytes -- which is what the companion test asserts.
+    assert len(page.content) == 4815
+    assert len(scrubbed) == 4780
     assert hashlib.sha256(scrubbed).hexdigest() == (
-        "23ae8fdc2ff0c6e5d448eedf5f7939cd4f95c2560a828782213ab5c684c587d8"
+        "000ea33b8d75893ab299f3c0b5b058a41619440bb68a6f53227038d198bd5837"
     ), "the missing-poll page changed: update this pin deliberately, and re-run the byte probe"
 
 
