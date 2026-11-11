@@ -5,6 +5,22 @@ import uuid
 from fastapi import HTTPException
 
 from kairos.dbconn import IS_SQLITE, get_connection  # noqa: F401  (re-exported)
+from kairos.validation import slot_is_readable
+
+
+def _readable_slots(rows: list[dict]) -> list[dict]:
+    """Filter unreadable rows out of a slot fetch.
+
+    PR #92 round-3 finding (MEDIUM). A pre-validator row on disk (e.g. a
+    stored `date` like `2026-1-5`) used to 500 every poll-read route:
+    `cursor.fetchall()` raised inside the DATE converter. The converters are
+    now tolerant (see `dbconn._tolerant_date`), so the raw string lands here
+    and `slot_is_readable` skips it -- logged once per `(poll_id, slot_id)`
+    pair so an operator sees the shape without the log filling on repeat
+    views. Called at every point in this module that loads `sched_poll_slots`
+    rows for a route to render; nothing downstream has to remember to filter.
+    """
+    return [s for s in rows if slot_is_readable(s)]
 
 SCHEMA = [
     """CREATE TABLE IF NOT EXISTS sched_polls (
@@ -355,7 +371,7 @@ def get_poll(poll_id: str) -> dict | None:
         conn.close()
         return None
     cursor.execute("SELECT * FROM sched_poll_slots WHERE poll_id = %s ORDER BY date, start_time", (poll_id,))
-    poll["slots"] = cursor.fetchall()
+    poll["slots"] = _readable_slots(cursor.fetchall())
     cursor.close()
     conn.close()
     return poll
@@ -371,7 +387,7 @@ def get_poll_by_token(public_token: str) -> dict | None:
         conn.close()
         return None
     cursor.execute("SELECT * FROM sched_poll_slots WHERE poll_id = %s ORDER BY date, start_time", (poll["id"],))
-    poll["slots"] = cursor.fetchall()
+    poll["slots"] = _readable_slots(cursor.fetchall())
     cursor.close()
     conn.close()
     return poll
@@ -409,7 +425,7 @@ def get_poll_by_admin_token(admin_token: str | None) -> dict | None:
         conn.close()
         return None
     cursor.execute("SELECT * FROM sched_poll_slots WHERE poll_id = %s ORDER BY date, start_time", (poll["id"],))
-    poll["slots"] = cursor.fetchall()
+    poll["slots"] = _readable_slots(cursor.fetchall())
     cursor.close()
     conn.close()
     return poll

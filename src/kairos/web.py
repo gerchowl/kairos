@@ -875,13 +875,15 @@ def edit_poll_submit(poll_id: str, request: Request, form=Depends(form_data)):
         return _error_page(user, "Edit Poll", exc.detail,
                            f"{P}/polls/{poll_id}/edit")
 
-    update_poll(poll_id, title=title,
-                description=form.get("description", "").strip() or None,
-                timezone=timezone)
-
-    # Additive date edit: new dates get slots, existing slots (and their
-    # responses) are untouched. `add_slots_capped` repeats the per-poll check
-    # inside a transaction so concurrent requests cannot push it past the cap.
+    # PR #92 round-3 finding 3 (LOW). The pre-fix order applied the title /
+    # description / timezone update first and then ran `add_slots_capped`:
+    # a slot-cap refusal returned 400 *after* the metadata had already
+    # landed, so the poll's title changed while the user saw an error page
+    # saying nothing was applied. Apply slots FIRST so the transactional
+    # cap check (SQLite BEGIN IMMEDIATE, MySQL SELECT ... FOR UPDATE) is the
+    # gate that decides whether any change lands; only then update the
+    # metadata, which cannot fail for a validated input. Capability console
+    # `_edit` runs the same discipline (`src/kairos/capability.py::_edit`).
     if slots:
         try:
             add_slots_capped(poll_id, slots, cap=settings.max_slots_per_poll())
@@ -889,6 +891,15 @@ def edit_poll_submit(poll_id: str, request: Request, form=Depends(form_data)):
             return _error_page(user, "Edit Poll", exc.detail,
                                f"{P}/polls/{poll_id}/edit")
 
+    update_poll(poll_id, title=title,
+                description=form.get("description", "").strip() or None,
+                timezone=timezone)
+
+    # Additive date edit: new dates get slots, existing slots (and their
+    # responses) are untouched. `add_slots_capped` above repeats the per-poll
+    # check inside a transaction so concurrent requests cannot push it past
+    # the cap.
+    if slots:
         if form.get("notify"):
             # Refetch so the nudge engine sees the just-added slots, then let
             # it work out who actually needs mail (idempotent, state-driven).

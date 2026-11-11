@@ -13,9 +13,57 @@ from kairos import settings
 
 IS_SQLITE = settings.DB_URL.startswith("sqlite")
 
+
+# PR #92 round-3 finding (MEDIUM). The DATE/TIMESTAMP converters used to raise
+# `date.fromisoformat(...)` -- an `"Invalid isoformat string"` -- from inside
+# `cursor.fetchall()`, which is how a *single* malformed stored row turned the
+# four poll-reading routes (/api/polls/{id}, /polls/{id}, /p/{token}, the ICS
+# feeds) into 500s. The fix is two-layer:
+#
+#   1. make the converter TOLERANT -- an unparseable value becomes the raw
+#      string (or `None` if even the decode fails), so `fetchall()` never
+#      raises on it;
+#   2. filter the resulting row at the db layer with `slot_is_readable`, so
+#      a row with a bad date is skipped instead of being handed to the route.
+#
+# Both layers matter: without (1) `fetchall()` still raises, and without (2)
+# a bad date would reach the renderer and 500 somewhere else. The write path
+# (the `validation.*` predicates) refuses new bad rows -- this is the
+# migration aid for rows that already exist on disk from before the validators
+# were in place.
+
+def _tolerant_date(b: bytes):
+    """A DATE column converter that never raises on fetchall.
+
+    Returns a `date` for a well-formed value, the decoded string for anything
+    unparseable (so `validation.slot_is_readable` sees it and skips the row),
+    or `None` if the bytes themselves cannot be decoded.
+    """
+    try:
+        s = b.decode()
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    try:
+        return date.fromisoformat(s)
+    except ValueError:
+        return s
+
+
+def _tolerant_timestamp(b: bytes):
+    """The TIMESTAMP counterpart -- same shape as `_tolerant_date`."""
+    try:
+        s = b.decode()
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return s
+
+
 if IS_SQLITE:
-    sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
-    sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
+    sqlite3.register_converter("TIMESTAMP", _tolerant_timestamp)
+    sqlite3.register_converter("DATE", _tolerant_date)
 
 
 class _SqliteCursor:

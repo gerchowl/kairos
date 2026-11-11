@@ -1438,12 +1438,14 @@ def _edit(request, form, poll, web):
         poll, _parse_dates(form.getlist("dates"))
     )
 
-    update_poll(
-        poll["id"],
-        title=title,
-        description=form.get("description", "").strip() or None,
-        timezone=timezone,
-    )
+    # PR #92 round-3 finding 3 (LOW). The pre-fix order applied `update_poll`
+    # first and then ran `add_slots_capped`: a slot-cap refusal returned 400
+    # *after* the title / description / timezone change had already landed,
+    # so the owner saw an error page while the poll's title had silently
+    # changed. Apply slots FIRST so the transactional cap check is the gate
+    # that decides whether any change lands; only then update the metadata,
+    # which cannot fail for a validated input. The web owner form
+    # (`web.edit_poll_submit`) runs the same discipline.
     if slots:
         # Finding 1 of PR #92 round-2: this used to call the bare `add_slots`,
         # which skipped the atomic count/check/insert — 128 concurrent workers
@@ -1452,6 +1454,12 @@ def _edit(request, form, poll, web):
         # (ADR-0012 parity): REST, MCP, the web owner form AND this capability
         # console all pass through the same transactional guard.
         add_slots_capped(poll["id"], slots, cap=settings.max_slots_per_poll())
+    update_poll(
+        poll["id"],
+        title=title,
+        description=form.get("description", "").strip() or None,
+        timezone=timezone,
+    )
     return _back("saved")
 
 

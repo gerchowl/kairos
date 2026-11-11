@@ -836,6 +836,50 @@ def test_round2_finding_2_under_cap_body_is_replayed_intact(monkeypatch):
     assert r.status_code == 200, r.text
 
 
+def test_round3_replay_receive_does_not_cancel_a_streaming_response(monkeypatch):
+    """**PR #92 round-3 finding 2 (LOW).** `replay_receive` used to return
+    `{"type": "http.disconnect"}` immediately after the body had been
+    replayed. Under ASGI spec 2.3 Starlette's `StreamingResponse` watches
+    `receive()` for a disconnect and cancels the stream the moment it sees
+    one, so a streaming POST returned only its first chunk.
+
+    The fix delegates to the ORIGINAL `receive` after the body is sent, so
+    a real disconnect still arrives when the client actually goes away and
+    an in-flight stream is not killed by an impostor disconnect. Driven
+    through a temporary POST route whose body is a `StreamingResponse`.
+    """
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+
+    from kairos import main as _main
+    monkeypatch.setattr("kairos.settings.MAX_BODY_BYTES", 1 * 1024 * 1024)
+
+    app = FastAPI()
+
+    async def _chunks():
+        # Three chunks with a tiny awaitable gap between them so the ASGI
+        # layer actually sees intermediate send messages rather than
+        # collapsing them. A disconnect delivered between chunks is what
+        # used to cancel the response -- here we assert all three chunks
+        # arrive.
+        import asyncio
+        for i in range(3):
+            yield f"chunk-{i}\n".encode()
+            await asyncio.sleep(0)
+
+    @app.post("/scheduler/stream-test")
+    async def _stream():
+        return StreamingResponse(_chunks(), media_type="text/plain")
+
+    _main._install_body_size_cap(app)
+    c = TestClient(app, base_url="https://testserver")
+    # The body itself matters only in that the middleware buffers-and-
+    # replays it; what we measure is what comes back.
+    r = c.post("/scheduler/stream-test", json={"ignored": True})
+    assert r.status_code == 200
+    assert r.text == "chunk-0\nchunk-1\nchunk-2\n", r.text
+
+
 def test_round2_finding_3_web_new_header_mode_refuses_the_per_request_cap(monkeypatch):
     """**Round-2 finding 3 (MEDIUM per-request cap on /new).** Header-mode
     /new had no per-request cap: 5,000 dates created 5,000 slot dicts

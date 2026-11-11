@@ -118,6 +118,16 @@ def _install_body_size_cap(app: FastAPI) -> None:
         # Replay the buffered body to the app in a single message. FastAPI's
         # body readers call receive() in a loop until `more_body=False`, so
         # one shot is enough.
+        #
+        # PR #92 round-3 finding 2 (LOW). The pre-fix version returned
+        # `{"type": "http.disconnect"}` on *every* subsequent call -- fine for
+        # the body readers that stop on `more_body=False`, broken for
+        # `StreamingResponse` which (per ASGI spec 2.3) treats an immediate
+        # disconnect as the peer cancelling the response: Starlette stops
+        # yielding further chunks, so a streaming POST returned only its
+        # first chunk. The fix is to delegate to the ORIGINAL `receive`
+        # after the body has been replayed, so a real disconnect still
+        # arrives when the client actually goes away.
         sent = False
 
         async def replay_receive():
@@ -125,9 +135,7 @@ def _install_body_size_cap(app: FastAPI) -> None:
             if not sent:
                 sent = True
                 return {"type": "http.request", "body": buffered, "more_body": False}
-            # After the body, deliver a disconnect so a buggy handler that
-            # keeps reading sees end-of-stream, not a hang.
-            return {"type": "http.disconnect"}
+            return await receive()
 
         request._receive = replay_receive  # Starlette's documented hook
         return await call_next(request)

@@ -2434,3 +2434,45 @@ def test_the_console_edit_route_refuses_an_over_wide_edit_and_writes_nothing(con
     assert ok.status_code == 302
     assert db.get_poll(poll_id)["title"] == "Retreat (moved)"
     assert len(db.get_poll(poll_id)["slots"]) == before + 2
+
+
+def test_round3_console_edit_title_does_not_leak_through_a_slot_cap_refusal(console, monkeypatch):
+    """**PR #92 round-3 finding 3 (LOW).** If `add_slots_capped` refuses (the
+    atomic cap race it exists to close), the title / description / timezone
+    change in the same request must NOT land. The pre-fix order applied
+    `update_poll` first, so a 400 from the cap guard still renamed the
+    poll — the user saw an error page while the title had silently changed.
+
+    The earlier test above exercises the `_parse_dates` / `expand_new_dates`
+    refusal paths, both of which raise BEFORE `update_poll` was ever called
+    so the pre-fix order was invisible. The one path where the pre-fix bug
+    shows is when `add_slots_capped` refuses (a race the data layer closes
+    with `BEGIN IMMEDIATE` on SQLite / `SELECT ... FOR UPDATE` on MySQL),
+    simulated here by monkeypatching the function to raise 400.
+    """
+    live = console
+    poll_id = live.poll()["id"]
+    before = db.get_poll(poll_id)
+
+    def refuse(_pid, _slots, cap):
+        raise HTTPException(400, "That edit would bring the poll over the limit.")
+    monkeypatch.setattr(capability, "add_slots_capped", refuse)
+
+    response = live.client.post(
+        f"/scheduler/manage/{poll_id}/edit",
+        data={
+            "csrf": live.csrf,
+            "title": "Renamed by a refused slot cap",
+            "description": "new desc",
+            "timezone": "UTC",
+            "dates": "2027-01-04",  # one new date -> add_slots_capped runs
+        },
+    )
+    assert response.status_code == 400
+    after = db.get_poll(poll_id)
+    assert after["title"] == before["title"], (
+        "add_slots_capped refused, but the title change in the same request "
+        "still landed — update_poll must run only after slots succeed"
+    )
+    assert after.get("description") == before.get("description")
+    assert after["timezone"] == before["timezone"]
