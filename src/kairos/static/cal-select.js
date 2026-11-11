@@ -109,10 +109,7 @@
     // IntersectionObserver for lazy loading
     var scrollContainer = document.getElementById('cal-scroll');
     var observer = new IntersectionObserver(function (entries) {
-        if (entries[0].isIntersecting && lastShown() < limit) {
-            addWeeks(LOAD_MORE_WEEKS);
-            updateNav();
-        }
+        if (entries[0].isIntersecting && lastShown() < limit) addWeeks(LOAD_MORE_WEEKS);
     }, { root: scrollContainer, rootMargin: '200px' });
     observer.observe(sentinel);
 
@@ -121,9 +118,9 @@
     var monthBtns = document.getElementById('cal-month-btns').querySelectorAll('button');
 
     function updateNav() {
-        // Update year dropdown
-        // Every year up to the horizon, not only the loaded ones: a jump loads
-        // its weeks on demand, so a later year must be pickable before scrolling.
+        // Built once: every year up to the horizon, not only the loaded ones (a
+        // jump loads its weeks on demand). Rebuilding on each lazy load would
+        // close a dropdown the user has open.
         var curYears = [];
         for (var y = today.getFullYear(); y <= limit.getFullYear(); y++) curYears.push(y);
         yearSelect.innerHTML = '';
@@ -166,7 +163,6 @@
         var target = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, 1);
         if (target > limit) return;
         while (!monthRows[targetMk] && lastShown() < target) addWeeks(LOAD_MORE_WEEKS);
-        updateNav();
     }
 
     // A freshly loaded month's row is among the last rows, and the box cannot
@@ -182,7 +178,7 @@
     function scrollToRow(tr) {
         var head = document.getElementById('cal-grid').querySelector('thead');
         var top = tr.getBoundingClientRect().top - scrollContainer.getBoundingClientRect().top
-            + scrollContainer.scrollTop - head.offsetHeight;
+            - scrollContainer.clientTop + scrollContainer.scrollTop - head.offsetHeight;
         top = Math.max(0, top);
         // Smooth over a few screens; instant across years, where a smooth scroll
         // would crawl through hundreds of rows for seconds.
@@ -195,7 +191,6 @@
         var tr = monthRows[mk];
         if (!tr) return;
         ensureRowsBelow(tr);
-        updateNav();
         // The destination is known, so show it right away and keep showing it
         // until the user scrolls by hand: rows passing by during the smooth
         // scroll, or a row shared by two months, must not rewrite the year.
