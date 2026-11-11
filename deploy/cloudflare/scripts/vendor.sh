@@ -89,6 +89,81 @@ rm -rf public/static
 mkdir -p public
 cp -r ../../src/kairos/static public/static
 
+# ---- Trim python_modules/ to fit the 3-MB-gzip Worker upload cap ---------
+#
+# The untrimmed bundle gzips to just over the 3072 KiB free-plan limit, so
+# every deploy would be refused. Each cut below is checked against runtime
+# imports (see the comment); if any smoke test fails, revert the matching
+# line and re-measure with `wrangler deploy --dry-run`.
+
+# __pycache__: compiled by the HOST CPython while unpacking wheels into
+# python_modules/. The Workers pyodide runtime is a different interpreter
+# (wasm32-emscripten, python 3.13) and recompiles on import, so these
+# .pyc blobs are never executed.
+find python_modules -type d -name "__pycache__" -exec rm -rf {} +
+
+# kairos/static/: byte-identical to public/static/, which Workers' Static
+# Assets binding serves via run_worker_first (see wrangler.jsonc and the
+# `/static/` branch in entry.py — ASSETS answers before the DO is ever
+# invoked). kairos.main.create_app() still mounts StaticFiles(check_dir=
+# True) pointing at this path, so the directory must exist at runtime.
+# Workers' wrangler packer skips empty directories, so we leave a 0-byte
+# placeholder — enough for os.path.isdir() in starlette.StaticFiles.
+rm -f python_modules/kairos/static/*
+mkdir -p python_modules/kairos/static
+: > python_modules/kairos/static/.keep
+
+# dns/ (dnspython): only reached by email_validator.deliverability, which
+# is lazy-imported inside validate_email() when check_deliverability=True
+# (and separately by caching_resolver() if the caller asks for one).
+# kairos always calls validate_email(check_deliverability=False) — see
+# src/kairos/http.py:_norm_email — and nothing else in kairos, fastapi or
+# starlette imports `dns`. The dist-info goes too since the wheel
+# installer only lists it for dnspython.
+rm -rf python_modules/dns python_modules/dnspython-*.dist-info
+
+# pydantic/v1: the pre-v2 compatibility shim. kairos uses pydantic v2
+# only; fastapi 0.115 and starlette 0.41 route v1 fields through a
+# `hasattr(field, "serialize")` duck-type check, not an actual import
+# of pydantic.v1.
+rm -rf python_modules/pydantic/v1
+
+# pydantic/experimental: opt-in beta features (pipeline). Not referenced
+# by pydantic's own __init__, by fastapi, or by kairos.
+rm -rf python_modules/pydantic/experimental
+
+# anyio/_backends/_trio.py: anyio.run defaults to the asyncio backend and
+# loads trio only via `import_module("anyio._backends._trio")` when a
+# caller passes backend="trio". The Worker ASGI shim and kairos both
+# stay on asyncio, so the trio module is dead code.
+# anyio/pytest_plugin.py: anyio's own pytest helper; no runtime import.
+rm -f python_modules/anyio/_backends/_trio.py \
+      python_modules/anyio/pytest_plugin.py
+
+# starlette/testclient.py + fastapi/testclient.py: only used by tests.
+# Nothing in kairos imports them at runtime.
+rm -f python_modules/starlette/testclient.py \
+      python_modules/fastapi/testclient.py
+
+# .pyi type stubs: Python's import machinery looks for .py/.pyc, not
+# .pyi. These exist for type checkers and IDEs only. The two top-level
+# stubs (_cloudflare_compat_flags, _pyodide_entrypoint_helper) describe
+# modules the Workers runtime INJECTS as built-ins — the real objects
+# come from the runtime, not from these files.
+find python_modules -name "*.pyi" -delete
+
+# tzdata non-data files: Python's zoneinfo walks the tzdata/zoneinfo/
+# tree directly (via importlib.resources) when loading a timezone; the
+# .tab files, tzdata.zi source and leapseconds metadata are used by the
+# `tz`/`tzselect` CLIs, not by ZoneInfo. The binary tz files (and the
+# tzdata/zones manifest zoneinfo.available_timezones uses) stay.
+rm -f python_modules/tzdata/zoneinfo/zone.tab \
+      python_modules/tzdata/zoneinfo/zone1970.tab \
+      python_modules/tzdata/zoneinfo/zonenow.tab \
+      python_modules/tzdata/zoneinfo/iso3166.tab \
+      python_modules/tzdata/zoneinfo/tzdata.zi \
+      python_modules/tzdata/zoneinfo/leapseconds
+
 echo
 echo "Done. python_modules/ ready for \`wrangler deploy\`."
 du -sh python_modules/

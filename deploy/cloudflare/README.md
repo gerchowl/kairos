@@ -42,7 +42,7 @@ SQLite is reached through a third backend in `kairos.dbconn` (see
    markupsafe/tzdata, pure-Python wheels for fastapi/starlette/jinja2/
    itsdangerous/python-multipart/email-validator, copies the `workers-py`
    SDK out of a host venv, and vendors the `kairos/` package. Produces
-   `./python_modules/` (~16 MB).
+   `./python_modules/` (~13 MB after trimming — see "Bundle trims" below).
 4. Generate a session secret and upload it as a Worker secret:
    ```sh
    openssl rand -hex 32 | npx wrangler@4 secret put SESSION_SECRET
@@ -83,6 +83,36 @@ See `wrangler.jsonc`. Important bits:
   Workers-runtime incompatibilities documented in `scripts/vendor.sh`.
 - **`python_modules/` is not committed.** Rebuild with `vendor.sh` on each
   deploy. A production path would build it in CI.
+
+## Bundle trims (keeping under the Workers 3 MB gzip cap)
+
+The Workers Free plan refuses any upload above **3072 KiB gzipped**. Our
+baseline vendored bundle was `12122.27 KiB raw / 3031.72 KiB gzip` — a
+41 KiB headroom, enough for a single new wheel version to tip the deploy
+over. `scripts/vendor.sh` therefore prunes files that are never imported
+or read in the Worker runtime; each exclusion carries an inline comment
+explaining why it is safe.
+
+After trimming: **`9501.02 KiB raw / 2475.50 KiB gzip`** (1088 modules),
+~556 KiB of headroom under the limit.
+
+Current exclusions (see `scripts/vendor.sh`):
+
+| Excluded path | Why safe |
+|---|---|
+| `python_modules/**/__pycache__/` | Host-CPython .pyc files; the wasm Pyodide runtime recompiles on import. |
+| `python_modules/kairos/static/*` | Same bytes live under `public/static/`, served by the ASSETS binding (`run_worker_first`). The empty dir + a 0-byte `.keep` keep `StaticFiles(check_dir=True)` happy. |
+| `python_modules/dns` + dnspython dist-info | Only imported by `email_validator.deliverability`, which is lazy and gated on `check_deliverability=True`. kairos always passes `False`. |
+| `python_modules/pydantic/v1` | pre-v2 shim; kairos/fastapi 0.115/starlette 0.41 never import `pydantic.v1` at runtime. |
+| `python_modules/pydantic/experimental` | opt-in beta (pipeline); not referenced anywhere. |
+| `python_modules/anyio/_backends/_trio.py` | asyncio is the only backend used; trio is lazy-loaded by `import_module`. |
+| `python_modules/anyio/pytest_plugin.py` | anyio's own test plugin; no runtime import. |
+| `python_modules/starlette/testclient.py`, `python_modules/fastapi/testclient.py` | Not imported by the app. |
+| `*.pyi` type stubs | Python ignores `.pyi` on import; the two top-level stubs describe modules the Workers runtime injects natively. |
+| `python_modules/tzdata/zoneinfo/{zone.tab,zone1970.tab,zonenow.tab,iso3166.tab,tzdata.zi,leapseconds}` | Used by the `tz` CLI / `tzselect`, not by Python's `zoneinfo` (which walks the tree directly). |
+
+Revert-if-it-breaks: undo the matching line in `scripts/vendor.sh`, then
+re-measure with `npx wrangler@4 deploy --dry-run --outdir /tmp/cfbuild`.
 
 ## What this spike proves and doesn't prove
 
