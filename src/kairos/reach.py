@@ -606,10 +606,27 @@ def guard_reach(request: Request, principal: dict) -> None:
     (`ETH/self-host/header/oidc`) deployment reaches every poll on the instance,
     which is the opposite of what the panel told the owner it would do.
     """
+    poll_id = required_poll_id(request)
+    guard_reach_id(principal, poll_id)
+
+
+def guard_reach_id(principal: dict, poll_id: str) -> None:
+    """Like `guard_reach`, but with the poll id passed directly.
+
+    Issue #83: the server-hosted MCP surface runs under a single `/mcp` route
+    whose path template names no poll id, so it cannot use the FastAPI
+    route-parameter path `guard_reach` reads. The id comes from the tool's own
+    arguments instead, and the same three properties still hold — same owner-
+    token branch, same `_is_owner_token_for` for the DB check, same `_refuse_key`
+    wording — so an env-key or owner-token caller on `/mcp` is authorised
+    identically to one on `/api`.
+
+    Factored rather than duplicated on purpose: three refusal paths that have
+    to agree byte-for-byte are two more than any review would catch drifting.
+    """
     is_owner_token = principal.get("source") == "owner_token"
     if policy() == OPEN and not is_owner_token:
         return
-    poll_id = required_poll_id(request)
     if not is_owner_token and key_reaches(principal, poll_id):
         return
     # Issue #82: an owner-minted token reaches polls its owner holds management

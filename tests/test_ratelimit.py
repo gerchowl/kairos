@@ -408,11 +408,15 @@ def test_public_and_web_routes_are_each_either_limited_or_explicitly_excluded():
         path = getattr(route, "path", None)
         if not path or not hasattr(route, "dependant"):
             continue
-        # The public router and the web router. /api/* is #51's surface and the
-        # static mount is not an endpoint; both are deliberately out of scope.
+        # The public router and the web router. /api/* is #51's surface,
+        # /mcp is #83's (its own in-handler `charge_request` against the
+        # same keyed `api` / `api_write` / `mail` / `mail_force` rules the
+        # REST surface uses — not a `rate_limit(...)` dependency this audit
+        # scans for), and the static mount is not an endpoint; all three
+        # are deliberately out of scope.
         if not path.startswith("/scheduler/p/") and not path.startswith("/scheduler/"):
             continue
-        if "/api/" in path or path.startswith("/scheduler/static"):
+        if "/api/" in path or path.startswith("/scheduler/static") or path == "/scheduler/mcp":
             continue
         for method in getattr(route, "methods", set()) - {"HEAD"}:
             seen.add((method, path))

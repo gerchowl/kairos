@@ -150,6 +150,12 @@ def create_app() -> FastAPI:
     # auth mode — the same pattern the OIDC and capability routers use.
     from kairos.panel import router as panel_router
     app.include_router(panel_router, include_in_schema=False)
+    # Issue #83: server-hosted MCP (streamable HTTP). Same bearer, same
+    # scopes and rate limits as `/api`; owned by `kairos.mcp_http`, which
+    # calls the REST endpoint functions directly so there is one body of
+    # business logic across transports.
+    from kairos.mcp_http import router as mcp_router
+    app.include_router(mcp_router, include_in_schema=False)
     # Registered in every mode and self-404ing when KAIROS_AUTH != oidc, so the
     # route table — which tests/test_ratelimit.py's route audit reads — does not
     # change shape with the auth mode.
@@ -195,6 +201,13 @@ def create_app() -> FastAPI:
 - [OpenAPI schema]({P}/api/openapi.json)
 - [Interactive docs]({P}/api/docs)
 - Auth: `Authorization: Bearer <KAIROS_API_KEY>` (ask the operator for the key)
+
+## MCP
+
+- Hosted endpoint: `POST {P}/mcp` (streamable HTTP, JSON-RPC 2.0, spec 2025-06-18)
+- Same bearer, same scopes, same budgets as the API. One URL to configure,
+  no local adapter to run. `claude mcp add --transport http kairos
+  https://<host>{P}/mcp --header "Authorization: Bearer kai_..."`.
 
 ## What am I allowed to do?
 

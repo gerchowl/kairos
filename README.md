@@ -411,6 +411,65 @@ credential — there is no account to attribute a token to — and the panel
 self-404s with a clear message. In `KAIROS_AUTH=none` there is no owner
 surface at all.
 
+### MCP
+
+Two ways to speak MCP to a Kairos instance:
+
+1. **Hosted (recommended for agents).** The app serves MCP at
+   `POST {PREFIX}/mcp` (streamable HTTP, stateless, spec `2025-06-18`).
+   Same bearer as `/api`, same scopes, same per-key and per-poll budgets.
+   One URL to configure; nothing to run locally.
+
+   Claude Code, Cursor, Zed and any client supporting the streamable-HTTP
+   transport add it as:
+
+   ```bash
+   claude mcp add --transport http kairos \
+       https://<host>/mcp \
+       --header "Authorization: Bearer kai_..."
+   ```
+
+   opencode's equivalent (`~/.config/opencode/config.json`):
+
+   ```json
+   {
+     "mcp": {
+       "kairos": {
+         "transport": { "type": "http", "url": "https://<host>/mcp" },
+         "headers": { "Authorization": "Bearer kai_..." }
+       }
+     }
+   }
+   ```
+
+   Replace `kai_...` with an owner-minted token from `/tokens` or a scoped
+   `KAIROS_API_KEYS` entry. The hosted endpoint rejects a request without a
+   Bearer with 401 + `WWW-Authenticate: Bearer`, there is no cookie or CSRF
+   path, and rate-limit refusals come back as JSON-RPC errors carrying
+   `retry_after` (same budgets as `/api`; `KAIROS_RATE_LIMIT=on` enables the
+   per-key tier). Set `KAIROS_MCP_ALLOWED_ORIGINS=<list>` on a browser-reachable
+   deployment to enforce the spec's DNS-rebinding guard.
+
+2. **Local stdio adapter** (unchanged). `mcp/kairos_mcp.py` is still shipped
+   and still runs over HTTPS against the REST API — useful when an agent has
+   no HTTP-MCP support or when you want a local wrapper over a remote
+   instance. Point your client at `uv run mcp/kairos_mcp.py` (stdio) with
+   `KAIROS_URL` and `KAIROS_API_KEY` in its environment.
+
+Both expose the same tool set: `whoami`, `list_polls`, `get_poll`,
+`create_poll`, `update_poll`, `delete_poll`, `add_dates`, `respond`, `invite`,
+`nudge`, `decide`, `email_decision`, `get_ics`, `get_contacts`. A tool a
+bearer lacks the scope for comes back as a tool result with `isError=true`
+naming the missing scope; a `scoped`-mode reach refusal names the owner the
+token acts for, so an agent reading the result can plan a re-mint rather than
+retry.
+
+> **On Cloudflare (hosted branch #79).** The in-app limiter above is layer 1,
+> authoritative; the entry Worker adds a layer 2 Rate Limiting binding keyed
+> on the bearer hash so a flood is rejected before a Durable Object wakes.
+> That lives in the Cloudflare branch — this deployment runs layer 1 alone,
+> which is sufficient for a single-process self-host.
+
 ### Mail budgets
 
 | Knob | Default | What it bounds | On exceeding it |
