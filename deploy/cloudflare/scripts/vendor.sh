@@ -58,7 +58,7 @@ cp .venv/lib/python*/site-packages/_pyodide_entrypoint_helper.pyi python_modules
 cp -r ../../src/kairos python_modules/
 
 # -- Download Emscripten + pure-Python wheels into a stash directory --
-WHEELS=$(mktemp -d)
+export WHEELS="$(mktemp -d)"
 .venv/bin/pip download --dest "$WHEELS" --no-deps --only-binary :all: \
     --platform pyodide_2025_0_wasm32 --platform any \
     --python-version "$PYTHON_VERSION" --implementation cp \

@@ -4,7 +4,7 @@ This directory is the time-boxed spike for #54 — Kairos running as a
 Cloudflare Python Worker whose Durable Object owns the SQLite storage.
 
 > **Status:** proof-of-concept, deployed live at
-> https://kairos.crs-hike.workers.dev. Not production. See the PR body for the
+> https://kairos.pet4pets.workers.dev. Not production. See the PR body for the
 > verdict and the gaps.
 
 ## Shape
