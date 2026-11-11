@@ -527,3 +527,285 @@ def test_without_an_allowlist_origin_is_not_consulted(client):
     r = client.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
                     headers={"Origin": "https://evil.example"})
     assert r.status_code == 200  # same as `/api` — Origin is only checked when configured
+
+
+# -- 7. Regression tests for PR #89 adversarial-review findings ------------
+#
+# Every test in this section was observed FAILING on head a7371f7 — the shape
+# of the finding first, and only then the fix. The grouping below mirrors the
+# finding order on the PR review.
+
+
+# -- 7a. Finding 1: rate-limit bypass via validation-first ordering --------
+
+
+def test_invalid_mcp_create_poll_still_charges_the_api_write_budget(monkeypatch, stubbed):
+    """MEDIUM: before the fix, `_dispatch` built the Pydantic body FIRST and
+    called `_authorize` after, so an invalid tool call (missing title, giant
+    slot list, nested-bracket body) returned a 400 isError without ever
+    charging the rate budget. REST does the opposite — `api_scope` charges
+    before body validation — and the two surfaces must answer identically.
+    Under 2/hour, three calls with no title must see the third one 429."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS",
+                        {**settings.DEFAULT_RATE_LIMITS, "api_write": (2, 3600)})
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    # Two malformed calls — charged, returned as tool errors.
+    for i in (1, 2):
+        _, env = call_tool(c, "create_poll", {}, id=i)
+        assert env.get("result", {}).get("isError") is True, env
+    # The third malformed call — budget exhausted. JSON-RPC rate-limit error.
+    _, env = call_tool(c, "create_poll", {}, id=3)
+    assert env.get("error", {}).get("code") == mcp_http.RATE_LIMITED_CODE, env
+    assert env["error"]["data"]["rule"] == "api_write"
+
+
+def test_rest_and_mcp_charge_the_same_budget_for_the_same_invalid_call(monkeypatch, stubbed):
+    """Parity: REST and MCP must charge the same rule for the same tool, and
+    at the same point in the chain. Interleave three REST calls and three
+    MCP calls against a 3/hour budget; the fourth attempt on the combined
+    stream must 429 regardless of which surface it lands on."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setattr(settings, "RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(settings, "RATE_LIMITS",
+                        {**settings.DEFAULT_RATE_LIMITS, "api_write": (3, 3600)})
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    # Two REST calls (422) and one MCP call (isError) consume the budget.
+    r1 = c.post("/scheduler/api/polls", json={})
+    assert r1.status_code == 422, r1.text
+    r2 = c.post("/scheduler/api/polls", json={})
+    assert r2.status_code == 422
+    _, env = call_tool(c, "create_poll", {}, id=1)
+    assert env["result"]["isError"] is True
+    # Fourth attempt — refused on whichever surface.
+    _, env = call_tool(c, "create_poll", {}, id=2)
+    assert env.get("error", {}).get("code") == mcp_http.RATE_LIMITED_CODE
+    r4 = c.post("/scheduler/api/polls", json={})
+    assert r4.status_code == 429, r4.text
+
+
+# -- 7b. Finding 2: argument coercion and REST/MCP parity ------------------
+
+
+def test_mcp_invite_required_false_string_coerces_to_false_like_rest(client, monkeypatch):
+    """`bool("false")` is True in Python. The old code wrote
+    `required=bool(params.get("required", True))`, so `required:"false"` on
+    the wire stored True — the opposite of what the caller asked for. The
+    fix uses `InviteCreate.model_validate(...)`, which coerces the string
+    exactly as REST's body parser does."""
+    captured: dict = {}
+
+    def fake(poll_id, body, request, user):
+        captured["body"] = body
+        return {"invites": []}
+
+    monkeypatch.setattr(api, "invite_endpoint", fake)
+    _, env = call_tool(client, "invite", {
+        "poll_id": "p1", "emails": ["a@x.ch"], "required": "false",
+    })
+    assert "result" in env, env
+    assert captured["body"].required is False, captured["body"]
+
+
+def test_mcp_nudge_force_false_string_does_not_charge_mail_force(client, monkeypatch):
+    """`bool("false")` is True, so the old `force=bool(params.get("force"))`
+    turned `force:"false"` into True and bypassed the 24h cooldown — a path
+    that also demanded `mail:force` scope and spent the tight `mail_force`
+    budget. Pydantic coerces the string to False correctly."""
+    captured: dict = {}
+
+    def fake(poll_id, body, request, user):
+        captured["body"] = body
+        return {"invited": 0}
+
+    monkeypatch.setattr(api, "nudge_endpoint", fake)
+    _, env = call_tool(client, "nudge", {
+        "poll_id": "p1", "force": "false",
+    })
+    assert "result" in env, env
+    assert captured["body"].force is False
+
+
+def test_mcp_add_dates_notify_false_string_does_not_require_mail_scope(monkeypatch, stubbed):
+    """`add_dates notify:"false"` used to coerce to True (bool of non-empty
+    string), which in turn demanded `mail:send` on top of `polls:write` —
+    a reader with a polls:write-only key got a 403 for a request they never
+    asked to mail. Pydantic coerces "false" to False so no mail:send check
+    is triggered."""
+    monkeypatch.setattr(settings, "API_KEYS", KEYRING)
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    captured: dict = {}
+
+    def fake(poll_id, body, request, user):
+        captured["body"] = body
+        return {"added": body.dates, "nudged": None}
+
+    monkeypatch.setattr(api, "add_slots_endpoint", fake)
+    c = _as(TestClient(main.app, base_url="https://testserver"), WRITER)
+    _, env = call_tool(c, "add_dates", {
+        "poll_id": "p1", "dates": ["2026-06-09"], "notify": "false",
+    })
+    assert "result" in env and "isError" not in env["result"], env
+    assert captured["body"].notify is False
+
+
+def test_mcp_invite_emails_dict_is_a_validation_error_not_a_key_list(client, monkeypatch):
+    """`list({"a": 1})` returns `["a"]`, so the old code happily sent an
+    invite to the KEY of the dict — not the intent. Pydantic refuses a dict
+    where a `list[str]` is required, so this reads as a 400 tool error."""
+    monkeypatch.setattr(api, "invite_endpoint",
+                        lambda *a, **k: pytest.fail("endpoint reached with invalid body"))
+    _, env = call_tool(client, "invite", {
+        "poll_id": "p1", "emails": {"evil@x.ch": 1},
+    })
+    assert env["result"].get("isError") is True, env
+    assert "400" in env["result"]["content"][0]["text"]
+    assert "emails" in env["result"]["content"][0]["text"]
+
+
+def test_rest_and_mcp_refuse_the_same_bad_args_for_invite(client, monkeypatch):
+    """Parity on argument validation: the REST route and the MCP tool must
+    refuse the same inputs and accept the same ones, because the dispatcher
+    now validates against the same Pydantic model."""
+    # Bad emails type — dict — refused on both.
+    r = client.post("/scheduler/api/polls/p1/invite", json={"emails": {"a": 1}})
+    assert r.status_code == 422, r.text
+    _, env = call_tool(client, "invite", {"poll_id": "p1", "emails": {"a": 1}})
+    assert env["result"]["isError"] is True
+
+
+# -- 7c. Finding 3: event-loop blocking ------------------------------------
+
+
+def test_mcp_tool_dispatch_runs_in_a_worker_thread_not_the_event_loop(client, monkeypatch):
+    """Finding 3: the endpoint used to be `async def` and called the whole
+    sync chain (SQLite, SMTP, slot expansion) on the event loop, starving
+    every concurrent request. The fix wraps auth + dispatch in
+    `run_in_threadpool` — which Starlette runs on a DIFFERENT thread from
+    the one the event loop is currently executing on. We detect that by
+    asking for the running loop from inside the tool: on the fixed version
+    the dispatch runs off-loop (so `asyncio.get_running_loop()` raises
+    `RuntimeError`); on the pre-fix async handler the dispatch runs ON the
+    loop and the call succeeds."""
+    import asyncio
+
+    seen: dict = {}
+
+    def spy(user):
+        try:
+            asyncio.get_running_loop()
+            seen["on_loop"] = True
+        except RuntimeError:
+            seen["on_loop"] = False
+        return {"scopes": [], "key_id": "k", "tier": None, "polls": [], "reach_policy": "open"}
+
+    monkeypatch.setattr(api, "whoami", spy)
+    r, _env = call_tool(client, "whoami")
+    assert r.status_code == 200
+    assert seen.get("on_loop") is False, (
+        "tool dispatch must run OFF the event loop (otherwise one slow call "
+        "stalls every concurrent request on the same instance)"
+    )
+
+
+# -- 7d. Finding 4: malformed args → plain-text 500 ------------------------
+
+
+def test_recursive_json_body_answers_with_a_parse_error_envelope(client):
+    """A 200 KiB nested-brackets body used to drive `json.loads` into a
+    RecursionError that bubbled out as a plain-text 500 — breaking the MCP
+    wire format a client reads. The body-size cap keeps most of these out
+    of the parser; the parser itself now catches RecursionError too."""
+    # Big but under the 1 MiB cap so this exercises the RecursionError path.
+    bomb = "[" * 100_000 + "]" * 100_000
+    r = client.post(MCP, content=bomb, headers={"Content-Type": "application/json"})
+    assert r.status_code == 200, r.text
+    env = r.json()
+    assert env["error"]["code"] == mcp_http.PARSE_ERROR
+
+
+def test_a_body_over_the_cap_is_413_with_a_parse_error_envelope(client):
+    """Oversized bodies were read into memory in full before parsing. The
+    cap refuses them at 413 with a JSON-RPC parse error envelope so an MCP
+    client's error handler still sees the protocol-level refusal."""
+    oversized = b'{"jsonrpc":"2.0","id":1,"method":"ping","x":"' + b"a" * (2 * 1024 * 1024) + b'"}'
+    r = client.post(MCP, content=oversized, headers={
+        "Content-Type": "application/json",
+        "Content-Length": str(len(oversized)),
+    })
+    assert r.status_code == 413
+    env = r.json()
+    assert env["error"]["code"] == mcp_http.PARSE_ERROR
+
+
+def test_a_tool_exception_becomes_an_isError_result_not_a_plain_500(client, monkeypatch):
+    """Finding 4 generic guard: if a tool raises an unexpected Exception
+    (not an HTTPException, not a ValidationError), the response must still
+    be a well-formed MCP envelope — not a plain-text 500 — so a client's
+    `result.isError` path keeps working."""
+    def boom(**kwargs):
+        raise RuntimeError("something went wrong")
+
+    monkeypatch.setattr(api, "whoami", boom)
+    r, env = call_tool(client, "whoami")
+    assert r.status_code == 200, r.text
+    assert env["result"]["isError"] is True
+    # The message must be generic — no traceback leak.
+    text = env["result"]["content"][0]["text"]
+    assert "500" in text
+    assert "something went wrong" not in text
+
+
+# -- 7e. Finding 5: protocol knobs -----------------------------------------
+
+
+def test_unsupported_mcp_protocol_version_header_is_400(client):
+    """Spec §4: a client that supplies MCP-Protocol-Version with an
+    unsupported value must be refused with 400."""
+    r = client.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                    headers={"MCP-Protocol-Version": "1999-01-01"})
+    assert r.status_code == 400
+    assert "Unsupported MCP-Protocol-Version" in r.text
+
+
+def test_supported_mcp_protocol_version_header_is_accepted(client):
+    """The current spec version and the previous widely-used revision are
+    both honoured — clients built against either must not be refused."""
+    for version in ("2025-06-18", "2025-03-26"):
+        r = client.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                        headers={"MCP-Protocol-Version": version})
+        assert r.status_code == 200, f"{version}: {r.text}"
+
+
+def test_a_jsonrpc_id_that_is_not_string_number_or_null_is_invalid(client):
+    """JSON-RPC 2.0 §4.1: id must be String, Number, or Null. A bool or an
+    object is an Invalid Request (not an Internal Error), because an id
+    that cannot be echoed back as the client sent it cannot correlate."""
+    for bad in (True, False, {"x": 1}, ["a"]):
+        r = client.post(MCP, json={"jsonrpc": "2.0", "id": bad, "method": "ping"})
+        assert r.status_code == 200
+        env = r.json()
+        assert env["error"]["code"] == mcp_http.INVALID_REQUEST, (bad, env)
+
+
+def test_origin_match_is_case_insensitive_and_trailing_slash_tolerant(monkeypatch, stubbed):
+    """Finding 5: before the fix, a bare-string compare refused
+    `https://CLAUDE.AI` or `https://claude.ai/` even when the operator had
+    listed `https://claude.ai`. The normaliser lowercases scheme/host and
+    strips a trailing slash, so all three forms match one allowlist entry."""
+    monkeypatch.setenv("KAIROS_API_KEY", KEY)
+    monkeypatch.setenv("KAIROS_MCP_ALLOWED_ORIGINS", "https://claude.ai")
+    c = TestClient(main.app, base_url="https://testserver",
+                   headers={"Authorization": f"Bearer {KEY}"})
+    for origin in ("https://claude.ai", "https://CLAUDE.AI",
+                   "https://claude.ai/", "HTTPS://claude.ai"):
+        r = c.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                   headers={"Origin": origin})
+        assert r.status_code == 200, f"{origin}: {r.text}"
+    # And one that should still be refused.
+    r = c.post(MCP, json={"jsonrpc": "2.0", "id": 1, "method": "ping"},
+               headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403

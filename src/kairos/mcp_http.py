@@ -24,12 +24,38 @@ reach-checked (per issues #63/#64) exactly as its REST counterpart is — and
 by *calling the same route function*, so there is one implementation of each
 business rule and the two surfaces cannot drift.
 
-**Tool call → REST route function.** `_call_rest` resolves rate / scope /
+**One dispatcher skeleton, charge-first.** The per-tool branches below used to
+build the Pydantic body FIRST and call `_authorize` afterwards, so an invalid
+call (a missing title, a slot list that expanded to a million rows) returned
+a 400 without ever incrementing the rate budget. REST does the opposite — the
+`api_scope` dependency charges its rule before the body parameter is
+validated — and the two surfaces have to answer identically on every budget
+question, or a rotated key can be spent on malformed requests. `_dispatch`
+now runs the four REST checks (charge, scope, reach, body) in that order, in
+one place, so every branch below is just "call the REST endpoint with the
+validated body" and no branch can forget any of them.
+
+**Tool call → REST route function.** The dispatcher resolves rate / scope /
 reach itself (because the FastAPI `Depends` is not reachable from a Python
-call), then calls the REST endpoint with `user=` already bound. A route's
-default `Depends(api_scope(...))` is only evaluated when FastAPI routes; a
-plain Python call with `user=principal` bypasses it, so the shared code path
-stays as it was and no REST test loses a byte.
+call), validates the arguments against the **same Pydantic model REST uses**
+(`PollCreate`, `InviteCreate`, `NudgeIn`, …) — so string "false" coerces to
+False exactly as it does on REST, a dict given where a list[str] is required
+is a validation error exactly as it is on REST, and no boolean / email /
+date type ever enters a tool body with a shape the REST endpoint would have
+refused. Then it calls the REST endpoint with `user=` already bound. A
+route's default `Depends(api_scope(...))` is only evaluated when FastAPI
+routes; a plain Python call with `user=principal` bypasses it, so the shared
+code path stays as it was and no REST test loses a byte.
+
+**Threadpool for the sync body.** `scoping.resolve` → `apitokens.resolve_token`
+opens the SQLite connection; `api.*_endpoint` performs the real DB write,
+the SMTP send, the slot expansion — all synchronous. An `async def` handler
+on the Starlette event loop would hold the loop for the duration of that
+work, starving every other concurrent request on the same instance. The
+endpoint is therefore the usual FastAPI sync-handler shape (`def`, which
+Starlette runs in its threadpool) so an arbitrary number of concurrent MCP
+calls do not serialise on one CPU; auth + dispatch run off the loop, exactly
+like every `/api` route already does.
 
 **Error mapping.** A scope refusal (`HTTPException(403)`), a reach refusal
 (the same), a 400 validation error and a 404 come back as MCP tool *results*
@@ -39,14 +65,29 @@ text, as it does when it talks to the stdio adapter. A rate-limit refusal
 (`RateLimited`) and a parse/invalid-request/method-not-found come back as
 JSON-RPC *errors* (`-32099` carrying `retry_after` for rate limit, the
 standard codes for the others) because those are protocol-level — the tool
-never ran. The split is the one the MCP spec names: tool-execution failures
-use `isError`, transport failures use error codes.
+never ran. **Any unexpected server-side exception** becomes a JSON-RPC
+`INTERNAL_ERROR` without details, logged server-side with a traceback, so no
+tool bug can produce a plain-text 500 (which breaks the MCP wire format).
+
+**Request size cap.** `Content-Length` over `MAX_BODY_BYTES` (default 1 MiB)
+is answered with a JSON-RPC parse error at HTTP 413 — a recursion-bomb body
+(200 KiB of `[[[[…]]]]`) cannot drive a RecursionError inside the JSON
+parser, because the parser never gets handed the bytes.
 
 **Origin validation.** The spec requires it to prevent DNS-rebinding attacks
 on local-bound servers. `KAIROS_MCP_ALLOWED_ORIGINS` lists allowed origins;
 unset means "no Origin header required and none rejected", which is the
 `/api` surface's existing behaviour (Kairos has no CORS today and nothing
-cross-origin reads this surface). A hosted deployment sets it.
+cross-origin reads this surface). A hosted deployment sets it. The caller's
+`Origin` header is normalised (lowercase scheme/host, trailing slash
+stripped) before comparison, so an allowlist entry `https://claude.ai` and
+an incoming header `https://CLAUDE.AI/` match.
+
+**MCP-Protocol-Version.** If the client sent a `MCP-Protocol-Version` header,
+it must be one this server supports (2025-06-18 and the three widely-used
+earlier revisions). An unsupported version is a 400, per spec, so a client
+built against a version this server does not understand fails loudly rather
+than falling back silently.
 
 **Rate-limiting layer 2 belongs elsewhere.** The hosted Cloudflare deployment
 also gets a Workers Rate Limiting binding in its entry Worker (`deploy/
@@ -54,20 +95,29 @@ cloudflare/entry.py`) keyed on the bearer hash, so a flood is rejected at
 the edge before a Durable Object wakes. That lives in the Cloudflare branch
 (#79) — this module owns the in-Kairos, authoritative layer: same limits as
 ``/api``, same `retry_after` the agent sees from the stdio adapter today.
+
+**Issue #70 (unbounded dates × grid) is a REST-side bug that this surface
+inherits for free.** Each MCP tool runs the REST endpoint body directly, so
+the size-cap fix #70 lands on `api.add_slots_endpoint` / `create_poll_endpoint`
+automatically covers this surface too — no second cap, no second review, no
+second place to drift from the one truth. The property that makes that
+true is `_dispatch`'s "call the REST function, don't reimplement": fix a
+ceiling once and both surfaces see it.
 """
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from kairos import api, reach, settings
 from kairos.ratelimit import RateLimited
-from kairos.scoping import DEFAULT_RULE_FOR_SCOPE, charge_request, enforce, resolve
+from kairos.scoping import DEFAULT_RULE_FOR_SCOPE, charge_request, enforce
 
 log = logging.getLogger("kairos.mcp_http")
 
@@ -79,6 +129,15 @@ log = logging.getLogger("kairos.mcp_http")
 # server names the version in the initialize response and in the
 # `MCP-Protocol-Version` header of every response, as the spec requires.
 PROTOCOL_VERSION = "2025-06-18"
+
+# Revisions this server will honour on an incoming `MCP-Protocol-Version`
+# request header. The spec (2025-06-18 §4) says a client that supplies the
+# header with an unsupported value must be refused with 400. Older clients
+# that omit the header still work; this list is the union of revisions whose
+# request *shape* this module accepts without translation.
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({
+    "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07",
+})
 
 SERVER_INFO = {"name": "kairos", "version": "1.0"}
 
@@ -92,8 +151,37 @@ INTERNAL_ERROR = -32603
 # refused" from "internal error" and carries `retry_after` in `error.data`.
 RATE_LIMITED_CODE = -32099
 
+# Hard cap on request body size. 1 MiB is far past any legitimate tool call —
+# `create_poll` with a full week's worth of time slots is well under 50 KiB —
+# so refusing over this is free. The cap exists because a 200 KiB of nested
+# JSON brackets drives `json.loads` into a RecursionError without any of the
+# handlers below getting to run; capping `Content-Length` before the body is
+# read keeps that payload from ever reaching the parser.
+MAX_BODY_BYTES = 1 * 1024 * 1024
+
 
 # -- Allowed-origins policy -------------------------------------------------
+
+
+def _normalise_origin(value: str) -> str:
+    """Normalise an Origin for comparison.
+
+    An `Origin` header carries scheme + host + optional port, as defined by
+    RFC 6454. The spec's own examples (`https://claude.ai`) are all-lowercase
+    and trailing-slash free, but a browser's `Origin` header is case-
+    insensitive on scheme and host and some agents send a trailing `/` by
+    habit — a string equality check would then refuse a legitimate request
+    for the shape of its casing, which is the kind of fragile allowlist
+    #51's module docstring complained about on rate-limit rules. One
+    normaliser, one place, read on both sides of the check.
+    """
+    value = value.strip()
+    if value.endswith("/"):
+        value = value[:-1]
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        return value.lower()
+    return f"{scheme.lower()}://{rest.lower()}"
 
 
 def _allowed_origins() -> set[str]:
@@ -102,11 +190,13 @@ def _allowed_origins() -> set[str]:
     Read at call time rather than captured at import, for the same reason
     every other knob in this app is: an operator who sets the variable, or a
     test using `monkeypatch.setenv`, must see it through the same door.
+    Each entry is normalised with `_normalise_origin` so the allowlist and
+    the incoming header are compared in the same shape.
     """
     import os
 
     raw = os.environ.get("KAIROS_MCP_ALLOWED_ORIGINS", "")
-    return {o.strip() for o in raw.split(",") if o.strip()}
+    return {_normalise_origin(o) for o in raw.split(",") if o.strip()}
 
 
 def _validate_origin(request: Request) -> None:
@@ -124,23 +214,123 @@ def _validate_origin(request: Request) -> None:
     origin = request.headers.get("origin")
     if origin is None:
         return
-    if origin not in allowed:
+    if _normalise_origin(origin) not in allowed:
         log.warning("refused Origin %r (allowed: %s)", origin, ",".join(sorted(allowed)))
         raise HTTPException(403, "Origin not allowed")
+
+
+def _validate_protocol_version(request: Request) -> None:
+    """Raise `HTTPException(400)` on an unsupported `MCP-Protocol-Version`.
+
+    Spec 2025-06-18 §4: a client that carries the header must use a version
+    the server supports, else it is a protocol-level refusal (not a tool
+    error). Clients that omit the header are still answered — the valid-
+    shape superset is unchanged on the request side, so older clients that
+    predate this header interoperate.
+    """
+    advertised = request.headers.get("mcp-protocol-version")
+    if advertised is None:
+        return
+    if advertised not in SUPPORTED_PROTOCOL_VERSIONS:
+        log.warning("refused MCP-Protocol-Version %r", advertised)
+        raise HTTPException(
+            400,
+            f"Unsupported MCP-Protocol-Version {advertised!r}; this server speaks "
+            f"{', '.join(sorted(SUPPORTED_PROTOCOL_VERSIONS))}",
+        )
 
 
 # -- Tool registry ----------------------------------------------------------
 
 
-# One entry per tool. The implementation calls the REST endpoint function, so
-# business logic lives in exactly one place. `scope`/`rule`/`reach` describe
-# what the dispatcher must enforce *before* the call; the REST function still
-# performs any route-internal checks (e.g. `add_slots_endpoint` enforces
-# `mail:send` on top when `notify=True`), so there is no duplication of rule
-# in this file either.
+# One entry per tool. Each tool declares:
+#
+#   `scope` / `rule` / `reach`   — what the dispatcher must enforce *before*
+#                                  the call, in the REST order (charge first,
+#                                  scope second, reach third).
+#   `model`                      — the Pydantic request model REST uses for
+#                                  this tool's body. `None` means the tool
+#                                  takes no body (whoami, list_polls, the
+#                                  single-poll-id reads/deletes). Using the
+#                                  REST model is how finding 2's coercion
+#                                  bugs stay fixed: pydantic coerces "false"
+#                                  to False, refuses a dict where a list[str]
+#                                  is required, and does so with the exact
+#                                  same rules the REST surface already pins
+#                                  down.
+#   `handler`                    — the small callable that runs the already-
+#                                  validated body against the REST endpoint.
+#                                  Because the handler sees only the
+#                                  validated poll_id and body, no branch can
+#                                  forget to authenticate or charge.
 #
 # Tool names and semantics match ``mcp/kairos_mcp.py`` — a test asserts the
 # parity so the two surfaces cannot drift (one hosted, one stdio).
+
+
+def _whoami(poll_id, body, principal, request):
+    return _ok(api.whoami(user=principal))
+
+
+def _list_polls(poll_id, body, principal, request):
+    return _ok(api.list_polls_endpoint(request=request, user=principal))
+
+
+def _get_poll(poll_id, body, principal, request):
+    return _ok(api.get_poll_endpoint(poll_id, request=request, user=principal))
+
+
+def _create_poll(poll_id, body, principal, request):
+    return _ok(api.create_poll_endpoint(body, request=request, user=principal))
+
+
+def _update_poll(poll_id, body, principal, request):
+    return _ok(api.update_poll_endpoint(poll_id, body, request=request, user=principal))
+
+
+def _add_dates(poll_id, body, principal, request):
+    return _ok(api.add_slots_endpoint(poll_id, body, request=request, user=principal))
+
+
+def _respond(poll_id, body, principal, request):
+    return _ok(api.respond_endpoint(poll_id, body, user=principal))
+
+
+def _invite(poll_id, body, principal, request):
+    return _ok(api.invite_endpoint(poll_id, body, request=request, user=principal))
+
+
+def _nudge(poll_id, body, principal, request):
+    return _ok(api.nudge_endpoint(poll_id, body, request=request, user=principal))
+
+
+def _decide(poll_id, body, principal, request):
+    return _ok(api.decide_endpoint(poll_id, body, request=request, user=principal))
+
+
+def _email_decision(poll_id, body, principal, request):
+    return _ok(api.email_decision_endpoint(poll_id, body, request=request, user=principal))
+
+
+def _get_ics(poll_id, body, principal, request):
+    # ics_response returns a Response whose body is the text/calendar string;
+    # the stdio adapter returns the string directly, so do the same here —
+    # one tool, one shape across transports.
+    resp = api.event_ics_endpoint(poll_id, request=request, user=principal)
+    if isinstance(resp, Response):
+        text = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
+        return {"content": _text_content(text)}
+    return _ok(resp)
+
+
+def _get_contacts(poll_id, body, principal, request):
+    return _ok(api.contacts_endpoint(poll_id, user=principal))
+
+
+def _delete_poll(poll_id, body, principal, request):
+    return _ok(api.delete_poll_endpoint(poll_id, user=principal))
+
+
 TOOLS: tuple[dict[str, Any], ...] = (
     {
         "name": "whoami",
@@ -155,6 +345,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": None,
         "rule": "api",
         "reach": False,
+        "model": None,
+        "handler": _whoami,
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -163,6 +355,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:read",
         "rule": "api",
         "reach": False,
+        "model": None,
+        "handler": _list_polls,
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -174,6 +368,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:read",
         "rule": "api",
         "reach": True,
+        "model": None,
+        "handler": _get_poll,
         "input_schema": {
             "type": "object",
             "properties": {"poll_id": {"type": "string"}},
@@ -193,6 +389,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:write",
         "rule": "api_write",
         "reach": False,
+        "model": api.PollCreate,
+        "handler": _create_poll,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -215,6 +413,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:write",
         "rule": "api_write",
         "reach": True,
+        "model": api.PollUpdate,
+        "handler": _update_poll,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -239,6 +439,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:write",
         "rule": "api_write",
         "reach": True,
+        "model": api.SlotsAdd,
+        "handler": _add_dates,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -258,6 +460,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "respond",
         "rule": "api_write",
         "reach": True,
+        "model": api.ResponseCreate,
+        "handler": _respond,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -281,6 +485,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "mail:send",
         "rule": "mail",
         "reach": True,
+        "model": api.InviteCreate,
+        "handler": _invite,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -303,6 +509,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "mail:send",
         "rule": "mail",
         "reach": True,
+        "model": api.NudgeIn,
+        "handler": _nudge,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -322,6 +530,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:write",
         "rule": "api_write",
         "reach": True,
+        "model": api.DecideIn,
+        "handler": _decide,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -342,6 +552,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "mail:send",
         "rule": "mail",
         "reach": True,
+        "model": api.MailIn,
+        "handler": _email_decision,
         "input_schema": {
             "type": "object",
             "properties": {
@@ -357,6 +569,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:read",
         "rule": "api",
         "reach": True,
+        "model": None,
+        "handler": _get_ics,
         "input_schema": {
             "type": "object",
             "properties": {"poll_id": {"type": "string"}},
@@ -370,6 +584,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:read",
         "rule": "api",
         "reach": True,
+        "model": None,
+        "handler": _get_contacts,
         "input_schema": {
             "type": "object",
             "properties": {"poll_id": {"type": "string"}},
@@ -383,6 +599,8 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "scope": "polls:write",
         "rule": "api_write",
         "reach": True,
+        "model": None,
+        "handler": _delete_poll,
         "input_schema": {
             "type": "object",
             "properties": {"poll_id": {"type": "string"}},
@@ -416,6 +634,11 @@ def _json_text(value: Any) -> str:
     return json.dumps(jsonable_encoder(value), ensure_ascii=False)
 
 
+def _ok(value: Any) -> dict[str, Any]:
+    """The success shape: a single text content with the JSON-encoded result."""
+    return {"content": _text_content(_json_text(value))}
+
+
 def _tool_error(message: str) -> dict[str, Any]:
     """An `isError: true` tool result. For scope / reach / validation refusals
     that the caller can act on (rename, mint, fix the args)."""
@@ -436,16 +659,17 @@ def _authorize(principal: dict, scope: str | None, rule: str | None, *,
         reach.guard_reach_id(principal, poll_id)
 
 
-def _call_rest(fn, principal: dict, *args, **kwargs) -> Any:
-    """Call a REST endpoint function with `user=principal` bound.
-
-    The endpoint's parameter default is `Depends(api_scope(...))`; FastAPI
-    evaluates it during routing, but a plain Python call with `user=` passes
-    through the Depends sentinel and runs the body against the bound
-    principal. Nothing in the endpoint body consults the Depends object
-    itself, so the behaviour is identical to the REST path.
+def _validate_body(tool: dict, params: dict) -> BaseModel | None:
+    """Validate `params` (minus `poll_id`, which is a path parameter on REST)
+    against the tool's request model. Returns the parsed model, or None when
+    the tool has no body. Any `ValidationError` from the Pydantic model
+    propagates — `_run_tool` turns it into an `isError` tool result.
     """
-    return fn(*args, user=principal, **kwargs)
+    model = tool.get("model")
+    if model is None:
+        return None
+    body = {k: v for k, v in params.items() if k != "poll_id"}
+    return model.model_validate(body)
 
 
 def _run_tool(name: str, params: dict, principal: dict, request: Request) -> dict[str, Any]:
@@ -454,175 +678,58 @@ def _run_tool(name: str, params: dict, principal: dict, request: Request) -> dic
     Returns the tool-result dict (`content` + optional `isError`). Raises
     `RateLimited` on a budget refusal (the caller turns that into a JSON-RPC
     error) — every other HTTP failure comes back as an `isError=true` result.
+
+    Order is load-bearing: charge first (so invalid calls still spend the
+    budget, matching REST exactly), then scope, then reach, then body —
+    which is the same order the REST dependency chain runs in.
     """
     tool = _TOOL_INDEX.get(name)
     if tool is None:
         return _tool_error(
             f"Unknown tool {name!r}. Call tools/list to see what this bearer may use."
         )
-    # Validate the input against the tool's pydantic model (where one exists)
-    # or just check required keys. Validation errors are `isError=true` tool
-    # results, not JSON-RPC errors: the request *reached* a tool, so the
-    # failure is tool-execution, not transport.
+    if not isinstance(params, dict):
+        return _tool_error("400: arguments must be an object")
     try:
-        return _dispatch(tool, params, principal, request)
+        # (1) charge + scope: cheap checks that must run before any arg
+        # parsing, or a malformed call would silently skip the rate budget.
+        # (2) reach: needs the poll_id, which must be present and a string.
+        #     A missing poll_id is a 400 isError result (post-charge), same
+        #     as on REST where it would be a 422 from the path parameter.
+        poll_id = None
+        if tool["reach"]:
+            poll_id = params.get("poll_id")
+            if not isinstance(poll_id, str) or not poll_id:
+                # Charge still happens — the budget punishes the loop that
+                # builds malformed calls, not just well-formed ones.
+                _authorize(principal, tool["scope"], tool["rule"])
+                return _tool_error("400: missing argument: poll_id")
+        _authorize(principal, tool["scope"], tool["rule"], poll_id=poll_id)
+        # (3) body: same Pydantic model REST uses, so coercion matches.
+        body = _validate_body(tool, params)
+        # (4) call the REST function.
+        return tool["handler"](poll_id, body, principal, request)
+    except RateLimited:
+        # Protocol-level: let the JSON-RPC layer turn this into -32099.
+        raise
     except HTTPException as exc:
-        # Scope/reach/validation refusals from `enforce`, `guard_reach_id`,
-        # the REST endpoint's own validation (`timezone`, `mode`, slot id,
-        # recipient list cap), the `require_sendable` gate, `_get_or_404`.
-        # All of these are *actionable* by the caller, so they become tool
-        # results naming the detail, not JSON-RPC errors.
         detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
         return _tool_error(f"{exc.status_code}: {detail}")
     except ValidationError as exc:
         # Pydantic model construction failed — wrong types / missing fields.
-        # Same reasoning as HTTPException(400) above.
-        return _tool_error(f"400: {exc.errors()}")
-
-
-def _dispatch(tool: dict, params: dict, principal: dict, request: Request) -> dict[str, Any]:
-    """Call the REST function the tool wraps. Separate so `_run_tool` can
-    catch and translate without the authorize/call shape getting lost."""
-    name = tool["name"]
-    scope, rule = tool["scope"], tool["rule"]
-
-    if name == "whoami":
-        _authorize(principal, scope, rule)
-        return {"content": _text_content(_json_text(api.whoami(user=principal)))}
-
-    if name == "list_polls":
-        _authorize(principal, scope, rule)
-        return {"content": _text_content(_json_text(
-            api.list_polls_endpoint(request=request, user=principal)
-        ))}
-
-    if name == "get_poll":
-        poll_id = _required(params, "poll_id")
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.get_poll_endpoint(poll_id, request=request, user=principal)
-        ))}
-
-    if name == "create_poll":
-        body = api.PollCreate(
-            title=params.get("title"),
-            description=params.get("description"),
-            mode=params.get("mode"),
-            timezone=params.get("timezone", "Europe/Zurich"),
-            slots=[api.SlotIn(**s) for s in params.get("slots", [])],
-            creator=params.get("creator"),
-            creator_email=params.get("creator_email"),
-        )
-        _authorize(principal, scope, rule)
-        result = api.create_poll_endpoint(body, request=request, user=principal)
-        return {"content": _text_content(_json_text(result))}
-
-    if name == "update_poll":
-        poll_id = _required(params, "poll_id")
-        body = api.PollUpdate(
-            title=params.get("title"),
-            description=params.get("description"),
-            timezone=params.get("timezone"),
-            status=params.get("status"),
-        )
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.update_poll_endpoint(poll_id, body, request=request, user=principal)
-        ))}
-
-    if name == "add_dates":
-        poll_id = _required(params, "poll_id")
-        body = api.SlotsAdd(
-            dates=params.get("dates", []),
-            notify=bool(params.get("notify", False)),
-        )
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.add_slots_endpoint(poll_id, body, request=request, user=principal)
-        ))}
-
-    if name == "respond":
-        poll_id = _required(params, "poll_id")
-        body = api.ResponseCreate(
-            name=params.get("name", ""),
-            email=params.get("email"),
-            availabilities=params.get("availabilities") or {},
-        )
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.respond_endpoint(poll_id, body, user=principal)
-        ))}
-
-    if name == "invite":
-        poll_id = _required(params, "poll_id")
-        body = api.InviteCreate(
-            emails=list(params.get("emails") or []),
-            required=bool(params.get("required", True)),
-        )
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.invite_endpoint(poll_id, body, request=request, user=principal)
-        ))}
-
-    if name == "nudge":
-        poll_id = _required(params, "poll_id")
-        emails_arg = params.get("emails")
-        body = api.NudgeIn(
-            emails=list(emails_arg) if emails_arg is not None else None,
-            force=bool(params.get("force", False)),
-        )
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.nudge_endpoint(poll_id, body, request=request, user=principal)
-        ))}
-
-    if name == "decide":
-        poll_id = _required(params, "poll_id")
-        slot_id = _required(params, "slot_id")
-        body = api.DecideIn(slot_id=slot_id)
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.decide_endpoint(poll_id, body, request=request, user=principal)
-        ))}
-
-    if name == "email_decision":
-        poll_id = _required(params, "poll_id")
-        body = api.MailIn(note=params.get("note", "") or "")
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.email_decision_endpoint(poll_id, body, request=request, user=principal)
-        ))}
-
-    if name == "get_ics":
-        poll_id = _required(params, "poll_id")
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        resp = api.event_ics_endpoint(poll_id, request=request, user=principal)
-        # ics_response returns a Response whose body is the text/calendar
-        # string; the stdio adapter returns the string directly, so do the
-        # same here — one tool, one shape across transports.
-        if isinstance(resp, Response):
-            text = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else str(resp.body)
-            return {"content": _text_content(text)}
-        return {"content": _text_content(_json_text(resp))}
-
-    if name == "get_contacts":
-        poll_id = _required(params, "poll_id")
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.contacts_endpoint(poll_id, user=principal)
-        ))}
-
-    if name == "delete_poll":
-        poll_id = _required(params, "poll_id")
-        _authorize(principal, scope, rule, poll_id=poll_id)
-        return {"content": _text_content(_json_text(
-            api.delete_poll_endpoint(poll_id, user=principal)
-        ))}
-
-    # Unreachable: every tool in TOOLS has a branch above. Leaving a loud
-    # failure rather than falling back silently, in case a tool is added
-    # without being wired here.
-    raise HTTPException(500, f"Tool {name!r} wired into the registry but not into the dispatcher")
+        # Concise message (first error only) so a tool result stays readable
+        # for an agent; the full list goes to the server log.
+        errors = exc.errors()
+        log.info("mcp %s: argument validation failed: %s", name, errors)
+        first = errors[0] if errors else {}
+        loc = ".".join(str(p) for p in first.get("loc", ())) or "body"
+        return _tool_error(f"400: invalid argument {loc}: {first.get('msg', 'validation error')}")
+    except Exception:
+        # Any other exception is an internal bug, not something the caller
+        # can act on. Log the traceback server-side and return a tool-level
+        # internal error without leaking details.
+        log.exception("mcp tool %r raised", name)
+        return _tool_error("500: internal error")
 
 
 def _required(params: dict, key: str) -> Any:
@@ -630,6 +737,9 @@ def _required(params: dict, key: str) -> Any:
     into a tool-error result. The REST surface answers 422 for a missing
     field; this surface answers one 400 in a text content, because an MCP
     client reads `content[0].text`, not a Pydantic validation structure.
+
+    Kept for callers outside `_run_tool` (none remain in-tree today); the
+    dispatcher's own poll_id extraction is in `_run_tool`.
     """
     value = params.get(key)
     if value is None or value == "":
@@ -720,7 +830,22 @@ def _handle_method(method: str, params: Any, request_id: Any, principal: dict | 
     return _jsonrpc_error(METHOD_NOT_FOUND, f"Unknown method: {method}", request_id)
 
 
-def _validate_envelope(message: Any, allow_notification: bool = True) -> tuple[bool, dict | None]:
+def _valid_jsonrpc_id(value: Any) -> bool:
+    """True when `value` is one of the three JSON-RPC 2.0 id types.
+
+    The spec §4.1 requires an id that is a String, Number, or Null; anything
+    else is an Invalid Request. A bool is a Number subclass in Python, so it
+    is excluded explicitly — `True` is not a legitimate correlation id even
+    though `isinstance(True, int)` holds.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (str, int, float))
+
+
+def _validate_envelope(message: Any) -> tuple[bool, dict | None]:
     """Is this a well-formed JSON-RPC 2.0 request/notification?
 
     Returns (ok, error_response). The error response is a complete JSON-RPC
@@ -733,6 +858,11 @@ def _validate_envelope(message: Any, allow_notification: bool = True) -> tuple[b
     method = message.get("method")
     if not isinstance(method, str) or not method:
         return False, _jsonrpc_error(INVALID_REQUEST, "method is required", message.get("id"))
+    # id (when present) must be string, number or null — bool excluded.
+    # Spec: §4.1. A list/dict id would silently correlate as whatever Python
+    # serialises it to, so refuse at the envelope rather than deeper.
+    if "id" in message and not _valid_jsonrpc_id(message["id"]):
+        return False, _jsonrpc_error(INVALID_REQUEST, "id must be string, number, or null")
     return True, None
 
 
@@ -750,58 +880,145 @@ def _response_headers(extra: dict[str, str] | None = None) -> dict[str, str]:
     return headers
 
 
+async def _read_body_capped(request: Request) -> bytes:
+    """Read the request body, refusing anything over `MAX_BODY_BYTES`.
+
+    Reads Content-Length first when present; otherwise streams into a buffer
+    with the same cap. Raises `HTTPException(413)` so the caller returns a
+    parse error envelope at HTTP 413 without ever handing the bytes to
+    `json.loads` — a nested-brackets recursion bomb cannot reach the parser.
+    """
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > MAX_BODY_BYTES:
+                raise HTTPException(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+        except ValueError:
+            # A malformed Content-Length is a client bug; let the stream
+            # read decide, with the same cap.
+            pass
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > MAX_BODY_BYTES:
+            raise HTTPException(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+    return bytes(buf)
+
+
+def _parse_body(raw: bytes) -> tuple[Any, dict | None]:
+    """Parse the JSON body. Returns (message, error) — exactly one is set.
+
+    `error` is a full JSON-RPC envelope. `RecursionError` is explicitly
+    handled because a deeply-nested brackets payload drives `json.loads`
+    into one; the body-size cap makes this rare, but a hostile client can
+    still send 999 nested `{...}` inside the cap. `ValueError` catches every
+    other parse pathology.
+    """
+    try:
+        return json.loads(raw) if raw else None, None
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        return None, _jsonrpc_error(PARSE_ERROR, f"Parse error: {exc}")
+
+
+def _authenticate(request: Request) -> tuple[dict | None, Response | None]:
+    """Resolve the bearer, or return the 401 response.
+
+    Factored out so it can run inside the threadpool wrapper — the SQLite
+    read inside `resolve_token` is synchronous.
+    """
+    # `scoping.resolve` is imported inside the function to let a test (or a
+    # future refactor) monkeypatch the symbol on `kairos.scoping`; module-
+    # level `from … import resolve` would capture the import-time binding.
+    from kairos.scoping import resolve
+
+    try:
+        principal = resolve(request)
+    except HTTPException as exc:
+        headers = _response_headers({"WWW-Authenticate": "Bearer"})
+        return None, JSONResponse(
+            {"detail": exc.detail}, status_code=exc.status_code, headers=headers,
+        )
+    return principal, None
+
+
+def _dispatch_sync(message: Any, principal: dict, request: Request) -> Response:
+    """The rest of the handler, after body read and parse.
+
+    Runs in the Starlette threadpool so the event loop is not held for the
+    duration of the DB/SMTP work inside `_handle_method`. Any exception
+    here (other than the ones `_run_tool` already turns into tool errors) is
+    an internal error: logged, and answered with a JSON-RPC internal error
+    envelope rather than a plain-text 500 (which would break the MCP wire
+    format a client reads).
+    """
+    try:
+        if isinstance(message, list):
+            # Batching removed in spec 2025-06-18. A JSON array body is invalid.
+            return _rpc_response(_jsonrpc_error(
+                INVALID_REQUEST,
+                "Batch requests are not supported in MCP spec 2025-06-18; send one message",
+            ))
+        ok, error = _validate_envelope(message)
+        if not ok:
+            return _rpc_response(error)
+        response = _handle_method(
+            message["method"], message.get("params") or {}, message.get("id"),
+            principal, request,
+        )
+        if response is None:
+            return Response(status_code=202, headers=_response_headers())
+        return _rpc_response(response)
+    except Exception:
+        log.exception("mcp dispatch raised")
+        request_id = message.get("id") if isinstance(message, dict) else None
+        return _rpc_response(_jsonrpc_error(INTERNAL_ERROR, "internal error", request_id))
+
+
 @router.post("/mcp", include_in_schema=False)
 async def mcp_post(request: Request) -> Response:
     """Streamable HTTP endpoint. One JSON-RPC message in, one out (or 202 for
     a notification). See the module docstring for the authentication,
     rate-limiting and scope/reach model this applies.
+
+    This endpoint is `async def` only so it can `await` the body read; the
+    real work (auth, dispatch, DB, SMTP, the Pydantic validation) happens
+    inside `run_in_threadpool` so one slow tool call cannot starve every
+    concurrent request on the same instance.
     """
     try:
         _validate_origin(request)
+        _validate_protocol_version(request)
     except HTTPException as exc:
         return JSONResponse(
             {"detail": exc.detail}, status_code=exc.status_code, headers=_response_headers(),
         )
 
-    # Auth — same bearer, same `resolve` function as `/api`, same 401 wording
-    # as `require_api_key`. One implementation of "is this bearer live?"; no
-    # second path that could forget that revoked means revoked.
+    # Body first, with a hard cap: a recursion-bomb payload must not reach
+    # the JSON parser. 413 carries a JSON-RPC parse error envelope so an
+    # agent reading `error.code` sees a protocol-level refusal, not an HTML
+    # body (which it would misparse).
     try:
-        principal = resolve(request)
+        raw = await _read_body_capped(request)
     except HTTPException as exc:
-        headers = _response_headers({"WWW-Authenticate": "Bearer"})
         return JSONResponse(
-            {"detail": exc.detail}, status_code=exc.status_code, headers=headers,
+            _jsonrpc_error(PARSE_ERROR, exc.detail),
+            status_code=exc.status_code, headers=_response_headers(),
         )
 
-    # Parse JSON. A malformed body is parse_error at 200 (the JSON-RPC wire
-    # spec puts the status in the envelope, not the HTTP status) because a
-    # 400 here would hide the JSON-RPC error code an MCP client reads first.
-    try:
-        raw = await request.body()
-        message = json.loads(raw) if raw else None
-    except json.JSONDecodeError as exc:
-        return _rpc_response(_jsonrpc_error(PARSE_ERROR, f"Parse error: {exc.msg}"))
+    message, parse_error = _parse_body(raw)
+    if parse_error is not None:
+        return _rpc_response(parse_error)
 
-    # Batching removed in spec 2025-06-18. A JSON array body is invalid.
-    if isinstance(message, list):
-        return _rpc_response(_jsonrpc_error(
-            INVALID_REQUEST,
-            "Batch requests are not supported in MCP spec 2025-06-18; send one message",
-        ))
+    # Auth + dispatch run off the event loop. Both are synchronous (SQLite
+    # for auth, SQLite/SMTP/slot-expansion for dispatch), so running them
+    # on the loop would serialise every concurrent MCP request through one
+    # worker. `run_in_threadpool` is the same mechanism FastAPI uses for a
+    # sync `def` route, so the behaviour matches `/api` exactly.
+    principal, failure = await run_in_threadpool(_authenticate, request)
+    if failure is not None:
+        return failure
 
-    ok, error = _validate_envelope(message)
-    if not ok:
-        return _rpc_response(error)
-
-    response = _handle_method(
-        message["method"], message.get("params") or {}, message.get("id"),
-        principal, request,
-    )
-    if response is None:
-        # Notification: spec says 202 Accepted with empty body.
-        return Response(status_code=202, headers=_response_headers())
-    return _rpc_response(response)
+    return await run_in_threadpool(_dispatch_sync, message, principal, request)
 
 
 @router.get("/mcp", include_in_schema=False)
@@ -814,3 +1031,11 @@ async def mcp_other() -> Response:
 
 def _rpc_response(envelope: dict) -> Response:
     return JSONResponse(envelope, status_code=200, headers=_response_headers())
+
+
+# -- Type hint for the handler signature ------------------------------------
+# One handler shape: (poll_id, body, principal, request) -> tool-result dict.
+# Kept at the bottom so the handlers themselves read top-to-bottom like the
+# tool registry does; this is only here for a static type checker and for a
+# code reader looking at a single handler to know what it is called with.
+_Handler = Callable[[str | None, BaseModel | None, dict, Request], dict[str, Any]]

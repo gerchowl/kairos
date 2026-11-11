@@ -447,8 +447,20 @@ Two ways to speak MCP to a Kairos instance:
    Bearer with 401 + `WWW-Authenticate: Bearer`, there is no cookie or CSRF
    path, and rate-limit refusals come back as JSON-RPC errors carrying
    `retry_after` (same budgets as `/api`; `KAIROS_RATE_LIMIT=on` enables the
-   per-key tier). Set `KAIROS_MCP_ALLOWED_ORIGINS=<list>` on a browser-reachable
-   deployment to enforce the spec's DNS-rebinding guard.
+   per-key tier).
+
+   **Origin validation.** `KAIROS_MCP_ALLOWED_ORIGINS` is a comma-separated
+   allowlist of origins (e.g. `https://claude.ai,https://cursor.so`) that
+   enforces the MCP spec's DNS-rebinding guard. When set, a request whose
+   `Origin` header is not on the list is refused with 403; a request with
+   no `Origin` header (curl, `claude mcp`, the stdio adapter) is accepted.
+   Comparison is case-insensitive on scheme and host and tolerates a
+   trailing slash, so one entry covers the shapes a browser actually sends.
+   Unset means "no Origin check runs", which matches `/api`'s behaviour; set
+   it on any deployment that a browser can reach directly. `MCP-Protocol-
+   Version` request headers that name an unsupported revision are 400s, per
+   spec — the server speaks `2025-06-18` and the three previous widely-used
+   revisions, so clients that omit the header still interoperate.
 
 2. **Local stdio adapter** (unchanged). `mcp/kairos_mcp.py` is still shipped
    and still runs over HTTPS against the REST API — useful when an agent has
