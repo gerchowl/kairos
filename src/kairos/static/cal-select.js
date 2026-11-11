@@ -35,8 +35,6 @@
     var start = getMon(today);
     var limit = new Date(today); limit.setFullYear(limit.getFullYear() + MAX_YEARS_AHEAD);
     var monthRows = {};
-    var loadedYears = new Set();
-    var loadedMonths = new Set();
 
     function lastShown() {
         var d = new Date(start); d.setDate(d.getDate() + totalWeeks * 7 - 1); return d;
@@ -56,7 +54,7 @@
 
             for (var d = 0; d < 7; d++) {
                 var cur = new Date(start); cur.setDate(cur.getDate() + w * 7 + d);
-                var key = fmt(cur), isPast = cur < today;
+                var key = fmt(cur), isPast = cur < today || cur > limit;  // past the horizon reads as unselectable too
                 var td = document.createElement('td');
                 if (d >= 5) td.classList.add('cal-we-col');
                 if (cur.getMonth() % 2 === 1) td.classList.add('month-alt');
@@ -90,9 +88,6 @@
                 div.addEventListener('mouseenter', onEnter);
                 td.appendChild(div); tr.appendChild(td);
                 cells[w + ',' + d] = { date: key, el: div, past: isPast };
-
-                loadedYears.add(cur.getFullYear());
-                loadedMonths.add(mk);
             }
             body.insertBefore(tr, sentinel);
         }
@@ -127,7 +122,10 @@
 
     function updateNav() {
         // Update year dropdown
-        var curYears = Array.from(loadedYears).sort();
+        // Every year up to the horizon, not only the loaded ones: a jump loads
+        // its weeks on demand, so a later year must be pickable before scrolling.
+        var curYears = [];
+        for (var y = today.getFullYear(); y <= limit.getFullYear(); y++) curYears.push(y);
         yearSelect.innerHTML = '';
         curYears.forEach(function (y) {
             var opt = document.createElement('option');
@@ -135,7 +133,7 @@
             yearSelect.appendChild(opt);
         });
         // Keep current selection if still valid
-        if (yearSelect._selectedYear && loadedYears.has(yearSelect._selectedYear)) {
+        if (yearSelect._selectedYear && curYears.indexOf(yearSelect._selectedYear) !== -1) {
             yearSelect.value = yearSelect._selectedYear;
         } else {
             yearSelect.value = curYears[0];
@@ -185,7 +183,11 @@
         var head = document.getElementById('cal-grid').querySelector('thead');
         var top = tr.getBoundingClientRect().top - scrollContainer.getBoundingClientRect().top
             + scrollContainer.scrollTop - head.offsetHeight;
-        scrollContainer.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+        top = Math.max(0, top);
+        // Smooth over a few screens; instant across years, where a smooth scroll
+        // would crawl through hundreds of rows for seconds.
+        var far = Math.abs(top - scrollContainer.scrollTop) > 3 * scrollContainer.clientHeight;
+        scrollContainer.scrollTo({ top: top, behavior: far ? 'auto' : 'smooth' });
     }
 
     function jumpTo(mk) {
@@ -194,12 +196,11 @@
         if (!tr) return;
         ensureRowsBelow(tr);
         updateNav();
-        // nit 2: during the smooth scroll the rows passing by must not rewrite
-        // the year select; the destination is known, so show it right away.
-        navTarget = mk; showMonth(mk);
+        // The destination is known, so show it right away and keep showing it
+        // until the user scrolls by hand: rows passing by during the smooth
+        // scroll, or a row shared by two months, must not rewrite the year.
+        pinned = mk; showMonth(mk);
         scrollToRow(tr);
-        clearTimeout(navTimer);
-        navTimer = setTimeout(function () { navTarget = null; }, 1000);
     }
 
     yearSelect.addEventListener('change', function () {
@@ -222,19 +223,19 @@
 
     updateNav();
 
-    var activeMk = null, navTarget = null, navTimer = null;
-    scrollContainer.addEventListener('scrollend', function () {
-        if (navTarget) { clearTimeout(navTimer); navTarget = null; markActiveMonth(); }
+    var activeMk = null, pinned = null;
+    ['wheel', 'touchstart', 'keydown', 'mousedown'].forEach(function (ev) {
+        scrollContainer.addEventListener(ev, function () { pinned = null; }, { passive: true });
     });
     function markActiveMonth() {
-        if (navTarget) return;
+        if (pinned) { showMonth(pinned); return; }
         var boxTop = scrollContainer.getBoundingClientRect().top
             + document.getElementById('cal-grid').querySelector('thead').offsetHeight;
-        var rows = body.rows, mk = null;
+        var rows = body.rows, top = null;
         for (var i = 0; i < rows.length; i++) {
-            if (rows[i].dataset.month && rows[i].getBoundingClientRect().bottom > boxTop + 1) { mk = rows[i].dataset.month; break; }
+            if (rows[i].dataset.month && rows[i].getBoundingClientRect().bottom > boxTop + 1) { top = rows[i]; break; }
         }
-        if (mk) showMonth(mk);
+        if (top) showMonth(top.dataset.month);
     }
     function showMonth(mk) {
         if (mk === activeMk) return;
