@@ -8,6 +8,7 @@
 
     var sel = new Set();
     var INITIAL_WEEKS = 20;
+    var MAX_YEARS_AHEAD = 5;
     var LOAD_MORE_WEEKS = 13;
     var MO = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     var today = new Date(); today.setHours(0, 0, 0, 0);
@@ -17,6 +18,9 @@
 
     function fmt(d) {
         return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+    }
+    function monthKey(d) {
+        return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
     }
     function getMon(d) {
         var dt = new Date(d), dy = dt.getDay(); dt.setDate(dt.getDate() + ((dy === 0 ? -6 : 1) - dy)); return dt;
@@ -59,14 +63,20 @@
                 div.textContent = cur.getDate();
                 div.dataset.date = key; div.dataset.row = w; div.dataset.col = d;
 
+                var mk = monthKey(cur);
                 if (cur.getDate() === 1) {
                     var band = document.createElement('span');
                     band.className = 'month-band';
                     band.textContent = MO[cur.getMonth()];
                     div.appendChild(band);
-                    var mk = cur.getFullYear() + '-' + String(cur.getMonth() + 1).padStart(2, '0');
-                    if (!monthRows[mk]) monthRows[mk] = tr;
                 }
+                // The calendar opens on the current week, so the current month's
+                // 1st is usually never rendered: its first visible row stands in.
+                if ((cur.getDate() === 1 || (w === 0 && d === 0)) && !monthRows[mk]) monthRows[mk] = tr;
+                // A week holding a month's 1st belongs to that month (it is the row
+                // a month button jumps to); any other week to its Thursday's month.
+                if (cur.getDate() === 1) tr.dataset.month = mk;
+                else if (d === 3 && !tr.dataset.month) tr.dataset.month = mk;
 
                 div.addEventListener('mousedown', onDown);
                 div.addEventListener('mouseenter', onEnter);
@@ -74,7 +84,7 @@
                 cells[w + ',' + d] = { date: key, el: div, past: isPast };
 
                 loadedYears.add(cur.getFullYear());
-                loadedMonths.add(cur.getFullYear() + '-' + String(cur.getMonth() + 1).padStart(2, '0'));
+                loadedMonths.add(mk);
             }
             body.insertBefore(tr, sentinel);
         }
@@ -143,16 +153,41 @@
     }
 
     function loadUntilMonth(targetMk) {
-        var maxAttempts = 200;
-        while (!monthRows[targetMk] && maxAttempts-- > 0) {
+        // Weeks are appended until the target month's 1st is on screen. The
+        // bound is in calendar time, not attempts: a month never reachable from
+        // here can not grow the table by decades of rows.
+        var parts = targetMk.split('-');
+        var target = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, 1);
+        var limit = new Date(today); limit.setFullYear(limit.getFullYear() + MAX_YEARS_AHEAD);
+        if (target > limit) return;
+        while (!monthRows[targetMk]) {
+            var lastShown = new Date(start); lastShown.setDate(lastShown.getDate() + totalWeeks * 7 - 1);
+            if (lastShown >= target) break;
             addWeeks(LOAD_MORE_WEEKS);
         }
         updateNav();
     }
 
+    // Scroll only the calendar box. scrollIntoView would also scroll the page,
+    // which is what made the whole form jump on every month click.
+    function scrollToRow(tr) {
+        var head = document.getElementById('cal-grid').querySelector('thead');
+        var top = tr.getBoundingClientRect().top - scrollContainer.getBoundingClientRect().top
+            + scrollContainer.scrollTop - head.offsetHeight;
+        scrollContainer.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+    }
+
+    function jumpTo(mk) {
+        if (!monthRows[mk]) loadUntilMonth(mk);
+        if (monthRows[mk]) scrollToRow(monthRows[mk]);
+    }
+
     yearSelect.addEventListener('change', function () {
-        yearSelect._selectedYear = parseInt(this.value, 10);
+        var yr = parseInt(this.value, 10);
+        yearSelect._selectedYear = yr;
         updateMonthBtns();
+        var m = yr === today.getFullYear() ? today.getMonth() : 0;
+        jumpTo(yr + '-' + String(m + 1).padStart(2, '0'));
     });
 
     for (var mi = 0; mi < monthBtns.length; mi++) {
@@ -160,16 +195,40 @@
             monthBtns[idx].addEventListener('click', function () {
                 if (this.disabled) return;
                 var yr = parseInt(yearSelect.value, 10);
-                var mk = yr + '-' + String(idx + 1).padStart(2, '0');
-                if (!monthRows[mk]) loadUntilMonth(mk);
-                if (monthRows[mk]) {
-                    monthRows[mk].scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }
+                jumpTo(yr + '-' + String(idx + 1).padStart(2, '0'));
             });
         })(mi);
     }
 
     updateNav();
+
+    var activeMk = null;
+    function markActiveMonth() {
+        var boxTop = scrollContainer.getBoundingClientRect().top
+            + document.getElementById('cal-grid').querySelector('thead').offsetHeight;
+        var rows = body.rows, mk = null;
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].dataset.month && rows[i].getBoundingClientRect().bottom > boxTop + 1) { mk = rows[i].dataset.month; break; }
+        }
+        if (!mk || mk === activeMk) return;
+        activeMk = mk;
+        var yr = parseInt(mk.slice(0, 4), 10);
+        if (yr !== parseInt(yearSelect.value, 10)) {
+            yearSelect.value = yr; yearSelect._selectedYear = yr; updateMonthBtns();
+        }
+        monthBtns.forEach(function (b, i) {
+            var on = i === parseInt(mk.slice(5), 10) - 1;
+            b.classList.toggle('cal-month-active', on);
+            if (on) b.setAttribute('aria-current', 'true'); else b.removeAttribute('aria-current');
+        });
+    }
+    var activeQueued = false;
+    scrollContainer.addEventListener('scroll', function () {
+        if (activeQueued) return;
+        activeQueued = true;
+        requestAnimationFrame(function () { activeQueued = false; markActiveMonth(); });
+    }, { passive: true });
+    markActiveMonth();
 
     // Rectangular drag
     function getRect() {
@@ -232,11 +291,15 @@
         var sorted = Array.from(sel).sort();
         var el = document.getElementById('selected-summary');
         el.textContent = sorted.length ? sorted.length + ' date' + (sorted.length > 1 ? 's' : '') + ' selected' : 'No dates selected';
+        if (clearBtn) clearBtn.hidden = sorted.length === 0;
         var hid = document.getElementById('hidden-dates'); hid.innerHTML = '';
         sorted.forEach(function (d) {
             var inp = document.createElement('input'); inp.type = 'hidden'; inp.name = 'dates'; inp.value = d; hid.appendChild(inp);
         });
     }
+
+    var clearBtn = document.getElementById('cal-clear');
+    if (clearBtn) clearBtn.addEventListener('click', function () { sel.clear(); updateUI(); });
 
     // time-fields toggle + validation only exist on the create page; the edit
     // page reuses this picker with a fixed mode and optional date additions.

@@ -111,6 +111,10 @@
   --sched-heat-base: #282828;
 }
 
+/* Reserve the scrollbar's width always, so content that grows past the
+   viewport (an opened menu, a longer form) never shifts the page sideways. */
+html { scrollbar-gutter: stable; }
+
 /* ===== navbar theme toggle =====
    Sun shown in light, moon in dark; honors explicit data-theme first,
    then the OS preference when no choice was made. */
@@ -198,8 +202,10 @@ td.cal-we-col.month-alt { background: var(--color-base-200); }
 #cal-month-btns button { background: none; border: 1px solid var(--color-base-300); border-radius: 4px; padding: 3px 8px; cursor: pointer; font-size: 12px; color: color-mix(in oklab, var(--color-base-content) 65%, transparent); min-width: 36px; }
 #cal-month-btns button:hover:not(.cal-month-disabled) { background: var(--color-base-200); color: var(--color-base-content); }
 #cal-month-btns button.cal-month-disabled { opacity: 0.3; cursor: default; }
+#cal-month-btns button.cal-month-active { border-color: var(--color-yes); color: var(--color-base-content); font-weight: 600; }
 #cal-scroll { max-height: 350px; overflow-y: auto; border: 1px solid var(--color-base-300); border-radius: 4px; }
-#cal-grid { border-collapse: collapse; width: 100%; }
+/* fixed layout: a selected (bold) day must not resize its column and jiggle the grid */
+#cal-grid { border-collapse: collapse; width: 100%; table-layout: fixed; }
 #cal-grid th, #cal-grid td { padding: 0; text-align: center; font-size: 13px; border: none; }
 #cal-grid thead { position: sticky; top: 0; background: var(--color-base-100); z-index: 1; }
 #cal-grid th { padding: 6px 0; font-weight: 600; color: color-mix(in oklab, var(--color-base-content) 65%, transparent); cursor: pointer; }
