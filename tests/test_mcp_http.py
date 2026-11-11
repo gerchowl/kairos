@@ -714,17 +714,49 @@ def test_mcp_tool_dispatch_runs_in_a_worker_thread_not_the_event_loop(client, mo
 # -- 7d. Finding 4: malformed args → plain-text 500 ------------------------
 
 
-def test_recursive_json_body_answers_with_a_parse_error_envelope(client):
-    """A 200 KiB nested-brackets body used to drive `json.loads` into a
+def test_body_parser_handles_recursionerror_and_valueerror_as_parse_errors():
+    """A nested-brackets body used to drive `json.loads` into a
     RecursionError that bubbled out as a plain-text 500 — breaking the MCP
-    wire format a client reads. The body-size cap keeps most of these out
-    of the parser; the parser itself now catches RecursionError too."""
-    # Big but under the 1 MiB cap so this exercises the RecursionError path.
-    bomb = "[" * 100_000 + "]" * 100_000
-    r = client.post(MCP, content=bomb, headers={"Content-Type": "application/json"})
-    assert r.status_code == 200, r.text
-    env = r.json()
-    assert env["error"]["code"] == mcp_http.PARSE_ERROR
+    wire format a client reads. `_parse_body` now catches RecursionError,
+    ValueError and JSONDecodeError so every parse pathology lands as a
+    JSON-RPC parse-error envelope, not a wire-format violation.
+
+    Tested against `_parse_body` directly rather than against a payload at
+    some depth, because CPython and PyPy have different stack behaviours
+    and a depth that trips RecursionError under one interpreter sails
+    through another. The three branches we care about — malformed JSON,
+    ValueError, RecursionError — are exercised by three calls here."""
+    import json as _jsonlib
+
+    # (1) Malformed JSON → PARSE_ERROR (JSONDecodeError path).
+    msg, err = mcp_http._parse_body(b"{not json")
+    assert msg is None and err is not None
+    assert err["error"]["code"] == mcp_http.PARSE_ERROR
+
+    # (2) Plain ValueError from the parser → PARSE_ERROR.
+    def ve(*_a, **_k):
+        raise ValueError("deliberate ValueError")
+
+    old = _jsonlib.loads
+    _jsonlib.loads = ve
+    try:
+        msg, err = mcp_http._parse_body(b'{"x":1}')
+    finally:
+        _jsonlib.loads = old
+    assert msg is None and err is not None
+    assert err["error"]["code"] == mcp_http.PARSE_ERROR
+
+    # (3) RecursionError from the parser → PARSE_ERROR (not a plain 500).
+    def re(*_a, **_k):
+        raise RecursionError("deliberate RecursionError")
+
+    _jsonlib.loads = re
+    try:
+        msg, err = mcp_http._parse_body(b'{"x":1}')
+    finally:
+        _jsonlib.loads = old
+    assert msg is None and err is not None
+    assert err["error"]["code"] == mcp_http.PARSE_ERROR
 
 
 def test_a_body_over_the_cap_is_413_with_a_parse_error_envelope(client):
