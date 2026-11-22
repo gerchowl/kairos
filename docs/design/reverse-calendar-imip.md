@@ -185,5 +185,5 @@ link and it RSVPs for you.
   password" was actually the tell that it wasn't a real Google App Password).
 - Gmail SMTP/IMAP needs a real **App Password** (16 lowercase, 2-Step on;
   passkeys don't unlock App Passwords).
-- Deploy runs from vm-dev over Tailscale → `ethz-heimdall` jump → `dupletent`;
-  vm-dev got its own sops age recipient (ent-scoped) + an authorized ETH key.
+- Deploy runs from [dev-vm] over Tailscale → `ethz-heimdall` jump → `dupletent`;
+  [dev-vm] got its own sops age recipient (ent-scoped) + an authorized ETH key.
